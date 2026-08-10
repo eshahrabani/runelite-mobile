@@ -1,0 +1,14 @@
+<robovm>
+  <config>
+    <executableName>RuneLiteMobile</executableName>
+    <mainClass>org.runelite.mobile.IOSLauncher</mainClass>
+    <os>ios</os>
+    <arch>arm64</arch>
+  </config>
+  <frameworks>
+    <framework>UIKit</framework>
+    <framework>OpenGLES</framework>
+    <framework>QuartzCore</framework>
+    <framework>CoreGraphics</framework>
+  </frameworks>
+</robovm>

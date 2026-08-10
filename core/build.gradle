@@ -1,0 +1,12 @@
+plugins {
+    id 'java-library'
+}
+
+dependencies {
+    // Core Java rendering utilities and interface bridges
+    // Note: RuneLite API dependencies will be resolved from the RuneLite maven repository if needed
+}
+
+tasks.withType(JavaCompile) {
+    options.compilerArgs.addAll(['--limit-modules', 'java.base,jdk.unsupported'])
+}

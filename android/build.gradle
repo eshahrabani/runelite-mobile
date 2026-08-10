@@ -1,0 +1,603 @@
+buildscript {
+    repositories {
+        mavenCentral()
+    }
+    dependencies {
+        classpath 'org.ow2.asm:asm:9.6'
+        classpath 'org.ow2.asm:asm-commons:9.6'
+    }
+}
+
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.runelite.mobile'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "org.runelite.mobile"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_11
+        targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+// Gradle task to download RuneLite's injected client and compile it to Dex format
+def ClientUpdaterVersionFile = "client-version.txt"
+
+task downloadAndDexJar {
+    doLast {
+        def buildToolsDir = new File(android.sdkDirectory, "build-tools")
+        if (!buildToolsDir.exists()) {
+            throw new GradleException("Android SDK build-tools directory not found: " + buildToolsDir.absolutePath)
+        }
+        def latestBuildTool = buildToolsDir.listFiles()?.sort()?.last()
+        if (!latestBuildTool) {
+            throw new GradleException("No Android SDK build-tools version found in: " + buildToolsDir.absolutePath)
+        }
+        
+        def d8Path = new File(latestBuildTool, "d8")
+        if (System.getProperty("os.name").toLowerCase().contains("windows")) {
+            d8Path = new File(latestBuildTool, "d8.bat")
+        }
+        
+        // Ensure assets and temp directories exist
+        def assetsDir = new File(projectDir, "src/main/assets")
+        assetsDir.mkdirs()
+        def tempDir = new File(project.buildDir, "temp-jars")
+        tempDir.mkdirs()
+        
+        // 1. Parse bootstrap.json from RuneLite to get active client version
+        println "Fetching RuneLite bootstrap.json..."
+        def bootstrapUrl = new URL("https://static.runelite.net/bootstrap.json")
+        def bootstrapText = bootstrapUrl.text
+        def bootstrapJson = new groovy.json.JsonSlurper().parseText(bootstrapText)
+        
+        // Find the client artifact to extract the version number
+        def clientArtifact = bootstrapJson.artifacts.find { it.name.startsWith("client-") && it.name.endsWith(".jar") }
+        if (!clientArtifact) {
+            throw new GradleException("Could not find client artifact in bootstrap.json!")
+        }
+        // Extract version from artifact name: "client-1.12.28.jar" -> "1.12.28"
+        def versionMatcher = (clientArtifact.name =~ /client-(.+)\.jar/)
+        if (!versionMatcher.matches()) {
+            throw new GradleException("Could not parse version from artifact name: " + clientArtifact.name)
+        }
+        def clientVersion = versionMatcher[0][1]
+        println "Active RuneLite client version: " + clientVersion
+        
+        // 2. Download injected-client JAR (the real pre-patched OSRS game client)
+        def injectedClientUrl = new URL("https://repo.runelite.net/net/runelite/injected-client/${clientVersion}/injected-client-${clientVersion}.jar")
+        def injectedClientJar = new File(tempDir, "injected-client.jar")
+        println "Downloading injected-client from: " + injectedClientUrl
+        injectedClientUrl.openStream().withStream { is ->
+            injectedClientJar.withOutputStream { os ->
+                os << is
+            }
+        }
+        println "  -> Downloaded: " + injectedClientJar.length() + " bytes"
+        
+        // 2b. Clean/transform the injected-client JAR to replace invokedynamic string concatenations
+        println "Transforming injected-client to remove Java 9+ invokedynamic string concatenations..."
+        def cleanedClientJar = new File(tempDir, "injected-client-cleaned.jar")
+        new java.util.zip.ZipFile(injectedClientJar).withCloseable { clientZip ->
+            new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(cleanedClientJar)).withStream { zos ->
+                clientZip.entries().each { entry ->
+                    zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                    if (!entry.isDirectory()) {
+                        clientZip.getInputStream(entry).withStream { zis ->
+                            byte[] bytes = zis.bytes
+                            if (entry.name.endsWith(".class")) {
+                                boolean hasConcat = false
+                                boolean hasUnsafe = false
+                                try {
+                                    byte[] pattern = "makeConcatWithConstants".getBytes("US-ASCII")
+                                    for (int i = 0; i <= bytes.length - pattern.length; i++) {
+                                        boolean match = true
+                                        for (int j = 0; j < pattern.length; j++) {
+                                            if (bytes[i + j] != pattern[j]) {
+                                                match = false
+                                                break
+                                            }
+                                        }
+                                        if (match) {
+                                            hasConcat = true
+                                            break
+                                        }
+                                    }
+                                    byte[] unsafePattern = "sun/misc/Unsafe".getBytes("US-ASCII")
+                                    for (int i = 0; i <= bytes.length - unsafePattern.length; i++) {
+                                        boolean match = true
+                                        for (int j = 0; j < unsafePattern.length; j++) {
+                                            if (bytes[i + j] != unsafePattern[j]) {
+                                                match = false
+                                                break
+                                            }
+                                        }
+                                        if (match) {
+                                            hasUnsafe = true
+                                            break
+                                        }
+                                    }
+                                    byte[] processPattern = "java/lang/ProcessHandle".getBytes("US-ASCII")
+                                    for (int i = 0; i <= bytes.length - processPattern.length; i++) {
+                                        boolean match = true
+                                        for (int j = 0; j < processPattern.length; j++) {
+                                            if (bytes[i + j] != processPattern[j]) {
+                                                match = false
+                                                break
+                                            }
+                                        }
+                                        if (match) {
+                                            hasUnsafe = true
+                                            break
+                                        }
+                                    }
+                                } catch (Exception e) {}
+                                
+                                if (hasConcat || hasUnsafe) {
+                                    println "  Transforming class: " + entry.name
+                                    try {
+                                        bytes = transformClassBytes(bytes)
+                                    } catch (Exception e) {
+                                        println "  ERROR transforming class " + entry.name + ": " + e.getMessage()
+                                        e.printStackTrace()
+                                    }
+                                }
+                            }
+                            zos.write(bytes)
+                        }
+                    }
+                    zos.closeEntry()
+                }
+            }
+        }
+        println "  Cleaned client JAR: " + cleanedClientJar.length() + " bytes (original: " + injectedClientJar.length() + " bytes)"
+
+        // 3. Download runelite-api JAR (interfaces and types referenced by the injected client)
+        def apiUrl = new URL("https://repo.runelite.net/net/runelite/runelite-api/${clientVersion}/runelite-api-${clientVersion}.jar")
+        def apiJar = new File(tempDir, "runelite-api.jar")
+        println "Downloading runelite-api from: " + apiUrl
+        apiUrl.openStream().withStream { is ->
+            apiJar.withOutputStream { os ->
+                os << is
+            }
+        }
+        println "  -> Downloaded: " + apiJar.length() + " bytes"
+        
+        // 4. Strip duplicate classes from api JAR that already exist in injected-client
+        // (e.g. com.jagex.oldscape.pub.OAuthApi exists in both JARs)
+        println "Stripping duplicate classes from runelite-api..."
+        def injectedEntries = new java.util.zip.ZipFile(cleanedClientJar).entries().collect { it.name }.toSet()
+        def cleanedApiJar = new File(tempDir, "runelite-api-cleaned.jar")
+        new java.util.zip.ZipFile(apiJar).withCloseable { apiZip ->
+            new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(cleanedApiJar)).withStream { zos ->
+                apiZip.entries().each { entry ->
+                    if (!injectedEntries.contains(entry.name)) {
+                        zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                        if (!entry.isDirectory()) {
+                            apiZip.getInputStream(entry).withStream { zis ->
+                                zos << zis
+                            }
+                        }
+                        zos.closeEntry()
+                    } else if (entry.name.endsWith(".class")) {
+                        println "  Stripped duplicate: " + entry.name
+                    }
+                }
+            }
+        }
+        println "  Cleaned API JAR: " + cleanedApiJar.length() + " bytes"
+        
+        // 5. Compile both JARs together to Dex format
+        println "Compiling injected-client + runelite-api to Dex format using: " + d8Path.absolutePath
+        def destJar = new File(assetsDir, "runelite-dex.jar")
+        
+        exec {
+            commandLine d8Path.absolutePath,
+                "--min-api", "26",
+                "--output", destJar.absolutePath,
+                cleanedClientJar.absolutePath,
+                cleanedApiJar.absolutePath
+        }
+        // 6. Copy resource files (non-class files) from original JARs into the dexed JAR
+        println "Copying resources from client and API jars to dexed jar..."
+        def tempDexDir = new File(tempDir, "dex-extracted")
+        if (tempDexDir.exists()) tempDexDir.deleteDir()
+        tempDexDir.mkdirs()
+        
+        // Extract dex file from the dexed JAR
+        new java.util.zip.ZipFile(destJar).withCloseable { zip ->
+            zip.entries().each { entry ->
+                if (entry.name.endsWith(".dex")) {
+                    def outFile = new File(tempDexDir, entry.name)
+                    outFile.parentFile.mkdirs()
+                    zip.getInputStream(entry).withStream { is ->
+                        outFile.withOutputStream { os -> os << is }
+                    }
+                }
+            }
+        }
+        
+        // Repackage the dex file with resources from input jars
+        new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(destJar)).withStream { zos ->
+            // Add the compiled .dex files
+            tempDexDir.eachFileRecurse { file ->
+                if (file.isFile()) {
+                    def relPath = tempDexDir.toURI().relativize(file.toURI()).toString()
+                    zos.putNextEntry(new java.util.zip.ZipEntry(relPath))
+                    file.withInputStream { is -> zos << is }
+                    zos.closeEntry()
+                }
+            }
+            
+            // Add non-class resources from cleanedClientJar
+            new java.util.zip.ZipFile(cleanedClientJar).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    if (!entry.isDirectory() && !entry.name.endsWith(".class") && !entry.name.startsWith("META-INF/")) {
+                        zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                        zip.getInputStream(entry).withStream { is -> zos << is }
+                        zos.closeEntry()
+                    }
+                }
+            }
+            
+            // Add non-class resources from cleanedApiJar
+            new java.util.zip.ZipFile(cleanedApiJar).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    if (!entry.isDirectory() && !entry.name.endsWith(".class") && !entry.name.startsWith("META-INF/")) {
+                        try {
+                            zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                            zip.getInputStream(entry).withStream { is -> zos << is }
+                            zos.closeEntry()
+                        } catch (java.util.zip.ZipException ze) {
+                            // duplicate entry, ignore
+                        }
+                    }
+                }
+            }
+            
+            // Generate runelite/index resource file to prevent NPE in OverlayIndex
+            zos.putNextEntry(new java.util.zip.ZipEntry("runelite/index"))
+            zos.write(new byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF})
+            zos.closeEntry()
+        }
+        println "RuneLite injected client successfully dexed and bundled! (" + destJar.length() + " bytes)"
+
+        // 7. Record the baked-in client version so the app can detect updates at runtime
+        def versionFile = new File(assetsDir, ClientUpdaterVersionFile)
+        versionFile.write(clientVersion)
+        println "Wrote client version marker: " + versionFile.absolutePath + " (v" + clientVersion + ")"
+    }
+}
+
+// Hook the task into the preBuild lifecycle
+project.afterEvaluate {
+    tasks.findByName("preBuild").dependsOn(downloadAndDexJar)
+}
+
+configurations {
+    all {
+        exclude group: 'com.google.guava', module: 'listenablefuture'
+    }
+}
+
+dependencies {
+    implementation project(':core')
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    // Dependencies referenced by the injected client at runtime
+    implementation 'com.google.guava:guava:23.2-jre'
+    implementation 'org.slf4j:slf4j-api:1.7.25'
+    // On-device client update pipeline (ClientUpdater): ASM transform + D8 dex.
+    // Mirrors the downloadAndDexJar build-time pipeline; keep ClientClassTransformer
+    // in sync with transformClassBytes in this file.
+    implementation 'org.ow2.asm:asm:9.6'
+    implementation 'org.ow2.asm:asm-tree:9.6'
+    implementation 'org.ow2.asm:asm-commons:9.6'
+    implementation 'com.android.tools:r8:8.2.33'
+}
+
+byte[] transformClassBytes(byte[] classBytes) {
+    org.objectweb.asm.ClassReader reader = new org.objectweb.asm.ClassReader(classBytes)
+    org.objectweb.asm.tree.ClassNode classNode = new org.objectweb.asm.tree.ClassNode()
+    reader.accept(classNode, 0)
+
+    boolean modified = false
+
+    // Remap java/lang/ProcessHandle to org/runelite/mobile/ProcessHandle in class signatures
+    if (classNode.signature != null) {
+        if (classNode.signature.contains("Ljava/lang/ProcessHandle;")) {
+            modified = true
+            classNode.signature = classNode.signature.replace("Ljava/lang/ProcessHandle;", "Lorg/runelite/mobile/ProcessHandle;")
+        }
+        if (classNode.signature.contains("Ljava/lang/ProcessHandle\$Info;")) {
+            modified = true
+            classNode.signature = classNode.signature.replace("Ljava/lang/ProcessHandle\$Info;", "Lorg/runelite/mobile/ProcessHandle\$Info;")
+        }
+    }
+
+    // Remap in fields
+    for (org.objectweb.asm.tree.FieldNode field : classNode.fields) {
+        if (field.desc != null && field.desc.contains("Ljava/lang/ProcessHandle;")) {
+            modified = true
+            field.desc = field.desc.replace("Ljava/lang/ProcessHandle;", "Lorg/runelite/mobile/ProcessHandle;")
+        }
+        if (field.desc != null && field.desc.contains("Ljava/lang/ProcessHandle\$Info;")) {
+            modified = true
+            field.desc = field.desc.replace("Ljava/lang/ProcessHandle\$Info;", "Lorg/runelite/mobile/ProcessHandle\$Info;")
+        }
+    }
+
+    // Remap in methods signature/descriptor
+    for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+        if (method.desc != null && method.desc.contains("Ljava/lang/ProcessHandle;")) {
+            modified = true
+            method.desc = method.desc.replace("Ljava/lang/ProcessHandle;", "Lorg/runelite/mobile/ProcessHandle;")
+        }
+        if (method.desc != null && method.desc.contains("Ljava/lang/ProcessHandle\$Info;")) {
+            modified = true
+            method.desc = method.desc.replace("Ljava/lang/ProcessHandle\$Info;", "Lorg/runelite/mobile/ProcessHandle\$Info;")
+        }
+    }
+
+    for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+        org.objectweb.asm.tree.InsnList instructions = method.instructions
+        org.objectweb.asm.tree.AbstractInsnNode[] insnArray = instructions.toArray()
+        for (org.objectweb.asm.tree.AbstractInsnNode insn : insnArray) {
+            if (insn instanceof org.objectweb.asm.tree.InvokeDynamicInsnNode) {
+                org.objectweb.asm.tree.InvokeDynamicInsnNode indy = (org.objectweb.asm.tree.InvokeDynamicInsnNode) insn
+                org.objectweb.asm.Handle bsm = indy.bsm
+                if (bsm.getOwner() == "java/lang/invoke/StringConcatFactory" && 
+                    bsm.getName() == "makeConcatWithConstants") {
+                    
+                    modified = true
+                    String recipe = (String) indy.bsmArgs[0]
+                    org.objectweb.asm.Type[] argTypes = org.objectweb.asm.Type.getArgumentTypes(indy.desc)
+                    
+                    org.objectweb.asm.tree.InsnList newInstructions = new org.objectweb.asm.tree.InsnList()
+                    
+                    // Store dynamic arguments into temp local variables in reverse order
+                    int[] localSlots = new int[argTypes.length]
+                    int currentSlot = method.maxLocals
+                    for (int j = argTypes.length - 1; j >= 0; j--) {
+                        org.objectweb.asm.Type type = argTypes[j]
+                        localSlots[j] = currentSlot
+                        newInstructions.add(new org.objectweb.asm.tree.VarInsnNode(type.getOpcode(org.objectweb.asm.Opcodes.ISTORE), currentSlot))
+                        currentSlot += type.getSize()
+                    }
+                    method.maxLocals = Math.max(method.maxLocals, currentSlot)
+                    
+                    // Instantiate StringBuilder
+                    newInstructions.add(new org.objectweb.asm.tree.TypeInsnNode(org.objectweb.asm.Opcodes.NEW, "java/lang/StringBuilder"))
+                    newInstructions.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DUP))
+                    newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKESPECIAL, "java/lang/StringBuilder", "<init>", "()V", false))
+                    
+                    // Process recipe
+                    StringBuilder literal = new StringBuilder()
+                    int dynamicArgIndex = 0
+                    int constantArgIndex = 0
+                    
+                    for (int j = 0; j < recipe.length(); j++) {
+                        char ch = recipe.charAt(j)
+                        if (ch == '\u0001') {
+                            if (literal.length() > 0) {
+                                newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(literal.toString()))
+                                newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false))
+                                literal.setLength(0)
+                            }
+                            org.objectweb.asm.Type type = argTypes[dynamicArgIndex]
+                            int slot = localSlots[dynamicArgIndex]
+                            newInstructions.add(new org.objectweb.asm.tree.VarInsnNode(type.getOpcode(org.objectweb.asm.Opcodes.ILOAD), slot))
+                            String appendDesc = getAppendDesc(type)
+                            newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", appendDesc, false))
+                            dynamicArgIndex++
+                        } else if (ch == '\u0002') {
+                            if (literal.length() > 0) {
+                                newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(literal.toString()))
+                                newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false))
+                                literal.setLength(0)
+                            }
+                            Object constVal = indy.bsmArgs[1 + constantArgIndex]
+                            constantArgIndex++
+                            
+                            if (constVal instanceof org.objectweb.asm.ConstantDynamic) {
+                                org.objectweb.asm.ConstantDynamic cd = (org.objectweb.asm.ConstantDynamic) constVal
+                                if (cd.getBootstrapMethod().getOwner() == "java/lang/invoke/ConstantBootstraps" && 
+                                    cd.getBootstrapMethod().getName() == "invoke") {
+                                    
+                                    org.objectweb.asm.Handle targetMethod = (org.objectweb.asm.Handle) cd.getBootstrapMethodArgument(0)
+                                    for (int k = 1; k < cd.getBootstrapMethodArgumentCount(); k++) {
+                                        Object arg = cd.getBootstrapMethodArgument(k)
+                                        newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(arg))
+                                    }
+                                    int opcode = getInvokeOpcode(targetMethod.getTag())
+                                    boolean isInterface = (targetMethod.getTag() == org.objectweb.asm.Opcodes.H_INVOKEINTERFACE)
+                                    newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(
+                                        opcode,
+                                        targetMethod.getOwner(),
+                                        targetMethod.getName(),
+                                        targetMethod.getDesc(),
+                                        isInterface
+                                    ))
+                                } else {
+                                    newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(constVal))
+                                }
+                                newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/Object;)Ljava/lang/StringBuilder;", false))
+                            } else {
+                                newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(constVal))
+                                String appendDesc = getConstantAppendDesc(constVal)
+                                newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", appendDesc, false))
+                            }
+                        } else {
+                            literal.append(ch)
+                        }
+                    }
+                    if (literal.length() > 0) {
+                        newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(literal.toString()))
+                        newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "append", "(Ljava/lang/String;)Ljava/lang/StringBuilder;", false))
+                    }
+                    
+                    // toString
+                    newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(org.objectweb.asm.Opcodes.INVOKEVIRTUAL, "java/lang/StringBuilder", "toString", "()Ljava/lang/String;", false))
+                    
+                    // Replace InvokeDynamicInsnNode with newInstructions
+                    instructions.insertBefore(indy, newInstructions)
+                    instructions.remove(indy)
+                }
+            } else if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                org.objectweb.asm.tree.LdcInsnNode ldc = (org.objectweb.asm.tree.LdcInsnNode) insn
+                if (ldc.cst instanceof org.objectweb.asm.Type) {
+                    org.objectweb.asm.Type t = (org.objectweb.asm.Type) ldc.cst
+                    if (t.getSort() == org.objectweb.asm.Type.OBJECT) {
+                        if (t.getInternalName() == "java/lang/ProcessHandle") {
+                            modified = true
+                            ldc.cst = org.objectweb.asm.Type.getObjectType("org/runelite/mobile/ProcessHandle")
+                        } else if (t.getInternalName() == "java/lang/ProcessHandle\$Info") {
+                            modified = true
+                            ldc.cst = org.objectweb.asm.Type.getObjectType("org/runelite/mobile/ProcessHandle\$Info")
+                        }
+                    }
+                }
+                if (ldc.cst instanceof org.objectweb.asm.ConstantDynamic) {
+                    org.objectweb.asm.ConstantDynamic cd = (org.objectweb.asm.ConstantDynamic) ldc.cst
+                    if (cd.getBootstrapMethod().getOwner() == "java/lang/invoke/ConstantBootstraps" && 
+                        cd.getBootstrapMethod().getName() == "invoke") {
+                        
+                        modified = true
+                        org.objectweb.asm.Handle targetMethod = (org.objectweb.asm.Handle) cd.getBootstrapMethodArgument(0)
+                        org.objectweb.asm.tree.InsnList newInstructions = new org.objectweb.asm.tree.InsnList()
+                        for (int k = 1; k < cd.getBootstrapMethodArgumentCount(); k++) {
+                            Object arg = cd.getBootstrapMethodArgument(k)
+                            newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(arg))
+                        }
+                        
+                        int opcode = getInvokeOpcode(targetMethod.getTag())
+                        boolean isInterface = (targetMethod.getTag() == org.objectweb.asm.Opcodes.H_INVOKEINTERFACE)
+                        newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(
+                            opcode,
+                            targetMethod.getOwner(),
+                            targetMethod.getName(),
+                            targetMethod.getDesc(),
+                            isInterface
+                        ))
+                        
+                        instructions.insertBefore(ldc, newInstructions)
+                        instructions.remove(ldc)
+                    }
+                }
+            } else if (insn instanceof org.objectweb.asm.tree.FieldInsnNode) {
+                org.objectweb.asm.tree.FieldInsnNode fieldInsn = (org.objectweb.asm.tree.FieldInsnNode) insn
+                if (fieldInsn.getOpcode() == org.objectweb.asm.Opcodes.GETSTATIC && 
+                    fieldInsn.owner == "sun/misc/Unsafe") {
+                    if (fieldInsn.name.startsWith("ARRAY_") && fieldInsn.desc == "I") {
+                        modified = true
+                        fieldInsn.owner = "org/runelite/mobile/UnsafeHelper"
+                        println "  [ASM] Rewrote GETSTATIC sun/misc/Unsafe." + fieldInsn.name + " to org/runelite/mobile/UnsafeHelper." + fieldInsn.name
+                    }
+                }
+            } else if (insn instanceof org.objectweb.asm.tree.MethodInsnNode) {
+                org.objectweb.asm.tree.MethodInsnNode methodInsn = (org.objectweb.asm.tree.MethodInsnNode) insn
+                if (methodInsn.owner == "sun/misc/Unsafe" && methodInsn.name == "copyMemory") {
+                    modified = true
+                    methodInsn.setOpcode(org.objectweb.asm.Opcodes.INVOKESTATIC)
+                    methodInsn.owner = "org/runelite/mobile/UnsafeHelper"
+                    if (methodInsn.desc == "(Ljava/lang/Object;JLjava/lang/Object;JJ)V") {
+                        methodInsn.desc = "(Ljava/lang/Object;Ljava/lang/Object;JLjava/lang/Object;JJ)V"
+                    } else if (methodInsn.desc == "(JJJ)V") {
+                        methodInsn.desc = "(Ljava/lang/Object;JJJ)V"
+                    }
+                    println "  [ASM] Rewrote INVOKEVIRTUAL sun/misc/Unsafe.copyMemory" + methodInsn.desc + " to INVOKESTATIC org/runelite/mobile/UnsafeHelper.copyMemory"
+                } else {
+                    if (methodInsn.owner == "java/lang/ProcessHandle") {
+                        modified = true
+                        methodInsn.owner = "org/runelite/mobile/ProcessHandle"
+                    } else if (methodInsn.owner == "java/lang/ProcessHandle\$Info") {
+                        modified = true
+                        methodInsn.owner = "org/runelite/mobile/ProcessHandle\$Info"
+                    }
+                    if (methodInsn.desc != null && methodInsn.desc.contains("Ljava/lang/ProcessHandle;")) {
+                        modified = true
+                        methodInsn.desc = methodInsn.desc.replace("Ljava/lang/ProcessHandle;", "Lorg/runelite/mobile/ProcessHandle;")
+                    }
+                    if (methodInsn.desc != null && methodInsn.desc.contains("Ljava/lang/ProcessHandle\$Info;")) {
+                        modified = true
+                        methodInsn.desc = methodInsn.desc.replace("Ljava/lang/ProcessHandle\$Info;", "Lorg/runelite/mobile/ProcessHandle\$Info;")
+                    }
+                }
+            } else if (insn instanceof org.objectweb.asm.tree.TypeInsnNode) {
+                org.objectweb.asm.tree.TypeInsnNode typeInsn = (org.objectweb.asm.tree.TypeInsnNode) insn
+                if (typeInsn.desc == "java/lang/ProcessHandle") {
+                    modified = true
+                    typeInsn.desc = "org/runelite/mobile/ProcessHandle"
+                } else if (typeInsn.desc == "java/lang/ProcessHandle\$Info") {
+                    modified = true
+                    typeInsn.desc = "org/runelite/mobile/ProcessHandle\$Info"
+                }
+            }
+        }
+    }
+
+    if (modified) {
+        org.objectweb.asm.ClassWriter writer = new org.objectweb.asm.ClassWriter(org.objectweb.asm.ClassWriter.COMPUTE_MAXS)
+        classNode.accept(writer)
+        return writer.toByteArray()
+    }
+    return classBytes
+}
+
+int getInvokeOpcode(int tag) {
+    switch (tag) {
+        case org.objectweb.asm.Opcodes.H_INVOKESTATIC:    return org.objectweb.asm.Opcodes.INVOKESTATIC
+        case org.objectweb.asm.Opcodes.H_INVOKEVIRTUAL:   return org.objectweb.asm.Opcodes.INVOKEVIRTUAL
+        case org.objectweb.asm.Opcodes.H_INVOKESPECIAL:   return org.objectweb.asm.Opcodes.INVOKESPECIAL
+        case org.objectweb.asm.Opcodes.H_INVOKEINTERFACE: return org.objectweb.asm.Opcodes.INVOKEINTERFACE
+        default: throw new IllegalArgumentException("Unsupported method handle tag: " + tag)
+    }
+}
+
+String getAppendDesc(org.objectweb.asm.Type type) {
+    switch (type.getSort()) {
+        case org.objectweb.asm.Type.BOOLEAN: return "(Z)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.CHAR:    return "(C)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.BYTE:
+        case org.objectweb.asm.Type.SHORT:
+        case org.objectweb.asm.Type.INT:     return "(I)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.LONG:    return "(J)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.FLOAT:   return "(F)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.DOUBLE:  return "(D)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.OBJECT:
+            if (type.getInternalName() == "java/lang/String") {
+                return "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+            }
+            return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+        case org.objectweb.asm.Type.ARRAY:   return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+        default:                             return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+    }
+}
+
+String getConstantAppendDesc(Object constVal) {
+    if (constVal instanceof Integer) return "(I)Ljava/lang/StringBuilder;"
+    if (constVal instanceof Long) return "(J)Ljava/lang/StringBuilder;"
+    if (constVal instanceof Float) return "(F)Ljava/lang/StringBuilder;"
+    if (constVal instanceof Double) return "(D)Ljava/lang/StringBuilder;"
+    if (constVal instanceof String) return "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+    if (constVal instanceof Character) return "(C)Ljava/lang/StringBuilder;"
+    if (constVal instanceof Boolean) return "(Z)Ljava/lang/StringBuilder;"
+    return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+}
+
+

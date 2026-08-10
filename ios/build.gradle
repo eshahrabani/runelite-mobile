@@ -1,0 +1,28 @@
+buildscript {
+    repositories {
+        mavenCentral()
+        gradlePluginPortal()
+    }
+    dependencies {
+        classpath 'com.mobidevelop.robovm:robovm-gradle-plugin:2.3.24'
+    }
+}
+
+plugins {
+    id 'java'
+}
+apply plugin: 'robovm'
+
+dependencies {
+    implementation project(':core')
+    // RoboVM iOS specific Cocoa Touch API bindings
+    implementation 'com.mobidevelop.robovm:robovm-rt:2.3.24'
+    implementation 'com.mobidevelop.robovm:robovm-cocoatouch:2.3.24'
+}
+
+robovm {
+    iosSignIdentity = ""
+    iosProvisioningProfile = ""
+    iosSkipSigning = true
+    archs = ['arm64']
+}
