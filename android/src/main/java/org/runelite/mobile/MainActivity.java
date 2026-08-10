@@ -3,6 +3,7 @@ package org.runelite.mobile;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
@@ -17,9 +18,6 @@ import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
-import android.webkit.WebResourceRequest;
-import android.webkit.WebView;
-import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -97,8 +95,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView tvUpdateText;
     private Button btnSettings;
 
-    // ── Login WebView ───────────────────────────────────────────────────────
-    private WebView loginWebView;
+    // ── Login (browser-based OAuth) ────────────────────────────────────────
+    private LocalCallbackServer callbackServer;
     private FrameLayout loginOverlay;
     private TextView tvLoginStatus;
 
@@ -625,48 +623,148 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // Jagex account login (two-leg OAuth in the WebView)
+    // Jagex account login (two-leg OAuth in the system browser)
     // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Jagex's Cloudflare bot protection blocks embedded WebViews (the UA-CH
+    // client hints advertise the "Android WebView" runtime, which no WebView
+    // API can change), so the interactive login happens in the device's real
+    // browser where it passes. Leg 1's auth code returns via an intent filter
+    // on the launcher redirect URL; leg 2's consent id_token returns via the
+    // URL fragment of http://localhost, captured by LocalCallbackServer.
 
     private void startJagexLogin() {
         if (loginActive) return;
         loginActive = true;
         loginStage = LoginStage.LEG1;
-        ensureLoginWebView();
+        if (!startCallbackServer()) {
+            failLogin("Login failed: could not start the local login callback.");
+            return;
+        }
         leg1Verifier = JagexOAuthClient.generateVerifier();
         String challenge = JagexOAuthClient.createChallenge(leg1Verifier);
         String state = JagexOAuthClient.randomToken(16);
         String nonce = JagexOAuthClient.randomToken(16);
         String url = JagexOAuthClient.buildLauncherAuthorizeUrl(state, nonce, challenge);
-        Log.i(TAG, "[1] Navigating to Jagex authorize (leg 1)");
-        tvLoginStatus.setText("Opening Jagex sign-in...");
+        Log.i(TAG, "[1] Opening browser for Jagex authorize (leg 1)");
+        tvLoginStatus.setText("Signing in — check your browser");
         loginOverlay.setVisibility(View.VISIBLE);
-        loginWebView.loadUrl(url);
+        openInBrowser(url);
     }
 
-    /** Lazy WebView creation: instantiating it eagerly spawns a renderer process. */
-    private void ensureLoginWebView() {
-        if (loginWebView != null) return;
-        loginWebView = new WebView(this);
-        loginWebView.getSettings().setJavaScriptEnabled(true);
-        loginWebView.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return handleLoginNavigation(request.getUrl().toString());
-            }
+    /** The launcher redirect comes back via the https URL or the "jagex:" scheme. */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        String url = intent.getDataString();
+        if (url == null) {
+            Log.w(TAG, "Redirect intent without a URL");
+            return;
+        }
+        Log.i(TAG, "[intent] " + url);
+        if (loginActive && loginStage == LoginStage.LEG1 && url.startsWith("jagex:")) {
+            handleLeg1Scheme(url.substring("jagex:".length()));
+        } else if (loginActive && loginStage == LoginStage.LEG1
+            && url.startsWith(JagexOAuthClient.LAUNCHER_REDIRECT_URI)) {
+            handleLeg1Redirect(url);
+        } else {
+            Log.w(TAG, "Ignoring redirect outside active leg-1 login: stage=" + loginStage);
+        }
+    }
 
-            @Override
-            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
-                runOnUiThread(() -> {
-                    if (loginActive) {
-                        tvLoginStatus.setText("Loading...");
-                    }
-                });
+    /** The launcher page hands the code via the "jagex:code=...,state=..." scheme. */
+    private void handleLeg1Scheme(String params) {
+        String code = null;
+        for (String pair : params.split("[,&]")) {
+            int eq = pair.indexOf('=');
+            if (eq < 0) continue;
+            String k = pair.substring(0, eq);
+            String v = pair.substring(eq + 1);
+            try {
+                v = java.net.URLDecoder.decode(v, "UTF-8");
+            } catch (Exception ignored) {
             }
-        });
-        FrameLayout.LayoutParams wvParams = new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT);
-        loginOverlay.addView(loginWebView, wvParams);
+            if ("code".equals(k)) {
+                code = v;
+            }
+        }
+        if (code == null || code.isEmpty()) {
+            failLogin("Login failed: no authorization code in the launcher redirect.");
+            return;
+        }
+        handleLeg1Code(code);
+    }
+
+    private void handleLeg1Redirect(String url) {
+        if (loginStage != LoginStage.LEG1) {
+            Log.w(TAG, "Ignoring leg-1 redirect outside leg 1: stage=" + loginStage);
+            return;
+        }
+        String code = parseUrlParam(url, "code");
+        if (code == null || code.isEmpty()) {
+            failLogin("Login failed: no authorization code in the redirect.");
+            return;
+        }
+        handleLeg1Code(code);
+    }
+
+    private void handleLeg1Code(String code) {
+        if (loginStage != LoginStage.LEG1) {
+            Log.w(TAG, "Ignoring leg-1 code outside leg 1: stage=" + loginStage);
+            return;
+        }
+        loginStage = LoginStage.EXCHANGING;
+        final String verifier = leg1Verifier;
+        Log.i(TAG, "[2] Captured leg-1 code (len=" + code.length() + ")");
+        new Thread(() -> {
+            try {
+                JagexOAuthClient.Tokens tokens = JagexOAuthClient.exchangeCode(code, verifier);
+                String provider = tokens.idToken != null ? JagexOAuthClient.loginProvider(tokens.idToken) : "";
+                Log.i(TAG, "[3] Token exchange OK; login_provider=" + provider);
+                if ("runescape".equals(provider)) {
+                    failLogin("This is a legacy RuneScape account. RuneLite Mobile only supports Jagex accounts.");
+                    return;
+                }
+                oauthAccessToken = tokens.accessToken != null ? tokens.accessToken : "";
+                oauthRefreshToken = tokens.refreshToken != null ? tokens.refreshToken : "";
+                oauthExpiresAt = tokens.expiresAtMillis;
+                runOnUiThread(MainActivity.this::startConsentLeg);
+            } catch (Exception e) {
+                Log.e(TAG, "Token exchange failed", e);
+                failLogin("Login failed: token exchange error. Check your network and try again.");
+            }
+        }, "JagexTokenExchange").start();
+    }
+
+    /** Start the loopback callback server the consent leg redirects to. */
+    private boolean startCallbackServer() {
+        stopCallbackServer();
+        callbackServer = new LocalCallbackServer(fragment ->
+            runOnUiThread(() -> handleConsentFragment(fragment)));
+        if (!callbackServer.start()) {
+            Log.e(TAG, "Could not bind the localhost consent callback port 80");
+            callbackServer = null;
+            return false;
+        }
+        return true;
+    }
+
+    private void stopCallbackServer() {
+        if (callbackServer != null) {
+            callbackServer.stop();
+            callbackServer = null;
+        }
+    }
+
+    private void openInBrowser(String url) {
+        try {
+            startActivity(new android.content.Intent(android.content.Intent.ACTION_VIEW,
+                android.net.Uri.parse(url)));
+        } catch (Exception e) {
+            Log.e(TAG, "No browser available to open " + url, e);
+            failLogin("Login failed: could not open your browser.");
+        }
     }
 
     private void startConsentLeg() {
@@ -674,74 +772,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         leg2State = JagexOAuthClient.randomToken(16);
         leg2Nonce = JagexOAuthClient.randomToken(16);
         String url = JagexOAuthClient.buildConsentAuthorizeUrl(leg2State, leg2Nonce);
-        Log.i(TAG, "[4] Navigating to consent authorize (leg 2)");
-        tvLoginStatus.setText("Confirming account...");
-        loginWebView.loadUrl(url);
+        Log.i(TAG, "[4] Opening browser for consent authorize (leg 2)");
+        tvLoginStatus.setText("Confirming account — check your browser");
+        openInBrowser(url);
     }
 
-    private boolean handleLoginNavigation(String url) {
-        if (!loginActive) return false;
-
-        switch (loginStage) {
-            case LEG1: {
-                if (!url.startsWith(JagexOAuthClient.LAUNCHER_REDIRECT_URI) && !url.startsWith("jagex:")) {
-                    return false;
-                }
-                String code = parseUrlParam(url, "code");
-                if (code == null || code.isEmpty()) {
-                    failLogin("Login failed: no authorization code in the redirect.");
-                    return true;
-                }
-                loginStage = LoginStage.EXCHANGING;
-                final String verifier = leg1Verifier;
-                Log.i(TAG, "[2] Captured leg-1 code (len=" + code.length() + ")");
-                new Thread(() -> {
-                    try {
-                        JagexOAuthClient.Tokens tokens = JagexOAuthClient.exchangeCode(code, verifier);
-                        String provider = tokens.idToken != null ? JagexOAuthClient.loginProvider(tokens.idToken) : "";
-                        Log.i(TAG, "[3] Token exchange OK; login_provider=" + provider);
-                        if ("runescape".equals(provider)) {
-                            failLogin("This is a legacy RuneScape account. RuneLite Mobile only supports Jagex accounts.");
-                            return;
-                        }
-                        oauthAccessToken = tokens.accessToken != null ? tokens.accessToken : "";
-                        oauthRefreshToken = tokens.refreshToken != null ? tokens.refreshToken : "";
-                        oauthExpiresAt = tokens.expiresAtMillis;
-                        runOnUiThread(MainActivity.this::startConsentLeg);
-                    } catch (Exception e) {
-                        Log.e(TAG, "Token exchange failed", e);
-                        failLogin("Login failed: token exchange error. Check your network and try again.");
-                    }
-                }, "JagexTokenExchange").start();
-                return true;
-            }
-            case LEG2: {
-                if (!url.startsWith("http://localhost") && !url.startsWith("http://127.0.0.1")) {
-                    return false;
-                }
-                String idToken = parseFragmentParam(url, "id_token");
-                if (idToken == null || idToken.isEmpty()) {
-                    failLogin("Login failed: Jagex did not return a consent token.");
-                    return true;
-                }
-                loginStage = LoginStage.DONE;
-                Log.i(TAG, "[5/6] Captured consent id_token (len=" + idToken.length() + ")");
-                new Thread(() -> {
-                    try {
-                        String newSessionId = JagexOAuthClient.createSession(idToken);
-                        List<JagexOAuthClient.Account> accounts = JagexOAuthClient.listAccounts(newSessionId);
-                        Log.i(TAG, "[7/8] Session created; accounts: " + accounts.size());
-                        runOnUiThread(() -> onLoginSucceeded(newSessionId, accounts));
-                    } catch (Exception e) {
-                        Log.e(TAG, "Session creation failed", e);
-                        failLogin("Login failed: could not create a game session. Try again.");
-                    }
-                }, "JagexSession").start();
-                return true;
-            }
-            default:
-                return false;
+    /** Consent id_token arrives in the URL fragment, POSTed back by the callback page. */
+    private void handleConsentFragment(String fragment) {
+        if (!loginActive || loginStage != LoginStage.LEG2) {
+            Log.w(TAG, "Ignoring consent callback outside leg 2: stage=" + loginStage);
+            return;
         }
+        String state = parsePairs(fragment, "state", true);
+        if (leg2State == null || !leg2State.equals(state)) {
+            Log.w(TAG, "Consent state mismatch: got=" + state);
+            failLogin("Login failed: consent state mismatch. Try again.");
+            return;
+        }
+        String idToken = parsePairs(fragment, "id_token", true);
+        if (idToken == null || idToken.isEmpty()) {
+            failLogin("Login failed: Jagex did not return a consent token.");
+            return;
+        }
+        loginStage = LoginStage.DONE;
+        Log.i(TAG, "[5/6] Captured consent id_token (len=" + idToken.length() + ")");
+        new Thread(() -> {
+            try {
+                String newSessionId = JagexOAuthClient.createSession(idToken);
+                List<JagexOAuthClient.Account> accounts = JagexOAuthClient.listAccounts(newSessionId);
+                Log.i(TAG, "[7/8] Session created; accounts: " + accounts.size());
+                runOnUiThread(() -> onLoginSucceeded(newSessionId, accounts));
+            } catch (Exception e) {
+                Log.e(TAG, "Session creation failed", e);
+                failLogin("Login failed: could not create a game session. Try again.");
+            }
+        }, "JagexSession").start();
     }
 
     private void onLoginSucceeded(String newSessionId, List<JagexOAuthClient.Account> accounts) {
@@ -779,7 +844,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         loginActive = false;
         loginStage = LoginStage.IDLE;
         loginOverlay.setVisibility(View.GONE);
-        loginWebView.stopLoading();
+        stopCallbackServer();
         tvLoginStatus.setText("");
     }
 
@@ -798,12 +863,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static String parseUrlParam(String url, String key) {
         int idx = url.indexOf('?');
-        if (idx < 0) return null;
-        return parsePairs(url.substring(idx + 1), key, false);
-    }
-
-    private static String parseFragmentParam(String url, String key) {
-        int idx = url.indexOf('#');
         if (idx < 0) return null;
         return parsePairs(url.substring(idx + 1), key, false);
     }
@@ -1513,8 +1572,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     @Override
     protected void onDestroy() {
         super.onDestroy();
-        if (loginWebView != null) {
-            loginWebView.destroy();
-        }
+        stopCallbackServer();
     }
 }
