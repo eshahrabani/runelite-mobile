@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- base-config is required: with a networkSecurityConfig present,
+         usesCleartextTraffic in the manifest is ignored on API 24+, and
+         cleartext defaults to BLOCKED. The game fetches the world list
+         from http://www.runescape.com/slr.ws (plain HTTP): without this
+         the fetch throws and the client spins in a null-array NPE loop. -->
+    <base-config cleartextTrafficPermitted="true"/>
+    <debug-overrides>
+        <trust-anchors>
+            <certificates src="@raw/rl_debug_ca"/>
+        </trust-anchors>
+    </debug-overrides>
+</network-security-config>

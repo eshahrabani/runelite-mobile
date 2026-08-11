@@ -81,6 +81,7 @@ public class Component implements Serializable {
     public synchronized void addMouseWheelListener(MouseWheelListener l) { mouseWheelListeners.add(l); }
     public synchronized void addKeyListener(KeyListener l) { keyListeners.add(l); }
     public synchronized void addFocusListener(FocusListener l) { focusListeners.add(l); }
+    public synchronized void removeFocusListener(FocusListener l) { focusListeners.remove(l); }
     public synchronized void addComponentListener(java.awt.event.ComponentListener l) { componentListeners.add(l); }
     public synchronized void removeComponentListener(java.awt.event.ComponentListener l) { componentListeners.remove(l); }
     public synchronized void addHierarchyListener(HierarchyListener l) { hierarchyListeners.add(l); }

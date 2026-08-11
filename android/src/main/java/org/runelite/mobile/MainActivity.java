@@ -71,6 +71,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean pointerDown = false;
     private long lastStateLog = 0;
     private long lastDrawLog = 0;
+    private long lastListenerLog = 0;
+    private Runnable loginReqTicker;
 
     // ── Launcher UI ─────────────────────────────────────────────────────────
     private FrameLayout rootLayout;
@@ -133,6 +135,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         System.setProperty("java.version", "11.0.22");
         System.setProperty("user.home", getFilesDir().getAbsolutePath());
         System.setProperty("jagex.userhome", getFilesDir().getAbsolutePath());
+        // The game's bundled BouncyCastle TLS (used for its own HTTPS requests)
+        // fails its handshake on Android. This flag makes the client use the
+        // standard platform TLS stack instead (verified in the client: qk ctor).
+        System.setProperty("jagex.disableBouncyCastle", "true");
 
         // Bind AWTBridge active pixels to appletPixels
         AWTBridge.activePixels = appletPixels;
@@ -1259,7 +1265,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Log.e(TAG, "Could not find a Callbacks field on the client class!");
             }
 
-            // ── Step 7: Initialize and start the game client ──
+            // ── Step 6.6: Inject the ScheduledExecutorService the game expects ──            // The game reads client.tk (ScheduledExecutorService) to run the
+            // post-terms-accept login task (mw.af). Desktop RuneLite populates it
+            // via Guice injectMembers(); here we set it by type, obfuscation-proof.
+            Field executorField = findFieldByType(clientClass, "java.util.concurrent.ScheduledExecutorService");
+            if (executorField != null) {
+                executorField.setAccessible(true);
+                executorField.set(clientObject, java.util.concurrent.Executors.newScheduledThreadPool(1));
+                Log.i(TAG, "ScheduledExecutorService injected into client field " + executorField.getName());
+            } else {
+                Log.e(TAG, "Could not find ScheduledExecutorService field on the client class!");
+            }
+
+            // ── Step 6.7: Install the OtlTokenRequester (one-time-login token) ──
+            // The game's login flow (client.hv) checks client.qs; if it is null it
+            // skips the OTL fetch and sends the /play login request with no token,
+            // which the server rejects with HTTP 400 ("Failed to login"). Desktop
+            // RuneLite injects a requester that POSTs the JX session to
+            // auth.jagex.com/game-session/v1/tokens and returns the OTL token.
+            installOtlTokenRequester();
+    // ── Step 7: Initialize and start the game client ──
             // GameEngine.initialize() calls setSize(GAME_FIXED_SIZE) + init() + start()
             updateStatus("Initializing game client...");
             Method initializeMethod = gameEngineClass.getMethod("initialize");
@@ -1283,6 +1308,118 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 Toast.makeText(this, "Loader Error: " + finalMsg, Toast.LENGTH_LONG).show();
             });
         }
+    }
+
+
+            /**
+     * The game expects the runtime to supply an OtlTokenRequester that turns the
+     * JX session into a one-time login token for the /play login request. We
+     * implement it against auth.jagex.com/game-session/v1/tokens (verified: the
+     * endpoint returns HTTP 200 {"token": "..."} for a fresh session).
+     */
+    private void installOtlTokenRequester() {
+        try {
+            ClassLoader cl = clientClass.getClassLoader();
+            Class<?> requesterIface = cl.loadClass("com.jagex.oldscape.pub.OtlTokenRequester");
+            Class<?> responseIface = cl.loadClass("com.jagex.oldscape.pub.OtlTokenResponse");
+            final Method isSuccess = responseIface.getMethod("isSuccess");
+            final Method getToken = responseIface.getMethod("getToken");
+
+            Object requester = Proxy.newProxyInstance(cl, new Class<?>[]{requesterIface},
+                (Object proxy, Method method, Object[] args) -> {
+                    if (!method.getName().equals("request") || args == null || args.length < 4) {
+                        return null;
+                    }
+                    final java.net.URL playUrl = (java.net.URL) args[1];
+                    @SuppressWarnings("unchecked")
+                    final java.util.Map<String, String> headers = (java.util.Map<String, String>) args[2];
+                    Log.d(TAG, "OTL request() invoked: url=" + playUrl + " arg0=" + args[0]
+                        + " headers=" + headers + " body=" + args[3]);
+                    return java.util.concurrent.CompletableFuture.supplyAsync(() -> {
+                        try {
+                            String token = fetchOtlToken(playUrl, headers);
+                            if (token == null) {
+                                Log.w(TAG, "OTL request failed");
+                                return responseProxy(responseIface, isSuccess, getToken, false, null);
+                            }
+                            Log.i(TAG, "OTL token obtained (" + token.length() + " chars)");
+                            return responseProxy(responseIface, isSuccess, getToken, true, token);
+                        } catch (Throwable e) {
+                            Log.w(TAG, "OTL request error", e);
+                            return responseProxy(responseIface, isSuccess, getToken, false, null);
+                        }
+                    }, java.util.concurrent.Executors.newSingleThreadExecutor());
+                });
+
+            // Find the setter by parameter type (obfuscation-proof).
+            Method setter = null;
+            for (Method m : clientClass.getMethods()) {
+                if (m.getParameterCount() == 1 && m.getParameterTypes()[0] == requesterIface) {
+                    setter = m;
+                    break;
+                }
+            }
+            if (setter == null) {
+                Log.e(TAG, "Could not find OtlTokenRequester setter on client");
+                return;
+            }
+            setter.invoke(clientObject, requester);
+            Log.i(TAG, "OtlTokenRequester installed via " + setter.getName());
+        } catch (Throwable e) {
+            Log.w(TAG, "OtlTokenRequester install failed: " + e.getMessage());
+        }
+    }
+
+    private String fetchOtlToken(java.net.URL playUrl, java.util.Map<String, String> headers) {
+        java.net.HttpURLConnection conn = null;
+        try {
+            java.net.URL otlUrl = new java.net.URL(playUrl.getProtocol(), playUrl.getHost(),
+                playUrl.getPort(), "/game-session/v1/tokens");
+            conn = (java.net.HttpURLConnection) otlUrl.openConnection();
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("Authorization", "Bearer " + sessionId);
+            conn.setDoOutput(true);
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(15000);
+            String body = new org.json.JSONObject().put("accountId", characterId).toString();
+            conn.getOutputStream().write(body.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            int code = conn.getResponseCode();
+            if (code != 200) {
+                Log.w(TAG, "OTL endpoint HTTP " + code);
+                return null;
+            }
+            java.io.InputStream in = conn.getInputStream();
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            byte[] buf = new byte[1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            org.json.JSONObject resp = new org.json.JSONObject(out.toString("UTF-8"));
+            return resp.optString("token", null);
+        } catch (Throwable e) {
+            Log.w(TAG, "OTL HTTP error", e);
+            return null;
+        } finally {
+            if (conn != null) {
+                conn.disconnect();
+            }
+        }
+    }
+
+    private Object responseProxy(Class<?> iface, Method isSuccess, Method getToken,
+                                 boolean success, String token) {
+        return Proxy.newProxyInstance(iface.getClassLoader(), new Class<?>[]{iface},
+            (Object proxy, Method method, Object[] args) -> {
+                if (method.equals(isSuccess)) {
+                    return success;
+                }
+                if (method.equals(getToken)) {
+                    return token;
+                }
+                return null;
+            });
     }
 
     private Field findFieldByType(Class<?> clazz, String typeName) {
@@ -1416,6 +1553,49 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (id != java.awt.event.MouseEvent.MOUSE_MOVED) {
             Log.d(TAG, "Dispatch mouse id=" + id + " at (" + x + "," + y + ") to " + target.getClass().getSimpleName());
         }
+        if (id == java.awt.event.MouseEvent.MOUSE_PRESSED) {
+            long now = System.currentTimeMillis();
+            if (now - lastListenerLog > 2000) {
+                lastListenerLog = now;
+                Log.d(TAG, "InputTarget listeners: mouse=" + target.getMouseListeners().length
+                    + " motion=" + target.getMouseMotionListeners().length
+                    + " wheel=" + target.getMouseWheelListeners().length);
+            }
+            dumpMouseState("press-stored");
+            surfaceView.postDelayed(() -> dumpMouseState("press-snapshot"), 300);
+        }
+        if (id == java.awt.event.MouseEvent.MOUSE_PRESSED) {
+            if (loginReqTicker == null) {
+                loginReqTicker = new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            ClassLoader cl = clientClass.getClassLoader();
+                            Object qj = readFieldOn(cl, "client", "qj");
+                            Object otl = readFieldOn(cl, "client", "pq");
+                            Object qs = readFieldOn(cl, "client", "qs");
+                            Object stage = readFieldOn(cl, "client", "cm");
+                            StringBuilder sb = new StringBuilder("LoginTick: stage=").append(stage);
+                            sb.append(" otl=").append(otl == null ? "null" : "set(" + String.valueOf(otl).length() + ")");
+                            sb.append(" requester=").append(qs == null ? "null" : "set");
+                            if (qj != null) {
+                                String url = readNestedField(qj, "af");
+                                sb.append(" qjUrl=").append(url);
+                                String resp = readNestedField(qj, "ae");
+                                sb.append(" qjState=").append(resp);
+                            } else {
+                                sb.append(" qj=null");
+                            }
+                            Log.i(TAG, sb.toString());
+                        } catch (Throwable e) {
+                            Log.w(TAG, "LoginTick failed: " + e.getMessage());
+                        }
+                        surfaceView.postDelayed(this, 1000);
+                    }
+                };
+                surfaceView.postDelayed(loginReqTicker, 1000);
+            }
+        }
         java.awt.event.MouseEvent ev = new java.awt.event.MouseEvent(
             target, id, when, 0, x, y, 1, false, 1);
         if (id == java.awt.event.MouseEvent.MOUSE_MOVED || id == java.awt.event.MouseEvent.MOUSE_DRAGGED) {
@@ -1440,6 +1620,95 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         break;
                 }
             }
+        }
+    }
+
+    /**
+     * Diagnostic: reflect the game's mouse-handler state (obfuscation-stable:
+     * we look up the class and public static fields by name) plus the RuneLite
+     * API view, to see whether a dispatched press reached the game.
+     */
+    private void dumpMouseState(String why) {
+        if (clientObject == null) return;
+        try {
+            ClassLoader cl = clientClass.getClassLoader();
+            Class<?> tz = cl.loadClass("tz");
+            StringBuilder sb = new StringBuilder(why + ": aj=" + (tz.getField("aj").get(null) != null));
+            String[] names = {"ar", "aw", "ai", "aq", "ac", "aa", "ao", "ab", "ag", "as", "ap", "ad"};
+            for (String n : names) {
+                try {
+                    sb.append(" ").append(n).append("=").append(tz.getField(n).getInt(null));
+                } catch (Exception e) {
+                    sb.append(" ").append(n).append("=ERR");
+                }
+            }
+            try {
+                Class<?> clientIface = cl.loadClass("net.runelite.api.Client");
+                Object pos = clientIface.getMethod("getMouseCanvasPosition").invoke(clientObject);
+                Object btn = clientIface.getMethod("getMouseCurrentButton").invoke(clientObject);
+                sb.append(" apiPos=").append(pos).append(" apiBtn=").append(btn);
+            } catch (Exception e) {
+                sb.append(" api=ERR");
+            }
+            sb.append(" jxSession=").append(readStaticField(cl, "at", "lb"));
+            sb.append(" jxChar=").append(readStaticField(cl, "ec", "ly"));
+            sb.append(" jxToken=").append(readStaticField(cl, "lt", "lh"));
+            sb.append(" otlToken=").append(readFieldOn(cl, "client", "pq"));
+            sb.append(" otlRequester=").append(readFieldOn(cl, "client", "qs") == null ? "null" : "set");
+            Object otlFuture = readFieldOn(cl, "client", "qt");
+            if (otlFuture instanceof java.util.concurrent.Future) {
+                java.util.concurrent.Future<?> f = (java.util.concurrent.Future<?>) otlFuture;
+                sb.append(" otlFuture=").append(f.isDone() ? "done" : (f.isCancelled() ? "cancelled" : "pending"));
+            } else {
+                sb.append(" otlFuture=").append(otlFuture);
+            }
+            sb.append(" loginReqUrl=").append(readFieldOn(cl, "client", "qj") == null ? "null" : readNestedField(readFieldOn(cl, "client", "qj"), "af"));
+            sb.append(" loginStage=").append(readFieldOn(cl, "client", "cm"));
+            Log.d(TAG, "MouseState " + sb);
+        } catch (Throwable e) {
+            Log.w(TAG, "MouseState dump failed: " + e.getMessage());
+        }
+    }
+
+    private static String readStaticField(ClassLoader cl, String cls, String field) {
+        try {
+            java.lang.reflect.Field f = cl.loadClass(cls).getDeclaredField(field);
+            f.setAccessible(true);
+            Object v = f.get(null);
+            if (v == null) return "null";
+            String s = v.toString();
+            return s.length() > 8 ? s.substring(0, 8) + "...(" + s.length() + ")" : s;
+        } catch (Exception e) {
+            return "ERR";
+        }
+    }
+
+    private static Object readFieldOn(ClassLoader cl, String cls, String field) {
+        try {
+            java.lang.reflect.Field f = cl.loadClass(cls).getDeclaredField(field);
+            f.setAccessible(true);
+            if (java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                return f.get(null);
+            }
+            if (clientObject == null) {
+                return null;
+            }
+            return f.get(clientObject);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private static String readNestedField(Object o, String field) {
+        try {
+            java.lang.reflect.Field f = o.getClass().getDeclaredField(field);
+            f.setAccessible(true);
+            Object v = f.get(o);
+            if (v == null) return "null";
+            String s = v.toString();
+            return s.length() > 60 ? s.substring(0, 60) + "...(" + s.length() + ")" : s;
+        } catch (Exception e) {
+            return "ERR";
         }
     }
 
@@ -1541,7 +1810,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             Class<?> clientInterface = clientClass.getClassLoader().loadClass("net.runelite.api.Client");
                             Object state = clientInterface.getMethod("getGameState").invoke(clientObject);
                             Object loginIdx = clientInterface.getMethod("getLoginIndex").invoke(clientObject);
-                            Log.i(TAG, "GameState: " + state + " loginIndex: " + loginIdx);
+                            StringBuilder sb = new StringBuilder("GameState: " + state + " loginIndex: " + loginIdx);
+                            for (String probe : new String[]{"getWorld", "getWorldHost", "getCurrentLoginField"}) {
+                                try {
+                                    Object v = clientInterface.getMethod(probe).invoke(clientObject);
+                                    sb.append(" ").append(probe).append("=").append(v);
+                                } catch (Exception e) {
+                                    sb.append(" ").append(probe).append("=ERR");
+                                }
+                            }
+                            try {
+                                Object worlds = clientInterface.getMethod("getWorldList").invoke(clientObject);
+                                if (worlds instanceof Object[]) {
+                                    sb.append(" worldList=").append(((Object[]) worlds).length);
+                                } else {
+                                    sb.append(" worldList=").append(worlds);
+                                }
+                            } catch (Exception e) {
+                                sb.append(" worldList=ERR");
+                            }
+                            Log.i(TAG, sb.toString());
                         } catch (Exception e) {
                             Log.w(TAG, "GameState poll failed: " + e.getMessage());
                         }
