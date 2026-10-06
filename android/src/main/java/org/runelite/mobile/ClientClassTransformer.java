@@ -11,6 +11,7 @@ import org.objectweb.asm.tree.FieldInsnNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.InsnList;
 import org.objectweb.asm.tree.InsnNode;
+import org.objectweb.asm.tree.JumpInsnNode;
 import org.objectweb.asm.tree.InvokeDynamicInsnNode;
 import org.objectweb.asm.tree.LdcInsnNode;
 import org.objectweb.asm.tree.MethodInsnNode;
@@ -39,6 +40,257 @@ public final class ClientClassTransformer {
         reader.accept(classNode, 0);
 
         boolean modified = false;
+
+        // Inject the scene snapshot into the in-game frame loop: client.ij calls
+        // gp.az (the 3D scene render) and then draws the 2D UI on top. The hook
+        // runs right AFTER the scene render (read-only diagnostic snapshot of
+        // the display buffer at the moment the scene has drawn, before the UI
+        // pass). Kept in sync with the transform in build.gradle.
+        if ("client".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("ij".equals(method.name) && "(I)V".equals(method.desc)) {
+                    for (AbstractInsnNode insn : method.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.getOpcode() == Opcodes.INVOKEVIRTUAL
+                                && "gp".equals(min.owner) && "az".equals(min.name)
+                                && "(IILvv;III)V".equals(min.desc)) {
+                                InsnList inj = new InsnList();
+                                inj.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                                inj.add(new MethodInsnNode(
+                                    Opcodes.INVOKESTATIC,
+                                    "org/runelite/mobile/TileCompositor",
+                                    "composite",
+                                    "(Ljava/lang/Object;)V",
+                                    false));
+                                AbstractInsnNode next = min.getNext();
+                                if (next == null) {
+                                    method.instructions.add(inj);
+                                } else {
+                                    method.instructions.insertBefore(next, inj);
+                                }
+                                modified = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ("client".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("ij".equals(method.name) && "(I)V".equals(method.desc)) {
+                    for (AbstractInsnNode insn : method.instructions.toArray()) {
+                        if (insn instanceof MethodInsnNode) {
+                            MethodInsnNode min = (MethodInsnNode) insn;
+                            if (min.getOpcode() == Opcodes.INVOKEVIRTUAL
+                                && "client".equals(min.owner) && "iz".equals(min.name)
+                                && "(I)V".equals(min.desc)) {
+                                InsnList inj = new InsnList();
+                                inj.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                                inj.add(new MethodInsnNode(
+                                    Opcodes.INVOKESTATIC,
+                                    "org/runelite/mobile/TileCompositor",
+                                    "compositeEnd",
+                                    "(Ljava/lang/Object;)V",
+                                    false));
+                                AbstractInsnNode next = min.getNext();
+                                if (next == null) {
+                                    method.instructions.add(inj);
+                                } else {
+                                    method.instructions.insertBefore(next, inj);
+                                }
+                                modified = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if ("fu".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("ax".equals(method.name) && "(DILva;)Z".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceTileEnter",
+                        "(Ljava/lang/Object;)V",
+                        false));
+                    method.instructions.insert(inj);
+                    for (AbstractInsnNode insn : method.instructions.toArray()) {
+                        if (insn instanceof JumpInsnNode
+                            && insn.getOpcode() == Opcodes.IFNONNULL
+                            && ((JumpInsnNode) insn).label != null) {
+                            InsnList inj2 = new InsnList();
+                            inj2.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                            inj2.add(new MethodInsnNode(
+                                Opcodes.INVOKESTATIC,
+                                "org/runelite/mobile/TileCompositor",
+                                "traceTileRender",
+                                "(Ljava/lang/Object;)V",
+                                false));
+                            method.instructions.insert(((JumpInsnNode) insn).label, inj2);
+                            modified = true;
+                            break;
+                        }
+                    }
+                    modified = true;
+                }
+                if ("mx".equals(method.name) && "(Lfu;DILyz;I)Z".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceMxEnter",
+                        "(Ljava/lang/Object;)V",
+                        false));
+                    method.instructions.insert(inj);
+                    for (AbstractInsnNode insn : method.instructions.toArray()) {
+                        if (insn.getOpcode() == Opcodes.IRETURN) {
+                            InsnList inj2 = new InsnList();
+                            inj2.add(new InsnNode(Opcodes.DUP));
+                            inj2.add(new MethodInsnNode(
+                                Opcodes.INVOKESTATIC,
+                                "org/runelite/mobile/TileCompositor",
+                                "traceMxResult",
+                                "(I)V",
+                                false));
+                            method.instructions.insertBefore(insn, inj2);
+                            modified = true;
+                        }
+                    }
+                    modified = true;
+                }
+            }
+        }
+
+        if ("gp".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("az".equals(method.name) && "(IILvv;III)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 1));
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 2));
+                    inj.add(new VarInsnNode(Opcodes.ALOAD, 3));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceGate",
+                        "(IILjava/lang/Object;)V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+                if ("em".equals(method.name) && "(Lgp;[Llw;IIIIIIIIIILvv;II)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ALOAD, 1));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceGpEm",
+                        "(Ljava/lang/Object;)V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+            }
+        }
+
+        if ("yw".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("es".equals(method.name) && "(IIII)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 0));
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 1));
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 2));
+                    inj.add(new VarInsnNode(Opcodes.ILOAD, 3));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceYwEs",
+                        "(IIII)V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+            }
+        }
+
+        if ("ff".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("aj".equals(method.name) && "(FFFFFFFFFIIIIIIIIIIIII)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceFqAj",
+                        "()V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+                if ("ct".equals(method.name) && "([I[IIIIIIIIFFIIIIII)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceFqCt",
+                        "()V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+                if ("bh".equals(method.name) && "([I[FIIIF)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceFfBh",
+                        "()V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+            }
+        }
+
+        if ("client".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("dg".equals(method.name) && "(Lzv;Lzv;Lzv;)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "traceDg",
+                        "()V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+            }
+        }
+
+        if ("tg".equals(classNode.name)) {
+            for (MethodNode method : classNode.methods) {
+                if ("af".equals(method.name) && "(IIB)V".equals(method.desc)) {
+                    InsnList inj = new InsnList();
+                    inj.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                    inj.add(new MethodInsnNode(
+                        Opcodes.INVOKESTATIC,
+                        "org/runelite/mobile/TileCompositor",
+                        "tracePresent",
+                        "(Ljava/lang/Object;)V",
+                        false));
+                    method.instructions.insert(inj);
+                    modified = true;
+                }
+            }
+        }
 
         if (classNode.signature != null) {
             if (classNode.signature.contains("Ljava/lang/ProcessHandle;")) {
@@ -245,7 +497,16 @@ public final class ClientClassTransformer {
         }
 
         if (modified) {
-            ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
+            ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
+                @Override
+                protected String getCommonSuperClass(String type1, String type2) {
+                    try {
+                        return super.getCommonSuperClass(type1, type2);
+                    } catch (Throwable t) {
+                        return "java/lang/Object";
+                    }
+                }
+            };
             classNode.accept(writer);
             return writer.toByteArray();
         }

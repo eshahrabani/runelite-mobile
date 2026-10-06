@@ -27,6 +27,7 @@ android {
     buildTypes {
         release {
             minifyEnabled false
+            signingConfig signingConfigs.debug
         }
     }
     compileOptions {
@@ -148,7 +149,7 @@ task downloadAndDexJar {
                                     }
                                 } catch (Exception e) {}
                                 
-                                if (hasConcat || hasUnsafe) {
+                                if (hasConcat || hasUnsafe || entry.name == "client.class" || entry.name == "fu.class" || entry.name == "gp.class" || entry.name == "yw.class" || entry.name == "ff.class" || entry.name == "tg.class") {
                                     println "  Transforming class: " + entry.name
                                     try {
                                         bytes = transformClassBytes(bytes)
@@ -292,6 +293,7 @@ project.afterEvaluate {
 configurations {
     all {
         exclude group: 'com.google.guava', module: 'listenablefuture'
+        exclude group: 'com.google.code.findbugs', module: 'jsr305'
     }
 }
 
@@ -317,6 +319,267 @@ byte[] transformClassBytes(byte[] classBytes) {
     reader.accept(classNode, 0)
 
     boolean modified = false
+
+    // Inject the scene snapshot into the in-game frame loop: client.ij calls
+    // gp.az (the 3D scene render) and then draws the 2D UI on top. The hook
+    // runs right AFTER the scene render (read-only diagnostic snapshot of the
+    // display buffer at the moment the scene has drawn, before the UI pass).
+    if (classNode.name == "client") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "ij" && method.desc == "(I)V") {
+                for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.MethodInsnNode) {
+                        org.objectweb.asm.tree.MethodInsnNode min = (org.objectweb.asm.tree.MethodInsnNode) insn
+                        if (min.opcode == org.objectweb.asm.Opcodes.INVOKEVIRTUAL
+                            && min.owner == "gp" && min.name == "az" && min.desc == "(IILvv;III)V") {
+                            org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                            inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                            inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                                org.objectweb.asm.Opcodes.INVOKESTATIC,
+                                "org/runelite/mobile/TileCompositor",
+                                "composite",
+                                "(Ljava/lang/Object;)V",
+                                false))
+                            org.objectweb.asm.tree.AbstractInsnNode next = min.getNext()
+                            if (next == null) {
+                                method.instructions.add(inj)
+                            } else {
+                                method.instructions.insertBefore(next, inj)
+                            }
+                            modified = true
+                            println "  [ASM] Injected TileCompositor.composite into client.ij after gp.az"
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (classNode.name == "client") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "ij" && method.desc == "(I)V") {
+                for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.MethodInsnNode) {
+                        org.objectweb.asm.tree.MethodInsnNode min = (org.objectweb.asm.tree.MethodInsnNode) insn
+                        if (min.opcode == org.objectweb.asm.Opcodes.INVOKEVIRTUAL
+                            && min.owner == "client" && min.name == "iz" && min.desc == "(I)V") {
+                            org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                            inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                            inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                                org.objectweb.asm.Opcodes.INVOKESTATIC,
+                                "org/runelite/mobile/TileCompositor",
+                                "compositeEnd",
+                                "(Ljava/lang/Object;)V",
+                                false))
+                            org.objectweb.asm.tree.AbstractInsnNode next = min.getNext()
+                            if (next == null) {
+                                method.instructions.add(inj)
+                            } else {
+                                method.instructions.insertBefore(next, inj)
+                            }
+                            modified = true
+                            println "  [ASM] Injected TileCompositor.compositeEnd into client.ij after client.iz"
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (classNode.name == "fu") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "ax" && method.desc == "(DILva;)Z") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceTileEnter",
+                    "(Ljava/lang/Object;)V",
+                    false))
+                method.instructions.insert(inj)
+                for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions.toArray()) {
+                    if (insn instanceof org.objectweb.asm.tree.JumpInsnNode
+                        && insn.opcode == org.objectweb.asm.Opcodes.IFNONNULL
+                        && insn.label != null) {
+                        org.objectweb.asm.tree.InsnList inj2 = new org.objectweb.asm.tree.InsnList()
+                        inj2.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                        inj2.add(new org.objectweb.asm.tree.MethodInsnNode(
+                            org.objectweb.asm.Opcodes.INVOKESTATIC,
+                            "org/runelite/mobile/TileCompositor",
+                            "traceTileRender",
+                            "(Ljava/lang/Object;)V",
+                            false))
+                        method.instructions.insert(insn.label, inj2)
+                        modified = true
+                        println "  [ASM] Injected TileCompositor.traceTileRender into fu.ax data branch"
+                        break
+                    }
+                }
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceTileEnter into fu.ax"
+            }
+            if (method.name == "mx" && method.desc == "(Lfu;DILyz;I)Z") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceMxEnter",
+                    "(Ljava/lang/Object;)V",
+                    false))
+                method.instructions.insert(inj)
+                for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions.toArray()) {
+                    if (insn.opcode == org.objectweb.asm.Opcodes.IRETURN) {
+                        org.objectweb.asm.tree.InsnList inj2 = new org.objectweb.asm.tree.InsnList()
+                        inj2.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DUP))
+                        inj2.add(new org.objectweb.asm.tree.MethodInsnNode(
+                            org.objectweb.asm.Opcodes.INVOKESTATIC,
+                            "org/runelite/mobile/TileCompositor",
+                            "traceMxResult",
+                            "(I)V",
+                            false))
+                        method.instructions.insertBefore(insn, inj2)
+                        modified = true
+                    }
+                }
+                modified = true
+                println "  [ASM] Injected TileCompositor.mx traces into fu.mx"
+            }
+        }
+    }
+
+    if (classNode.name == "gp") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "az" && method.desc == "(IILvv;III)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 1))
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 2))
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 3))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceGate",
+                    "(IILjava/lang/Object;)V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceGate into gp.az"
+            }
+            if (method.name == "em" && method.desc == "(Lgp;[Llw;IIIIIIIIIILvv;II)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 1))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceGpEm",
+                    "(Ljava/lang/Object;)V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceGpEm into gp.em"
+            }
+        }
+    }
+
+    if (classNode.name == "yw") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "es" && method.desc == "(IIII)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 0))
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 1))
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 2))
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ILOAD, 3))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceYwEs",
+                    "(IIII)V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceYwEs into yw.es"
+            }
+        }
+    }
+
+    if (classNode.name == "ff") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "aj" && method.desc == "(FFFFFFFFFIIIIIIIIIIIII)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceFqAj",
+                    "()V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceFqAj into ff.aj"
+            }
+            if (method.name == "ct" && method.desc == "([I[IIIIIIIIFFIIIIII)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceFqCt",
+                    "()V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceFqCt into ff.ct"
+            }
+            if (method.name == "bh" && method.desc == "([I[FIIIF)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceFfBh",
+                    "()V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceFfBh into ff.bh"
+            }
+        }
+    }
+
+    if (classNode.name == "client") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "dg" && method.desc == "(Lzv;Lzv;Lzv;)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "traceDg",
+                    "()V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.traceDg into client.dg"
+            }
+        }
+    }
+
+    if (classNode.name == "tg") {
+        for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+            if (method.name == "af" && method.desc == "(IIB)V") {
+                org.objectweb.asm.tree.InsnList inj = new org.objectweb.asm.tree.InsnList()
+                inj.add(new org.objectweb.asm.tree.VarInsnNode(org.objectweb.asm.Opcodes.ALOAD, 0))
+                inj.add(new org.objectweb.asm.tree.MethodInsnNode(
+                    org.objectweb.asm.Opcodes.INVOKESTATIC,
+                    "org/runelite/mobile/TileCompositor",
+                    "tracePresent",
+                    "(Ljava/lang/Object;)V",
+                    false))
+                method.instructions.insert(inj)
+                modified = true
+                println "  [ASM] Injected TileCompositor.tracePresent into tg.af"
+            }
+        }
+    }
 
     // Remap java/lang/ProcessHandle to org/runelite/mobile/ProcessHandle in class signatures
     if (classNode.signature != null) {
@@ -552,7 +815,16 @@ byte[] transformClassBytes(byte[] classBytes) {
     }
 
     if (modified) {
-        org.objectweb.asm.ClassWriter writer = new org.objectweb.asm.ClassWriter(org.objectweb.asm.ClassWriter.COMPUTE_MAXS)
+        org.objectweb.asm.ClassWriter writer = new org.objectweb.asm.ClassWriter(org.objectweb.asm.ClassWriter.COMPUTE_FRAMES) {
+            @Override
+            protected String getCommonSuperClass(String type1, String type2) {
+                try {
+                    return super.getCommonSuperClass(type1, type2)
+                } catch (Throwable t) {
+                    return "java/lang/Object"
+                }
+            }
+        }
         classNode.accept(writer)
         return writer.toByteArray()
     }

@@ -71,6 +71,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean pointerDown = false;
     private long lastStateLog = 0;
     private long lastDrawLog = 0;
+    private long drawCount = 0;
+    private volatile Object bufferProvider;
+    private Button kbButton;
+    private LinearLayout kbBar;
+    private EditText kbEdit;
+    private String kbPrevText = "";
+    private final Object renderLock = new Object();
+    private final int[] frameScratch = new int[GAME_W * GAME_H];
     private long lastListenerLog = 0;
     private Runnable loginReqTicker;
 
@@ -183,6 +191,50 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // 5. Check for a newer RuneLite client in the background
         startUpdateCheckAsync();
+
+        // 5b. Pre-register the game dex with ART so dex2oat can AOT it. This
+        // device has dalvik.vm.usejit=false (JIT disabled), so without AOT the
+        // game runs interpreted (~0.2 fps). The DexClassLoader construction
+        // mirrors bootstrapGameClient exactly, which lets `cmd package compile
+        // --secondary-dex` record the class-loader context before login.
+        try {
+            File dexJar = new File(getFilesDir(), ClientUpdater.DEX_ASSET_NAME);
+            if (dexJar.exists() && dexJar.length() > 0) {
+                File dexOut = getDir("dex", MODE_PRIVATE);
+                new DexClassLoader(dexJar.getAbsolutePath(), dexOut.getAbsolutePath(), null, getClassLoader());
+                Log.i(TAG, "Pre-registered game dex classloader for ART dexopt");
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Pre-register dex failed: " + t.getMessage());
+        }
+
+        // 6. JIT sanity benchmark: proves whether ART is compiling hot code in
+        // this process (JIT'd: 50M float ops ~100-300ms; interpret-only: seconds).
+        Thread benchThread = new Thread(() -> {
+            try {
+                Thread.sleep(3000);
+                int[] arr = new int[1 << 20];
+                int r = 0;
+                long t0 = System.nanoTime();
+                for (int i = 0; i < 5_000_000; i++) r += Float.floatToRawIntBits((i - r) * 1.3f) >>> 31;
+                long warmFloatNs = System.nanoTime() - t0;
+                t0 = System.nanoTime();
+                for (int i = 0; i < 50_000_000; i++) r += Float.floatToRawIntBits((i - r) * 1.3f) >>> 31;
+                long hotFloatNs = System.nanoTime() - t0;
+                t0 = System.nanoTime();
+                for (int i = 0; i < 100_000_000; i++) r += arr[i & 0xFFFFF] + i * 7;
+                long hotIntNs = System.nanoTime() - t0;
+                t0 = System.nanoTime();
+                for (int i = 0; i < 20_000_000; i++) arr[i & 0xFFFFF] = arr[i & 0xFFFFF] + (Float.floatToRawIntBits((i - r) * 1.3f) >>> 3);
+                long scanNs = System.nanoTime() - t0;
+                Log.i(TAG, "BENCH warmFloat(5M)=" + (warmFloatNs / 1e6) + "ms hotFloat(50M)=" + (hotFloatNs / 1e6)
+                    + "ms hotInt(100M)=" + (hotIntNs / 1e6) + "ms scanline(20M)=" + (scanNs / 1e6) + "ms chk=" + r);
+            } catch (Throwable e) {
+                Log.e(TAG, "BENCH failed", e);
+            }
+        }, "BenchThread");
+        benchThread.setPriority(Thread.MIN_PRIORITY);
+        benchThread.start();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -345,6 +397,83 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             launcherScroll.setVisibility(launcherScroll.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         btnSettings.setVisibility(View.GONE);
         rootLayout.addView(btnSettings);
+
+        // ── Soft keyboard bridge: the game has no IME of its own, so a
+        //    floating "KB" button opens an EditText whose keystrokes are
+        //    forwarded into the client as AWT KeyEvents (display-name, chat) ──
+        float density2 = getResources().getDisplayMetrics().density;
+        kbButton = new Button(this);
+        kbButton.setText("KB");
+        kbButton.setTextSize(14f);
+        GradientDrawable kbBg = new GradientDrawable();
+        kbBg.setColor(0xAA2E2E3E);
+        kbBg.setCornerRadius(10 * density2);
+        kbBg.setStroke(2, 0xFF4F4F5F);
+        kbButton.setBackground(kbBg);
+        FrameLayout.LayoutParams kbBtnParams = new FrameLayout.LayoutParams(
+            (int) (52 * density2), (int) (44 * density2));
+        kbBtnParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+        kbBtnParams.topMargin = (int) (8 * density2);
+        kbButton.setLayoutParams(kbBtnParams);
+        kbButton.setVisibility(View.GONE);
+        kbButton.setOnClickListener(v -> toggleKeyboardBar());
+        rootLayout.addView(kbButton);
+
+        kbBar = new LinearLayout(this);
+        kbBar.setOrientation(LinearLayout.HORIZONTAL);
+        kbBar.setPadding((int) (6 * density2), (int) (6 * density2), (int) (6 * density2), (int) (6 * density2));
+        kbBar.setVisibility(View.GONE);
+        kbEdit = new EditText(this);
+        kbEdit.setSingleLine(true);
+        kbEdit.setTextSize(16f);
+        kbEdit.setHint("Type here...");
+        kbEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        kbEdit.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_GO);
+        kbEdit.setOnEditorActionListener((v, actionId, event) -> {
+            dispatchKeyCode(java.awt.event.KeyEvent.VK_ENTER, '\n');
+            return true;
+        });
+        kbEdit.addTextChangedListener(new android.text.TextWatcher() {
+            @Override
+            public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+            @Override
+            public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+            @Override
+            public void afterTextChanged(android.text.Editable s) {
+                String oldText = kbPrevText;
+                String newText = s.toString();
+                kbPrevText = newText;
+                int pf = 0;
+                while (pf < oldText.length() && pf < newText.length() && oldText.charAt(pf) == newText.charAt(pf)) pf++;
+                int sf = 0;
+                while (sf < oldText.length() - pf && sf < newText.length() - pf
+                    && oldText.charAt(oldText.length() - 1 - sf) == newText.charAt(newText.length() - 1 - sf)) sf++;
+                int removed = oldText.length() - pf - sf;
+                String added = newText.substring(pf, newText.length() - sf);
+                for (int i = 0; i < removed; i++) {
+                    dispatchKeyCode(java.awt.event.KeyEvent.VK_BACK_SPACE, '\b');
+                }
+                if (added.length() > 0) {
+                    dispatchKeyText(added);
+                }
+            }
+        });
+        Button kbEnter = new Button(this);
+        kbEnter.setText("Enter");
+        kbEnter.setOnClickListener(v -> dispatchKeyCode(java.awt.event.KeyEvent.VK_ENTER, '\n'));
+        Button kbClose = new Button(this);
+        kbClose.setText("Hide");
+        kbClose.setOnClickListener(v -> toggleKeyboardBar());
+        kbBar.addView(kbEdit, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        kbBar.addView(kbEnter, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        kbBar.addView(kbClose, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        FrameLayout.LayoutParams kbBarParams = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        kbBarParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        kbBar.setLayoutParams(kbBarParams);
+        rootLayout.addView(kbBar);
 
         // ── Login WebView overlay (WebView created lazily in startJagexLogin —
         //    instantiating it eagerly spawns a background renderer process) ──
@@ -1018,6 +1147,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void launchGame() {
         launcherScroll.setVisibility(View.GONE);
         btnSettings.setVisibility(View.VISIBLE);
+        kbButton.setVisibility(View.VISIBLE);
         tvStatus.setText("Starting game...");
         new Thread(this::bootstrapGameClient, "GameClientBootstrapper").start();
     }
@@ -1111,8 +1241,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // Prefer the files-dir copy (runtime-updated) unless the APK asset is newer.
             updateStatus("Loading dexed injected client...");
             File localJarFile = new File(getFilesDir(), ClientUpdater.DEX_ASSET_NAME);
+            long apkTime = 0;
+            try {
+                apkTime = new File(getPackageCodePath()).lastModified();
+            } catch (Exception ignored) {}
             boolean useExisting = localJarFile.exists() && localJarFile.length() > 0
-                && !versionIsOlderThanAsset();
+                && !versionIsOlderThanAsset()
+                && localJarFile.lastModified() >= apkTime;
             if (!useExisting) {
                 if (localJarFile.exists() && !localJarFile.delete()) {
                     Log.w(TAG, "Failed to delete stale dex JAR");
@@ -1128,6 +1263,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             Log.i(TAG, "Using dexed client: " + localJarFile.getAbsolutePath() + " (" + localJarFile.length() + " bytes)");
 
+            // ART refuses to load dex files that are writable by others
+            // ("Writable dex file ... is not allowed").
+            localJarFile.setWritable(true, true);
+            localJarFile.setReadOnly();
+
             // ── Step 4: Initialize DexClassLoader ──
             File dexOutputDir = getDir("dex", MODE_PRIVATE);
             DexClassLoader dexClassLoader = new DexClassLoader(
@@ -1140,6 +1280,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             // ── Step 5: Instantiate the OSRS client ──
             updateStatus("Instantiating OSRS injected client...");
             clientClass = dexClassLoader.loadClass("client");
+            org.runelite.mobile.TileCompositor.setClassLoader(dexClassLoader);
             clientObject = clientClass.getDeclaredConstructor().newInstance();
             clientInstance = (java.awt.Component) clientObject;
             clientInstance.setSize(GAME_W, GAME_H);
@@ -1212,15 +1353,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             // Frame blit: copy the rendered game buffer into the graphics
                             if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
                                 try {
+                                    bufferProvider = args[0];
+                                    bufferProviderStatic = args[0];
+                                    repointSceneRasterizerOnce();
                                     Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
                                     if (image instanceof java.awt.Image) {
                                         java.awt.Image img = (java.awt.Image) image;
                                         long now = System.currentTimeMillis();
-                                        if (now - lastDrawLog > 5000) {
+                                        drawCount++;
+                                        if (now - lastDrawLog > 2000) {
+                                            long elapsed = now - lastDrawLog;
+                                            long n = drawCount;
                                             lastDrawLog = now;
-                                            Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight());
+                                            drawCount = 0;
+                                            int[] imgPx = img.getPixels();
+                                            StringBuilder pb = new StringBuilder(" px="
+                                                + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
+                                            if (imgPx != null && imgPx.length >= 765 * 503) {
+                                                int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
+                                                for (int si = 0; si < s.length; si++) {
+                                                    if (s[si] < imgPx.length) {
+                                                        pb.append(String.format(",%08X", imgPx[s[si]]));
+                                                    }
+                                                }
+                                            }
+                                            Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
+                                                + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
                                         }
-                                        ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                        synchronized (renderLock) {
+                                            ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                        }
                                     }
                                 } catch (Exception e) {
                                     Log.w(TAG, "callbacks.draw failed", e);
@@ -1305,6 +1467,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 tvStatus.setText("Game failed to start: " + finalMsg);
                 launcherScroll.setVisibility(View.VISIBLE);
                 btnSettings.setVisibility(View.GONE);
+                kbButton.setVisibility(View.GONE);
+                kbBar.setVisibility(View.GONE);
                 Toast.makeText(this, "Loader Error: " + finalMsg, Toast.LENGTH_LONG).show();
             });
         }
@@ -1586,6 +1750,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             } else {
                                 sb.append(" qj=null");
                             }
+                            sb.append(" kk=").append(readFieldOn(cl, "client", "kk"));
+                            sb.append(" gx=").append(readFieldOn(cl, "client", "gx"));
+                            sb.append(" ci=").append(readFieldOn(cl, "client", "ci"));
+                            sb.append(" ru=").append(readFieldOn(cl, "client", "ru"));
+                            sb.append(" isGpu=").append(invokeOnClient("isGpu"));
+                            sb.append(" dq=").append(readFieldOn(cl, "client", "dq"));
+                            sb.append(" mm=").append(readFieldOn(cl, "client", "mm"));
+                            sb.append(" player=").append(invokeOnClient("getLocalPlayer") == null ? "null" : "set");
+                            sb.append(" cam=").append(invokeOnClient("getCameraX")).append(",")
+                                .append(invokeOnClient("getCameraY")).append(",")
+                                .append(invokeOnClient("getCameraZ"));
+                            try {
+                                ClassLoader cl2 = clientClass.getClassLoader();
+                                Object camObj = cl2.loadClass("wk").getField("cy").get(null);
+                                if (camObj != null) {
+                                    java.lang.reflect.Field fap = findFieldInChain(camObj.getClass(), "ap");
+                                    fap.setAccessible(true);
+                                    sb.append(" vv.ap=").append(fap.getInt(camObj));
+                                } else {
+                                    sb.append(" vv=null");
+                                }
+                            } catch (Exception e) {
+                                sb.append(" vv=ERR");
+                            }
+                            sb.append(" fv=").append(readFieldOn(cl, "client", "fv"));
+                            sb.append(" fn=").append(readFieldOn(cl, "client", "fn"));
+                            sb.append(" my=").append(readFieldOn(cl, "client", "my"));
+                            sb.append(" loginIdx=").append(readFieldOn(cl, "bf", "cw"));
+                            sb.append(" lh=").append(readFieldOn(cl, "lt", "lh") == null ? "null" : "set(" + String.valueOf(readFieldOn(cl, "lt", "lh")).length() + ")");
+                            sb.append(" lz=").append(readFieldOn(cl, "ch", "lz") == null ? "null" : "set");
+                            sb.append(" qn=").append(readFieldOn(cl, "client", "qn") == null ? "null" : "set");
+                            sb.append(" qt=").append(readFieldOn(cl, "client", "qt") == null ? "null" : "set");
+                            sb.append(" qv=").append(readFieldOn(cl, "client", "qv") == null ? "null" : "set");
+                            sb.append(" iw=").append(readFieldOn(cl, "client", "iw"));
+                            sb.append(" dm=").append(readFieldOn(cl, "client", "dm") == null ? "null" : readFieldOn(cl, "client", "dm").getClass().getSimpleName());
+                            sb.append(" cxAz=").append(readFieldOn(cl, "cx", "az") == null ? "null" : readFieldOn(cl, "cx", "az").getClass().getSimpleName());
+                            sb.append(" cxAt=").append(readFieldOn(cl, "cx", "at") == null ? "null" : readFieldOn(cl, "cx", "at").getClass().getSimpleName());
+                            sb.append(" cxAv=").append(readFieldOn(cl, "cx", "av") == null ? "null" : readFieldOn(cl, "cx", "av").getClass().getSimpleName());
+                            sb.append(" fmLn=").append(readFieldOn(cl, "fm", "ln") == null ? "null" : readFieldOn(cl, "fm", "ln").getClass().getSimpleName());
+                            sb.append(" ja=").append(readFieldOn(cl, "client", "ja"));
+                            sb.append(" jf=").append(readFieldOn(cl, "client", "jf"));
+                            sb.append(" ji=").append(readFieldOn(cl, "client", "ji"));
+                            sb.append(" jn=").append(readFieldOn(cl, "client", "jn"));
+                            sb.append(" vg=").append(readFieldOn(cl, "client", "vg") == null ? "null" : "set");
+                            sb.append(" rm=").append(readFieldOn(cl, "client", "rm") == null ? "null" : "set");
+                            sb.append(" mo=").append(readFieldOn(cl, "client", "mo") == null ? "null" : "set");
+                            sb.append(" ye=").append(readFieldOn(cl, "client", "ye"));
+            sb.append(" ").append(dumpPixelArrays(cl));
+            sb.append(" ").append(dumpSceneContent(cl));
+            sb.append(" ").append(dumpBridgeContent());
+            Object vbStore = readFieldOn(cl, "eb", "pw");
+                            if (vbStore != null) {
+                                sb.append(" vb.ay=").append(readNestedField(vbStore, "ay"));
+                                sb.append(" vb.ad=").append(readNestedField(vbStore, "ad"));
+                                sb.append(" vb.aw=").append(readNestedField(vbStore, "aw"));
+                                sb.append(" vb.ai=").append(readNestedField(vbStore, "ai"));
+                                sb.append(" vb.am=").append(readNestedField(vbStore, "am"));
+                                sb.append(" vb.ac=").append(readNestedField(vbStore, "ac"));
+                                sb.append(" vb.ax=").append(readNestedField(vbStore, "ax"));
+                                sb.append(" vb.bp=").append(readNestedField(vbStore, "bp"));
+                                sb.append(" vb.ao=").append(readNestedField(vbStore, "ao"));
+                                sb.append(" vb.luk=").append(readNestedField(vbStore, "aa") == null ? "null" : "set");
+                            } else {
+                                sb.append(" vb=null");
+                            }
                             Log.i(TAG, sb.toString());
                         } catch (Throwable e) {
                             Log.w(TAG, "LoginTick failed: " + e.getMessage());
@@ -1699,6 +1928,321 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    /**
+     * Diagnostic: identity of the 3D scene's pixel array (fh.ae / the fq
+     * instance's aa) vs the buffer image's pixels. If they differ, the scene
+     * renders into a scratch array that never reaches the display.
+     */
+    private static String dumpPixelArrays(ClassLoader cl) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Class<?> fh = cl.loadClass("fh");
+            java.lang.reflect.Field fae = fh.getDeclaredField("ae");
+            fae.setAccessible(true);
+            int[] scenePx = (int[]) fae.get(null);
+            sb.append(" fh.ae=").append(System.identityHashCode(scenePx)).append("(").append(scenePx.length).append(")");
+            try {
+                java.lang.reflect.Field faj = fh.getDeclaredField("aj");
+                faj.setAccessible(true);
+                Object aj = faj.get(null);
+                if (aj != null) {
+                    java.lang.reflect.Field faa = findFieldInChain(aj.getClass(), "aa");
+                    faa.setAccessible(true);
+                    int[] scenePx2 = (int[]) faa.get(aj);
+                    sb.append(" aj.aa=").append(System.identityHashCode(scenePx2)).append("(").append(scenePx2.length).append(")");
+                } else {
+                    sb.append(" aj=null");
+                }
+            } catch (Exception e) {
+                sb.append(" aj.aa=ERR");
+            }
+        } catch (Exception e) {
+            sb.append(" fh.ae=ERR");
+        }
+        Object bp = bufferProviderStatic;
+        if (bp != null) {
+            try {
+                java.lang.reflect.Field faz = findFieldInChain(bp.getClass(), "az");
+                faz.setAccessible(true);
+                Object img = faz.get(bp);
+                if (img instanceof java.awt.Image) {
+                    int[] dispPx = ((java.awt.Image) img).getPixels();
+                    sb.append(" dispPx=").append(System.identityHashCode(dispPx)).append("(").append(dispPx.length).append(")");
+                } else {
+                    sb.append(" img=null");
+                }
+            } catch (Exception e) {
+                sb.append(" dispPx=ERR");
+            }
+        } else {
+            sb.append(" bp=null");
+        }
+        try {
+            Class<?> yw = cl.loadClass("yw");
+            java.lang.reflect.Field faj = yw.getDeclaredField("aj");
+            faj.setAccessible(true);
+            int[] ywPx = (int[]) faj.get(null);
+            sb.append(" yw.aj=").append(ywPx == null ? "null" : System.identityHashCode(ywPx) + "(" + ywPx.length + ")");
+            sb.append(" yw.ay=").append(yw.getDeclaredField("ay").getInt(null));
+            sb.append(" yw.aq=").append(yw.getDeclaredField("aq").getInt(null));
+        } catch (Exception e) {
+            sb.append(" yw=ERR");
+        }
+        return sb.toString();
+    }
+
+    private static volatile Object bufferProviderStatic;
+    private volatile boolean rasterizerRepointed = false;
+
+    /**
+     * The desktop client re-points the 3D rasterizer at the display buffer
+     * during its resize path; on this port that call never happens, so the
+     * scene renders into a 65536-element scratch array that is never shown.
+     * Replicate the call once the buffer exists (fh.ap -> fq.de sets the
+     * rasterizer's pixel target + width/height).
+     */
+    private void repointSceneRasterizerOnce() {
+        if (rasterizerRepointed) return;
+        rasterizerRepointed = true;
+        try {
+            ClassLoader cl = clientClass != null ? clientClass.getClassLoader() : null;
+            if (cl == null || bufferProviderStatic == null) {
+                rasterizerRepointed = false;
+                return;
+            }
+            java.lang.reflect.Field faz = findFieldInChain(bufferProviderStatic.getClass(), "az");
+            faz.setAccessible(true);
+            Object img = faz.get(bufferProviderStatic);
+            if (!(img instanceof java.awt.Image)) {
+                rasterizerRepointed = false;
+                return;
+            }
+            int[] dispPx = ((java.awt.Image) img).getPixels();
+            Class<?> fh = cl.loadClass("fh");
+            Class<?> yw = cl.loadClass("yw");
+            java.lang.reflect.Method eu = yw.getMethod("eu", int[].class, int.class, int.class, float[].class);
+            float[] floatBuf = null;
+            try {
+                floatBuf = (float[]) yw.getField("ad").get(null);
+            } catch (Exception ignored) {}
+            eu.invoke(null, dispPx, GAME_W - 1, GAME_H, floatBuf);
+            java.lang.reflect.Field fae = fh.getDeclaredField("ae");
+            fae.setAccessible(true);
+            fae.set(null, dispPx);
+            for (String inst : new String[]{"aj", "af", "az"}) {
+                try {
+                    java.lang.reflect.Field fi = fh.getDeclaredField(inst);
+                    fi.setAccessible(true);
+                    Object rasterizer = fi.get(null);
+                    if (rasterizer != null) {
+                        java.lang.reflect.Field faa = findFieldInChain(rasterizer.getClass(), "aa");
+                        faa.setAccessible(true);
+                        faa.set(rasterizer, dispPx);
+                    }
+                } catch (Exception ignored) {}
+            }
+            Log.i(TAG, "Repointed scene rasterizer to display buffer "
+                + System.identityHashCode(dispPx) + "(" + dispPx.length + ") yw.aj="
+                + (yw.getField("aj").get(null) != null ? System.identityHashCode(yw.getField("aj").get(null)) : "null"));
+        } catch (Throwable t) {
+            rasterizerRepointed = false;
+            Log.w(TAG, "Repoint rasterizer failed: " + t);
+        }
+    }
+
+    /**
+     * The software renderer draws the 3D scene into a small square scene
+     * buffer (fh.aj.aa, 65536 = 256x256) and the client never scales it up
+     * into the display buffer (the RuneLite runtime/GPU plugin does that on
+     * desktop). Upscale the scene buffer into the display right before the
+     * blit; the 2D UI redraws over it every frame so this is safe timing-wise.
+     */
+    private void compositeSceneBuffer(java.awt.Image displayImage) {
+        try {
+            ClassLoader cl = clientClass != null ? clientClass.getClassLoader() : null;
+            if (cl == null) return;
+            Class<?> fh = cl.loadClass("fh");
+            java.lang.reflect.Field faj = fh.getDeclaredField("aj");
+            faj.setAccessible(true);
+            Object rasterizer = faj.get(null);
+            if (rasterizer == null) return;
+            java.lang.reflect.Field faa = findFieldInChain(rasterizer.getClass(), "aa");
+            faa.setAccessible(true);
+            int[] scene = (int[]) faa.get(rasterizer);
+            int[] disp = displayImage.getPixels();
+            if (scene == null || disp == null) return;
+            int srcW = 256;
+            int srcH = 256;
+            try {
+                java.lang.reflect.Field fw = findFieldInChain(rasterizer.getClass(), "ab");
+                fw.setAccessible(true);
+                java.lang.reflect.Field fh2 = findFieldInChain(rasterizer.getClass(), "af");
+                fh2.setAccessible(true);
+                int w = fw.getInt(rasterizer);
+                int h = fh2.getInt(rasterizer);
+                if (w > 0 && w <= 1024 && h > 0 && h <= 1024 && w * h <= scene.length) {
+                    srcW = w;
+                    srcH = h;
+                }
+            } catch (Exception ignored) {}
+            int dispW = displayImage.getWidth();
+            int dispH = displayImage.getHeight();
+            for (int y = 0; y < dispH; y++) {
+                int srcY = y * srcH / dispH;
+                int srcRow = srcY * srcW;
+                int dstRow = y * dispW;
+                for (int x = 0; x < dispW; x++) {
+                    int srcX = x * srcW / dispW;
+                    if (srcRow + srcX < scene.length) {
+                        disp[dstRow + x] = scene[srcRow + srcX];
+                    }
+                }
+            }
+            if (!sceneCompositeLogged) {
+                sceneCompositeLogged = true;
+                Log.i(TAG, "SceneComposite: src=" + scene.length + " (" + srcW + "x" + srcH
+                    + ") -> " + dispW + "x" + dispH);
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "SceneComposite failed: " + t);
+        }
+    }
+
+    private volatile boolean sceneCompositeLogged = false;
+
+    private volatile boolean tileLayoutLogged = false;
+
+    private static java.lang.reflect.Field findFieldInChain(Class<?> c, String name) {
+        Class<?> cur = c;
+        while (cur != null) {
+            try {
+                return cur.getDeclaredField(name);
+            } catch (NoSuchFieldException e) {
+                cur = cur.getSuperclass();
+            }
+        }
+        throw new RuntimeException("field not found: " + name);
+    }
+
+        /**
+     * Diagnostic: content of the 3D scene buffer, the rasterizer viewport
+     * dims, and the terrain tile cache state.
+     */
+    private static String dumpSceneContent(ClassLoader cl) {
+        StringBuilder sb = new StringBuilder();
+        try {
+            Class<?> fh = cl.loadClass("fh");
+            java.lang.reflect.Field faj = fh.getDeclaredField("aj");
+            faj.setAccessible(true);
+            Object rast = faj.get(null);
+            if (rast == null) {
+                sb.append(" rast=null");
+                return sb.toString();
+            }
+            int[] px = null;
+            try {
+                java.lang.reflect.Field faa = findFieldInChain(rast.getClass(), "aa");
+                faa.setAccessible(true);
+                px = (int[]) faa.get(rast);
+            } catch (Exception ignored) {}
+            if (px != null && px.length >= 65536) {
+                java.util.HashSet<Integer> colors = new java.util.HashSet<>();
+                int[] samples = new int[]{0, 16384, 32768, 49152, 65535, 100, 30000};
+                sb.append(" scenePx=");
+                for (int i = 0; i < samples.length; i++) {
+                    sb.append(String.format("%08X,", px[samples[i]]));
+                }
+                for (int i = 0; i < px.length; i += 17) {
+                    colors.add(px[i] & 0x00FFFFFF);
+                }
+                sb.append("colors=").append(colors.size());
+            } else {
+                sb.append(" scenePx=null");
+            }
+            for (String f : new String[]{"ab", "af", "ag"}) {
+                try {
+                    java.lang.reflect.Field ff = findFieldInChain(rast.getClass(), f);
+                    ff.setAccessible(true);
+                    sb.append(" r.").append(f).append("=").append(ff.getInt(rast));
+                } catch (Exception e) {
+                    sb.append(" r.").append(f).append("=ERR");
+                }
+            }
+            try {
+                java.lang.reflect.Field fao = findFieldInChain(rast.getClass(), "ao");
+                fao.setAccessible(true);
+                Object fd = fao.get(rast);
+                if (fd != null) {
+                    java.lang.reflect.Field fai = findFieldInChain(fd.getClass(), "ai");
+                    fai.setAccessible(true);
+                    Object ec = fai.get(fd);
+                    if (ec != null) {
+                        java.lang.reflect.Field faz = findFieldInChain(ec.getClass(), "az");
+                        faz.setAccessible(true);
+                        Object[] tiles = (Object[]) faz.get(ec);
+                        int rendered = 0;
+                        int withPx = 0;
+                        if (tiles != null) {
+                            for (Object t : tiles) {
+                                if (t == null) continue;
+                                try {
+                                    int st = findFieldInChain(t.getClass(), "as").getInt(t);
+                                    Object al = findFieldInChain(t.getClass(), "al").get(t);
+                                    if (st != -1) rendered++;
+                                    if (al != null) withPx++;
+                                } catch (Exception ignored) {}
+                            }
+                        }
+                        sb.append(" tiles=").append(tiles == null ? "null" : tiles.length)
+                            .append(" rendered=").append(rendered).append(" withPx=").append(withPx);
+                    }
+                }
+            } catch (Exception e) {
+                sb.append(" ec=ERR");
+            }
+        } catch (Exception e) {
+            sb.append(" scene=ERR");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * Diagnostic: samples of the display buffer (what drawImage blits) and the
+     * applet bridge (what the render thread scales to the surface), to locate
+     * where the composited scene gets lost.
+     */
+    private static String dumpBridgeContent() {
+        StringBuilder sb = new StringBuilder();
+        Object bp = bufferProviderStatic;
+        if (bp != null) {
+            try {
+                java.lang.reflect.Field faz = findFieldInChain(bp.getClass(), "az");
+                faz.setAccessible(true);
+                Object img = faz.get(bp);
+                if (img instanceof java.awt.Image) {
+                    int[] disp = ((java.awt.Image) img).getPixels();
+                    int w = ((java.awt.Image) img).getWidth();
+                    int[] s = new int[]{0, 100 * w + 100, 250 * w + 380, 300 * w + 200, 400 * w + 200};
+                    sb.append(" dispSamp=");
+                    for (int i = 0; i < s.length; i++) {
+                        if (s[i] < disp.length) sb.append(String.format("%08X,", disp[s[i]]));
+                    }
+                }
+            } catch (Exception e) {
+                sb.append(" dispSamp=ERR");
+            }
+        }
+        int[] ap = AWTBridge.activePixels;
+        if (ap != null && ap.length >= GAME_W * GAME_H) {
+            int[] s = new int[]{0, 100 * GAME_W + 100, 250 * GAME_W + 380, 300 * GAME_W + 200, 400 * GAME_W + 200};
+            sb.append(" appletSamp=");
+            for (int i = 0; i < s.length; i++) {
+                sb.append(String.format("%08X,", ap[s[i]]));
+            }
+        }
+        return sb.toString();
+    }
+
     private static String readNestedField(Object o, String field) {
         try {
             java.lang.reflect.Field f = o.getClass().getDeclaredField(field);
@@ -1707,6 +2251,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             if (v == null) return "null";
             String s = v.toString();
             return s.length() > 60 ? s.substring(0, 60) + "...(" + s.length() + ")" : s;
+        } catch (Exception e) {
+            return "ERR";
+        }
+    }
+
+    private static String invokeOnClient(String methodName) {
+        try {
+            if (clientObject != null && clientClass != null) {
+                return String.valueOf(clientClass.getMethod(methodName).invoke(clientObject));
+            }
+            return "no-client";
         } catch (Exception e) {
             return "ERR";
         }
@@ -1721,6 +2276,89 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             java.awt.event.MouseWheelEvent.WHEEL_UNIT_SCROLL, 3, rotation);
         for (java.awt.event.MouseWheelListener listener : target.getMouseWheelListeners()) {
             listener.mouseWheelMoved(ev);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Soft keyboard bridge
+    // ═══════════════════════════════════════════════════════════════════════
+
+    private void toggleKeyboardBar() {
+        boolean show = kbBar.getVisibility() != View.VISIBLE;
+        kbBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        android.view.inputmethod.InputMethodManager imm =
+            (android.view.inputmethod.InputMethodManager) getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+        if (show) {
+            kbEdit.requestFocus();
+            imm.showSoftInput(kbEdit, 0);
+        } else {
+            imm.hideSoftInputFromWindow(kbEdit.getWindowToken(), 0);
+        }
+    }
+
+    /**
+     * Delivers AWT KeyEvents (KEY_PRESSED + KEY_TYPED + KEY_RELEASED) for the
+     * given text into every key listener registered on the client component or
+     * its canvas. Mirrors desktop AWT: printable chars go through KEY_TYPED
+     * with the char; the code is the upper-case VK for letters, else the char.
+     */
+    private void dispatchKeyText(String text) {
+        if (clientInstance == null || clientClass == null) return;
+        java.awt.Component target = resolveInputTarget();
+        if (target == null) return;
+        java.awt.Component canvas = null;
+        try {
+            Class<?> gameEngineClass = clientClass.getClassLoader().loadClass("net.runelite.api.GameEngine");
+            Method getCanvas = gameEngineClass.getMethod("getCanvas");
+            Object c = getCanvas.invoke(clientObject);
+            if (c instanceof java.awt.Component) canvas = (java.awt.Component) c;
+        } catch (Exception ignored) {}
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            int keyCode = (c >= 'a' && c <= 'z') ? c - 32 : (c >= 'A' && c <= 'Z') ? c : c;
+            deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_PRESSED, keyCode, c);
+            deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_TYPED, keyCode, c);
+            deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_RELEASED, keyCode, c);
+        }
+    }
+
+    /** Delivers a special-key event (ENTER, BACK_SPACE, ESCAPE, ...). */
+    private void dispatchKeyCode(int keyCode, char keyChar) {
+        if (clientInstance == null || clientClass == null) return;
+        java.awt.Component target = resolveInputTarget();
+        if (target == null) return;
+        java.awt.Component canvas = null;
+        try {
+            Class<?> gameEngineClass = clientClass.getClassLoader().loadClass("net.runelite.api.GameEngine");
+            Method getCanvas = gameEngineClass.getMethod("getCanvas");
+            Object c = getCanvas.invoke(clientObject);
+            if (c instanceof java.awt.Component) canvas = (java.awt.Component) c;
+        } catch (Exception ignored) {}
+        deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_PRESSED, keyCode, keyChar);
+        deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_TYPED, keyCode, keyChar);
+        deliverKeyEvent(target, canvas, java.awt.event.KeyEvent.KEY_RELEASED, keyCode, keyChar);
+    }
+
+    private void deliverKeyEvent(java.awt.Component target, java.awt.Component canvas,
+                                 int id, int keyCode, char keyChar) {
+        long when = System.currentTimeMillis();
+        java.awt.event.KeyEvent ev = new java.awt.event.KeyEvent(target, id, when, 0, keyCode, keyChar);
+        java.awt.Component[] components = (canvas != null && canvas != target)
+            ? new java.awt.Component[]{target, canvas} : new java.awt.Component[]{target};
+        for (java.awt.Component comp : components) {
+            for (java.awt.event.KeyListener listener : comp.getKeyListeners()) {
+                switch (id) {
+                    case java.awt.event.KeyEvent.KEY_PRESSED:
+                        listener.keyPressed(ev);
+                        break;
+                    case java.awt.event.KeyEvent.KEY_TYPED:
+                        listener.keyTyped(ev);
+                        break;
+                    case java.awt.event.KeyEvent.KEY_RELEASED:
+                        listener.keyReleased(ev);
+                        break;
+                }
+            }
         }
     }
 
@@ -1778,8 +2416,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
 
                     if (clientInstance != null) {
-                        java.awt.Graphics2D bridgeGraphics = new java.awt.Graphics2D(appletPixels, GAME_W, GAME_H);
-                        clientInstance.paint(bridgeGraphics);
+                        // The client thread delivers completed frames via the
+                        // callbacks.draw proxy (drawImage under renderLock). We
+                        // must NOT call client.paint() here: it blits the game's
+                        // LIVE frame buffer while the client thread is rendering
+                        // the next frame into it, producing torn frames.
+                        synchronized (renderLock) {
+                            System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
+                        }
+                    } else {
+                        System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
                     }
 
                     int[] destPixels = awtBridge.getRawPixels();
@@ -1792,7 +2438,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         int srcRowOffset = srcY * GAME_W;
                         for (int x = 0; x < destW; x++) {
                             int srcX = x * GAME_W / destW;
-                            destPixels[destRowOffset + x] = appletPixels[srcRowOffset + srcX];
+                            destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX];
                         }
                     }
 
