@@ -1,7 +1,7 @@
 # AGENTS.md
 
 RuneLite/OSRS port to Android/iOS. The app does **not** ship a custom client:
-at runtime it downloads/dexes RuneLite's official injected client and loads it via
+it downloads RuneLite's official injected client (pre-dexed by CI) and loads it via
 `DexClassLoader`, stubbing out the desktop JVM classes the game expects.
 
 ## Build commands
@@ -36,9 +36,18 @@ at runtime it downloads/dexes RuneLite's official injected client and loads it v
   `injected-client-<ver>.jar` + `runelite-api-<ver>.jar` (both pinned to the
   **same version from one artifact** — never mismatch them) → ASM-transform
   → d8 → `android/src/main/assets/runelite-dex.jar` + writes
-  `assets/client-version.txt`. The ASM transform logic lives in TWO places
-  that MUST stay in sync: the Groovy `transformClassBytes` in build.gradle
-  and the Java port `ClientClassTransformer` (used by the on-device updater).
+  `assets/client-version.txt`. The ASM transform (`transformClassBytes` in
+  build.gradle) runs on **every** class of the jar — never re-introduce a
+  per-class gate: a class whose only Android-hostile feature is a
+  `CONSTANT_Dynamic` (e.g. `ar.class`) then ships untransformed and d8 aborts
+  with "Unsupported dynamic constant (has arguments to bootstrap method)".
+  `ConstantBootstraps.invoke` constants are rewritten into explicit bytecode
+  **memoised in a synthetic static field**, because the JVM resolves such a
+  constant once per constant-pool entry and reuses that instance — the
+  obfuscator builds its singletons that way (`client.ib()`/`ar.zb()` return a
+  fresh `new T[1]`, one call site stores element 0 through the constant and
+  others read it back). A plain `INVOKESTATIC` rewrite hands out a fresh array
+  every evaluation and `client.init` then NPEs.
 - **`MainActivity.java`** is the launcher + game host. Flow: launcher screen
   (sign in → character picker → Play) → Jagex login via two-leg OAuth in an
   in-app WebView (`JagexOAuthClient` — see below) → bootstrap: emulate only
@@ -56,12 +65,30 @@ at runtime it downloads/dexes RuneLite's official injected client and loads it v
   search** (`findFieldByType(clientClass, "net.runelite.api.hooks.Callbacks")`
   in MainActivity — walks the hierarchy, survives obfuscation).
 - **Frame rendering goes through the Callbacks proxy** (bound into the
-  client's Callbacks field): the render loop calls `client.paint(Graphics2D)`
-  every frame; the client renders into a `MainBufferProvider` and calls back
-  `callbacks.draw(buffer, Graphics, x, y)`; the proxy blits `buffer.getImage()`
-  into the passed Graphics via `drawImage`; mouse hooks pass the event through.
+  client's Callbacks field): the client's own loop renders a frame and then
+  calls back `callbacks.draw(buffer, Graphics, x, y)`; the proxy blits
+  `buffer.getImage()` into the passed Graphics via `drawImage` (which fills
+  `AWTBridge.activePixels`); mouse hooks pass the event through. The app's
+  render thread must **not** call `client.paint()` — that blits the live frame
+  while the client thread is rendering the next one (torn frames).
+  Two port-side invariants keep the world visible; both are easy to break:
+  1. `bindSceneRasterizerToDisplay()` re-points each 3D rasterizer instance's
+     pixel array (`ak`) at the display buffer. The client initialises it from
+     `fq.aq` — a 256×256 scratch — and only the desktop runtime's resize path
+     re-points it, so without this the 3D scene is rasterised into a discarded
+     buffer: a frozen frame with a live minimap. The client-internal names
+     (`fq`, `yw.ef`, `fa.ak`) are version-specific and must be re-derived on a
+     client bump (docs/telemetry-assessment.md §6).
+  2. The frame is presented as `pixel | 0xFF000000`. The software rasterizer
+     writes 3D pixels with alpha 0 and `canvas.drawBitmap` blends, so an
+     alpha-0 pixel is dropped and the previous surface content stays visible
+     (stale login-screen remnants).
   A no-op proxy leaves a static gray screen — this is the #1 thing to check if
-  rendering "stops".
+  rendering "stops". The throttled `callbacks.draw` log prints `world=`/`bridge=`
+  (non-zero pixel count + XOR checksum of the left three quarters) for the
+  client's own frame and for `AWTBridge.activePixels`; a frozen `world=` with a
+  changing `bridge=` means the client stopped redrawing, and differing values
+  mean the blit is dropping content.
 - **Jagex account login** (`JagexOAuthClient.java`): two-leg
   authorization-code+PKCE (S256) flow against `account.jagex.com/oauth2/…`
   with the launcher client id (`com_jagex_auth_desktop_launcher`, redirect
@@ -77,25 +104,26 @@ at runtime it downloads/dexes RuneLite's official injected client and loads it v
   manual JX_* entry and imports `credentials.properties` from external
   storage as a fallback. `usesCleartextTraffic` is on in the manifest — the
   `http://localhost` consent redirect needs it; don't remove it.
-- **Client auto-update** (`ClientUpdater.java`): launcher checks
-  `static.runelite.net/bootstrap.json` against `client-version.txt`; on a
-  newer RuneLite client it downloads both jars, runs the same ASM transform
-  on-device, dexes with the **embedded R8/D8 API** (`com.android.tools:r8`,
-  `D8.run(cmd, ExecutorService)` with a 2-thread executor + two separate
-  dex passes to keep memory down), strips duplicate classes from the API jar
-  (OAuthApi exists in both — D8 rejects duplicates), bundles resources +
-  `runelite/index`, atomically swaps `files/runelite-dex.jar` and asks to
-  restart. Known quirks: on-device dexing is SLOW (~15-25 min on a Pixel 8
-  Pro vs 26 s on a host JVM) — it's intentionally background; `largeHeap`
-  is required (D8 OOMs at 256 MB); catch `Throwable`, not `Exception`
-  (OutOfMemoryError).
-- **Render loop is fixed 766×503**: `appletPixels` (MainActivity) ↔
+- **Client auto-update** (`ClientUpdater.java`): the launcher fetches
+  `client-version.txt` from the CI-published GitHub Release (base URL
+  `BuildConfig.DIST_BASE`, override at build time with `-PdistBase=<url>/`) and
+  compares it with the installed version. On a newer version it downloads
+  `runelite-dex.jar` + `runelite-dex.jar.sha256` from the same host, verifies
+  the SHA-256, then atomically swaps `files/runelite-dex.jar` and
+  `files/client-version.txt` and asks to restart. **Nothing is dexed
+  on-device** — `downloadAndDexJar` builds the pre-dexed jar once in CI and
+  `.github/workflows/build.yml` publishes it (plus `client-version.txt` and the
+  checksum) as release assets named exactly `runelite-dex.jar`,
+  `client-version.txt`, `runelite-dex.jar.sha256` — those names are the URL
+  tails the app fetches. A failed download or checksum mismatch leaves the old
+  client installed and working.
+- **Render loop is fixed 765×503** (the client's own frame size — `GAME_W` in
+  MainActivity must match it): `appletPixels` (MainActivity) ↔
   `AWTBridge.activePixels/activeWidth/activeHeight`. Change all three
   together. A render thread scales the buffer nearest-neighbor to the surface
-  size; it sleeps 500 ms when the client isn't running (so background dexing
-  isn't starved) and only clears the buffer then — the game overwrites every
-  pixel via the frame blit. A debug overlay + 5 s GameState log are drawn on
-  top of the frame.
+  size; it sleeps 500 ms when the client isn't running and only clears the
+  buffer then — the game overwrites every pixel via the frame blit. A debug
+  overlay + 5 s GameState log are drawn on top of the frame.
 - **Touch input is wired**: ACTION_DOWN/MOVE/UP → MOUSE_PRESSED/DRAGGED/
   RELEASED/CLICKED, ACTION_SCROLL → MOUSE_WHEEL, dispatched to the client
   component itself, falling back to the canvas from `GameEngine.getCanvas()`

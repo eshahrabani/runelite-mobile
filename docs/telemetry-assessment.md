@@ -52,7 +52,8 @@ Notes:
   widget dispatch (§1.1).
 - No third-party analytics/crash SDK is present in this app; `android/build.gradle`
   depends only on `androidx.appcompat`, `com.google.android.material`, `guava`,
-  `slf4j-api`, `org.ow2.asm:*`, `com.android.tools:r8`.
+  `slf4j-api` (ASM/R8 are build-script-only: `org.ow2.asm:*` is on the buildscript
+  classpath, and d8 comes from the SDK build-tools — neither is an app dependency).
 
 ## 3. What the client does NOT send
 
@@ -67,20 +68,28 @@ Notes:
 
 - **Host**: `DexClassLoader` + AWT/Swing stubs under `core/src/main/java/java/…`; the
   game runs RuneLite's own bytecode, so its wire behaviour is RuneLite's.
-- **ASM patch**: `downloadAndDexJar` (`android/build.gradle`) and, on-device,
-  `ClientUpdater` + `ClientClassTransformer` inject read-only `TileCompositor` hooks
-  into the render loop and remap Android-missing APIs. Every hook is guarded
+- **ASM patch**: `downloadAndDexJar` (`android/build.gradle`) injects read-only
+  `TileCompositor` hooks into the render loop and remaps Android-missing APIs at
+  **build time only** — the client jar is pre-dexed in CI and the app just downloads
+  it, so nothing is patched on-device. Every hook is guarded
   (`catch (Throwable)` → `TileCompositor.hookFailed`), so port code cannot throw into
   the game's frame loop and cannot contribute a class name to an error path.
-- **Crash-beacon neutralisation**: both ASM copies force any non-`<init>`/`<clinit>`
+- **Crash-beacon neutralisation**: the ASM pass forces any non-`<init>`/`<clinit>`
   method that references a `clienterror.ws…` literal to return immediately. Verified
   on the live 1.13.1 jar: `aat.aj`/`aat.af` now start with `return` (build log
   `[ASM] Neutered crash beacon in aat.aj`, and `javap` on
-  `android/build/temp-jars/injected-client-cleaned.jar`). The build-time gate that
-  decides which classes to transform also scans for the literal (`hasBeacon`).
+  `android/build/temp-jars/injected-client-cleaned.jar`). The pass runs over every
+  class of the jar, so no gate can skip a class that carries the literal.
 - **Input synthesis**: touch → AWT `MouseEvent`. `setupTouchInput` replays
   `MotionEvent` history and fills segments via `core/src/main/java/org/runelite/mobile/MousePath.java`
   so the client sees a continuous, monotonic motion stream instead of single jumps.
+- **Software 3D presentation** (port-only, no wire effect): the 3D rasterizer's
+  per-instance pixel target is re-pointed at the display buffer by
+  `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a
+  256×256 scratch and only the desktop runtime's resize path re-points it), and
+  the frame is presented as `pixel | 0xFF000000` because the rasterizer emits
+  alpha-0 3D pixels that `canvas.drawBitmap` would otherwise blend away. Both are
+  required for the world to be visible at all.
 - **OS fingerprint is truthful** (Linux/aarch64, no Windows spoofing); the JVM
   properties emulated are only the ones Android lacks.
 

@@ -22,6 +22,14 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+        // Base URL the app downloads the pre-dexed client from. Override with
+        // -PdistBase=<url>/ to serve the three release-named files from any
+        // static host (offline verification). Trailing slash required.
+        buildConfigField "String", "DIST_BASE", "\"${project.findProperty('distBase') ?: 'https://github.com/eshahrabani/runelite-mobile/releases/latest/download/'}\""
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
     buildTypes {
@@ -102,76 +110,21 @@ task downloadAndDexJar {
                         clientZip.getInputStream(entry).withStream { zis ->
                             byte[] bytes = zis.bytes
                             if (entry.name.endsWith(".class")) {
-                                boolean hasConcat = false
-                                boolean hasUnsafe = false
-                                boolean hasBeacon = false
+                                // Transform EVERY class. The old per-class gate (hasConcat /
+                                // hasUnsafe / hasBeacon byte-scans plus a hardcoded class-name
+                                // list) skipped classes whose only Android-hostile feature is a
+                                // dynamic constant -- e.g. ar.class in clients >= 1.13 -- which
+                                // d8 then rejects with "Unsupported dynamic constant".
+                                // transformClassBytes returns the same array instance when it
+                                // changed nothing, so identity is the change test.
                                 try {
-                                    byte[] pattern = "makeConcatWithConstants".getBytes("US-ASCII")
-                                    for (int i = 0; i <= bytes.length - pattern.length; i++) {
-                                        boolean match = true
-                                        for (int j = 0; j < pattern.length; j++) {
-                                            if (bytes[i + j] != pattern[j]) {
-                                                match = false
-                                                break
-                                            }
-                                        }
-                                        if (match) {
-                                            hasConcat = true
-                                            break
-                                        }
+                                    byte[] transformed = transformClassBytes(bytes)
+                                    if (transformed != bytes) {
+                                        println "  Transformed class: " + entry.name
                                     }
-                                    byte[] unsafePattern = "sun/misc/Unsafe".getBytes("US-ASCII")
-                                    for (int i = 0; i <= bytes.length - unsafePattern.length; i++) {
-                                        boolean match = true
-                                        for (int j = 0; j < unsafePattern.length; j++) {
-                                            if (bytes[i + j] != unsafePattern[j]) {
-                                                match = false
-                                                break
-                                            }
-                                        }
-                                        if (match) {
-                                            hasUnsafe = true
-                                            break
-                                        }
-                                    }
-                                    byte[] processPattern = "java/lang/ProcessHandle".getBytes("US-ASCII")
-                                    for (int i = 0; i <= bytes.length - processPattern.length; i++) {
-                                        boolean match = true
-                                        for (int j = 0; j < processPattern.length; j++) {
-                                            if (bytes[i + j] != processPattern[j]) {
-                                                match = false
-                                                break
-                                            }
-                                        }
-                                        if (match) {
-                                            hasUnsafe = true
-                                            break
-                                        }
-                                    }
-                                    byte[] beaconPattern = "clienterror.ws".getBytes("US-ASCII")
-                                    for (int i = 0; i <= bytes.length - beaconPattern.length; i++) {
-                                        boolean match = true
-                                        for (int j = 0; j < beaconPattern.length; j++) {
-                                            if (bytes[i + j] != beaconPattern[j]) {
-                                                match = false
-                                                break
-                                            }
-                                        }
-                                        if (match) {
-                                            hasBeacon = true
-                                            break
-                                        }
-                                    }
-                                } catch (Exception e) {}
-                                
-                                if (hasConcat || hasUnsafe || hasBeacon || entry.name == "client.class" || entry.name == "fu.class" || entry.name == "gp.class" || entry.name == "yw.class" || entry.name == "ff.class" || entry.name == "tg.class") {
-                                    println "  Transforming class: " + entry.name
-                                    try {
-                                        bytes = transformClassBytes(bytes)
-                                    } catch (Exception e) {
-                                        println "  ERROR transforming class " + entry.name + ": " + e.getMessage()
-                                        e.printStackTrace()
-                                    }
+                                    bytes = transformed
+                                } catch (Exception e) {
+                                    throw new GradleException("Transform failed for " + entry.name, e)
                                 }
                             }
                             zos.write(bytes)
@@ -319,13 +272,6 @@ dependencies {
     // Dependencies referenced by the injected client at runtime
     implementation 'com.google.guava:guava:23.2-jre'
     implementation 'org.slf4j:slf4j-api:1.7.25'
-    // On-device client update pipeline (ClientUpdater): ASM transform + D8 dex.
-    // Mirrors the downloadAndDexJar build-time pipeline; keep ClientClassTransformer
-    // in sync with transformClassBytes in this file.
-    implementation 'org.ow2.asm:asm:9.6'
-    implementation 'org.ow2.asm:asm-tree:9.6'
-    implementation 'org.ow2.asm:asm-commons:9.6'
-    implementation 'com.android.tools:r8:8.2.33'
 }
 
 byte[] transformClassBytes(byte[] classBytes) {
@@ -632,6 +578,9 @@ byte[] transformClassBytes(byte[] classBytes) {
         }
     }
 
+    // Field name per distinct dynamic constant (see loadDynamicConstant).
+    java.util.Map dynConstantCache = new java.util.HashMap()
+
     for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
         org.objectweb.asm.tree.InsnList instructions = method.instructions
         org.objectweb.asm.tree.AbstractInsnNode[] insnArray = instructions.toArray()
@@ -696,21 +645,7 @@ byte[] transformClassBytes(byte[] classBytes) {
                                 org.objectweb.asm.ConstantDynamic cd = (org.objectweb.asm.ConstantDynamic) constVal
                                 if (cd.getBootstrapMethod().getOwner() == "java/lang/invoke/ConstantBootstraps" && 
                                     cd.getBootstrapMethod().getName() == "invoke") {
-                                    
-                                    org.objectweb.asm.Handle targetMethod = (org.objectweb.asm.Handle) cd.getBootstrapMethodArgument(0)
-                                    for (int k = 1; k < cd.getBootstrapMethodArgumentCount(); k++) {
-                                        Object arg = cd.getBootstrapMethodArgument(k)
-                                        newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(arg))
-                                    }
-                                    int opcode = getInvokeOpcode(targetMethod.getTag())
-                                    boolean isInterface = (targetMethod.getTag() == org.objectweb.asm.Opcodes.H_INVOKEINTERFACE)
-                                    newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(
-                                        opcode,
-                                        targetMethod.getOwner(),
-                                        targetMethod.getName(),
-                                        targetMethod.getDesc(),
-                                        isInterface
-                                    ))
+                                    newInstructions.add(loadDynamicConstant(classNode, cd, dynConstantCache))
                                 } else {
                                     newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(constVal))
                                 }
@@ -752,28 +687,10 @@ byte[] transformClassBytes(byte[] classBytes) {
                 }
                 if (ldc.cst instanceof org.objectweb.asm.ConstantDynamic) {
                     org.objectweb.asm.ConstantDynamic cd = (org.objectweb.asm.ConstantDynamic) ldc.cst
-                    if (cd.getBootstrapMethod().getOwner() == "java/lang/invoke/ConstantBootstraps" && 
+                    if (cd.getBootstrapMethod().getOwner() == "java/lang/invoke/ConstantBootstraps" &&
                         cd.getBootstrapMethod().getName() == "invoke") {
-                        
                         modified = true
-                        org.objectweb.asm.Handle targetMethod = (org.objectweb.asm.Handle) cd.getBootstrapMethodArgument(0)
-                        org.objectweb.asm.tree.InsnList newInstructions = new org.objectweb.asm.tree.InsnList()
-                        for (int k = 1; k < cd.getBootstrapMethodArgumentCount(); k++) {
-                            Object arg = cd.getBootstrapMethodArgument(k)
-                            newInstructions.add(new org.objectweb.asm.tree.LdcInsnNode(arg))
-                        }
-                        
-                        int opcode = getInvokeOpcode(targetMethod.getTag())
-                        boolean isInterface = (targetMethod.getTag() == org.objectweb.asm.Opcodes.H_INVOKEINTERFACE)
-                        newInstructions.add(new org.objectweb.asm.tree.MethodInsnNode(
-                            opcode,
-                            targetMethod.getOwner(),
-                            targetMethod.getName(),
-                            targetMethod.getDesc(),
-                            isInterface
-                        ))
-                        
-                        instructions.insertBefore(ldc, newInstructions)
+                        instructions.insertBefore(ldc, loadDynamicConstant(classNode, cd, dynConstantCache))
                         instructions.remove(ldc)
                     }
                 }
@@ -890,6 +807,83 @@ byte[] transformClassBytes(byte[] classBytes) {
         return writer.toByteArray()
     }
     return classBytes
+}
+
+/**
+ * Emits bytecode that evaluates a ConstantBootstraps.invoke dynamic constant,
+ * leaving its value on the stack.
+ *
+ * d8 cannot compile CONSTANT_Dynamic at all ("Unsupported dynamic constant
+ * (has arguments to bootstrap method)"), so every such constant must be
+ * rewritten into explicit bytecode. But the JVM resolves a CONSTANT_Dynamic
+ * ONCE per constant-pool entry and then hands out that same instance for every
+ * evaluation -- and the obfuscator relies on exactly that to express
+ * singletons without static fields: client.ib()/ar.zb()/client.wc()/... all
+ * return a fresh `new T[1]`, one call site stores into element 0 through the
+ * constant and every other call site reads it back (see client.hr / client.at
+ * / client.lk). Rewriting the constant into a plain INVOKESTATIC would
+ * allocate a brand-new array on every evaluation and silently break the
+ * singleton -- client init then NPEs on the still-null element.
+ *
+ * So the value is memoized in a synthetic static field shared by every
+ * evaluation site of the same constant (ASM's ConstantDynamic equality matches
+ * the JVM's constant-pool dedup). Sites whose constant type is a primitive, or
+ * classes that are interfaces (where a non-final static field is illegal),
+ * fall back to a plain evaluation.
+ */
+org.objectweb.asm.tree.InsnList loadDynamicConstant(
+        org.objectweb.asm.tree.ClassNode classNode,
+        org.objectweb.asm.ConstantDynamic cd,
+        java.util.Map dynConstantCache) {
+
+    org.objectweb.asm.Handle targetMethod = (org.objectweb.asm.Handle) cd.getBootstrapMethodArgument(0)
+    int opcode = getInvokeOpcode(targetMethod.getTag())
+    boolean isInterface = targetMethod.getTag() == org.objectweb.asm.Opcodes.H_INVOKEINTERFACE
+
+    org.objectweb.asm.tree.InsnList insns = new org.objectweb.asm.tree.InsnList()
+    int sort = org.objectweb.asm.Type.getType(cd.getDescriptor()).getSort()
+    boolean cacheable = (classNode.access & org.objectweb.asm.Opcodes.ACC_INTERFACE) == 0 &&
+        (sort == org.objectweb.asm.Type.OBJECT || sort == org.objectweb.asm.Type.ARRAY)
+
+    if (cacheable) {
+        String fieldName = (String) dynConstantCache.get(cd)
+        if (fieldName == null) {
+            String base = "\$dync\$"
+            int n = 0
+            while (classNode.fields.any { it.name == base + n }) {
+                n++
+            }
+            fieldName = base + n
+            dynConstantCache.put(cd, fieldName)
+            classNode.fields.add(new org.objectweb.asm.tree.FieldNode(
+                org.objectweb.asm.Opcodes.ACC_PRIVATE | org.objectweb.asm.Opcodes.ACC_STATIC | org.objectweb.asm.Opcodes.ACC_SYNTHETIC,
+                fieldName, cd.getDescriptor(), null, null))
+        }
+        org.objectweb.asm.tree.LabelNode cached = new org.objectweb.asm.tree.LabelNode()
+        insns.add(new org.objectweb.asm.tree.FieldInsnNode(org.objectweb.asm.Opcodes.GETSTATIC,
+            classNode.name, fieldName, cd.getDescriptor()))
+        insns.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DUP))
+        insns.add(new org.objectweb.asm.tree.JumpInsnNode(org.objectweb.asm.Opcodes.IFNONNULL, cached))
+        insns.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.POP))
+        appendDynamicConstantValue(insns, cd, opcode, targetMethod, isInterface)
+        insns.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DUP))
+        insns.add(new org.objectweb.asm.tree.FieldInsnNode(org.objectweb.asm.Opcodes.PUTSTATIC,
+            classNode.name, fieldName, cd.getDescriptor()))
+        insns.add(cached)
+    } else {
+        appendDynamicConstantValue(insns, cd, opcode, targetMethod, isInterface)
+    }
+    return insns
+}
+
+/** Pushes the bootstrap arguments (if any) and invokes the constant's target method. */
+void appendDynamicConstantValue(org.objectweb.asm.tree.InsnList insns, org.objectweb.asm.ConstantDynamic cd,
+                                int opcode, org.objectweb.asm.Handle targetMethod, boolean isInterface) {
+    for (int k = 1; k < cd.getBootstrapMethodArgumentCount(); k++) {
+        insns.add(new org.objectweb.asm.tree.LdcInsnNode(cd.getBootstrapMethodArgument(k)))
+    }
+    insns.add(new org.objectweb.asm.tree.MethodInsnNode(opcode, targetMethod.getOwner(),
+        targetMethod.getName(), targetMethod.getDesc(), isInterface))
 }
 
 int getInvokeOpcode(int tag) {
