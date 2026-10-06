@@ -51,7 +51,7 @@ import dalvik.system.DexClassLoader;
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private static final String TAG = "RuneLiteMobile";
-    private static final int GAME_W = 766;
+    private static final int GAME_W = 765;
     private static final int GAME_H = 503;
     private static final String PREFS_NAME = "RuneLiteMobilePrefs";
 
@@ -75,7 +75,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private long lastStateLog = 0;
     private long lastDrawLog = 0;
     private long drawCount = 0;
-    private volatile Object bufferProvider;
     private Button kbButton;
     private LinearLayout kbBar;
     private EditText kbEdit;
@@ -1027,7 +1026,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void startUpdateCheckAsync() {
         new Thread(() -> {
-            String latest = ClientUpdater.fetchLatestClientVersion();
+            String latest = ClientUpdater.fetchAvailableClientVersion();
             if (latest == null) {
                 return;
             }
@@ -1047,7 +1046,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         tvUpdateText.setVisibility(View.VISIBLE);
         tvUpdateText.setText("Checking for updates...");
         new Thread(() -> {
-            String latest = ClientUpdater.fetchLatestClientVersion();
+            String latest = ClientUpdater.fetchAvailableClientVersion();
             String installed = ClientUpdater.installedClientVersion(this);
             runOnUiThread(() -> {
                 if (latest == null) {
@@ -1069,11 +1068,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateDialogShown = true;
         new AlertDialog.Builder(this)
             .setTitle("RuneLite client update available")
-            .setMessage("A new RuneLite client is available (v" + installed + " -> v" + latest + ").\n\n"
-                + "Download and install it now? The install runs in the background (dexing "
-                + "takes about 20-30 minutes on-device — progress is shown here); you'll be "
-                + "asked to restart the game when it's ready. This keeps the game working "
-                + "after weekly OSRS updates.")
+            .setMessage("A new game client is available (v" + installed + " -> v" + latest + ").\n\n"
+                + "Download and install it now? (~6 MB, takes seconds.) "
+                + "The old client keeps working if you decline.")
             .setPositiveButton("Update now", (d, w) -> runClientUpdate(latest))
             .setNegativeButton("Later", null)
             .setCancelable(true)
@@ -1089,7 +1086,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         btnCheckUpdates.setEnabled(false);
         new Thread(() -> {
             try {
-                ClientUpdater.runUpdate(this, version, (stage, percent, etaMillis) -> runOnUiThread(() -> {
+                ClientUpdater.downloadAndInstall(this, version, (stage, percent, etaMillis) -> runOnUiThread(() -> {
                     updateProgress.setProgress(percent);
                     tvUpdateText.setText(stage + "\n" + percent + "% · " + formatEta(etaMillis));
                 }));
@@ -1362,9 +1359,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                 // Frame blit: copy the rendered game buffer into the graphics
                                 if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
                                     try {
-                                        bufferProvider = args[0];
                                         bufferProviderStatic = args[0];
-                                        repointSceneRasterizerOnce();
+                                        bindSceneRasterizerToDisplay(args[0]);
                                         Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
                                         if (image instanceof java.awt.Image) {
                                             java.awt.Image img = (java.awt.Image) image;
@@ -1386,6 +1382,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                                         }
                                                     }
                                                 }
+                                                // World-region (left three quarters) content of the
+                                                // client's own frame vs the applet bridge the render
+                                                // thread scales: non-zero pixel count + XOR checksum.
+                                                // Constant client values with changing bridge values
+                                                // mean the client stopped redrawing the world.
+                                                pb.append(" world=").append(regionNonZero(imgPx, img.getWidth(), img.getHeight()))
+                                                    .append("/").append(Integer.toHexString(regionXor(imgPx, img.getWidth(), img.getHeight())));
+                                                int[] bridgePx = AWTBridge.activePixels;
+                                                pb.append(" bridge=").append(regionNonZero(bridgePx, GAME_W, GAME_H))
+                                                    .append("/").append(Integer.toHexString(regionXor(bridgePx, GAME_W, GAME_H)));
                                                 Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
                                                     + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
                                             }
@@ -2093,125 +2099,88 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private static volatile Object bufferProviderStatic;
-    private volatile boolean rasterizerRepointed = false;
+    private java.lang.reflect.Field[] sceneRasterizerSlots;
+    private java.lang.reflect.Field[] sceneRasterizerPixels;
+    private int[] sceneBoundPixels;
 
     /**
-     * The desktop client re-points the 3D rasterizer at the display buffer
-     * during its resize path; on this port that call never happens, so the
-     * scene renders into a 65536-element scratch array that is never shown.
-     * Replicate the call once the buffer exists (fh.ap -> fq.de sets the
-     * rasterizer's pixel target + width/height).
+     * Points the software 3D rasterizer at the display buffer the app blits.
+     *
+     * Each 3D rasterizer instance owns the pixel array it rasterizes into
+     * (`ak`, initialised from `fq.aq` — a 256x256 scratch), and the client never
+     * re-points it on this port: the desktop runtime does that from its resize
+     * path, which never runs here. The result is that the 2D UI lands in the
+     * display buffer (via the static `yw` target) while the 3D scene is drawn
+     * into the discarded scratch — a static, login-screen-stained frame with a
+     * live minimap.
+     *
+     * Nothing in the public API can retarget a rasterizer, so the client's own
+     * internals are reached by name; those names are version-specific and must
+     * be re-derived on a client bump (docs/telemetry-assessment.md §6).
+     *
+     * Idempotent and re-checked per frame: the client re-creates rasterizers
+     * (which resets `ak` to the scratch), and the display array can be replaced.
      */
-    private void repointSceneRasterizerOnce() {
-        if (rasterizerRepointed) return;
-        rasterizerRepointed = true;
+    private void bindSceneRasterizerToDisplay(Object bufferProvider) {
         try {
-            ClassLoader cl = clientClass != null ? clientClass.getClassLoader() : null;
-            if (cl == null || bufferProviderStatic == null) {
-                rasterizerRepointed = false;
-                return;
-            }
-            java.lang.reflect.Field faz = findFieldInChain(bufferProviderStatic.getClass(), "az");
-            faz.setAccessible(true);
-            Object img = faz.get(bufferProviderStatic);
-            if (!(img instanceof java.awt.Image)) {
-                rasterizerRepointed = false;
-                return;
-            }
-            int[] dispPx = ((java.awt.Image) img).getPixels();
-            Class<?> fh = cl.loadClass("fh");
-            Class<?> yw = cl.loadClass("yw");
-            java.lang.reflect.Method eu = yw.getMethod("eu", int[].class, int.class, int.class, float[].class);
-            float[] floatBuf = null;
-            try {
-                floatBuf = (float[]) yw.getField("ad").get(null);
-            } catch (Exception ignored) {}
-            eu.invoke(null, dispPx, GAME_W - 1, GAME_H, floatBuf);
-            java.lang.reflect.Field fae = fh.getDeclaredField("ae");
-            fae.setAccessible(true);
-            fae.set(null, dispPx);
-            for (String inst : new String[]{"aj", "af", "az"}) {
-                try {
-                    java.lang.reflect.Field fi = fh.getDeclaredField(inst);
-                    fi.setAccessible(true);
-                    Object rasterizer = fi.get(null);
-                    if (rasterizer != null) {
-                        java.lang.reflect.Field faa = findFieldInChain(rasterizer.getClass(), "aa");
-                        faa.setAccessible(true);
-                        faa.set(rasterizer, dispPx);
-                    }
-                } catch (Exception ignored) {}
-            }
-            Log.i(TAG, "Repointed scene rasterizer to display buffer "
-                + System.identityHashCode(dispPx) + "(" + dispPx.length + ") yw.aj="
-                + (yw.getField("aj").get(null) != null ? System.identityHashCode(yw.getField("aj").get(null)) : "null"));
-        } catch (Throwable t) {
-            rasterizerRepointed = false;
-            Log.w(TAG, "Repoint rasterizer failed: " + t);
-        }
-    }
+            ClassLoader cl = clientClass.getClassLoader();
+            Class<?> bufferProviderIface = cl.loadClass("net.runelite.api.BufferProvider");
+            int[] pixels = (int[]) bufferProviderIface.getMethod("getPixels").invoke(bufferProvider);
+            if (pixels == null) return;
 
-    /**
-     * The software renderer draws the 3D scene into a small square scene
-     * buffer (fh.aj.aa, 65536 = 256x256) and the client never scales it up
-     * into the display buffer (the RuneLite runtime/GPU plugin does that on
-     * desktop). Upscale the scene buffer into the display right before the
-     * blit; the 2D UI redraws over it every frame so this is safe timing-wise.
-     */
-    private void compositeSceneBuffer(java.awt.Image displayImage) {
-        try {
-            ClassLoader cl = clientClass != null ? clientClass.getClassLoader() : null;
-            if (cl == null) return;
-            Class<?> fh = cl.loadClass("fh");
-            java.lang.reflect.Field faj = fh.getDeclaredField("aj");
-            faj.setAccessible(true);
-            Object rasterizer = faj.get(null);
-            if (rasterizer == null) return;
-            java.lang.reflect.Field faa = findFieldInChain(rasterizer.getClass(), "aa");
-            faa.setAccessible(true);
-            int[] scene = (int[]) faa.get(rasterizer);
-            int[] disp = displayImage.getPixels();
-            if (scene == null || disp == null) return;
-            int srcW = 256;
-            int srcH = 256;
-            try {
-                java.lang.reflect.Field fw = findFieldInChain(rasterizer.getClass(), "ab");
-                fw.setAccessible(true);
-                java.lang.reflect.Field fh2 = findFieldInChain(rasterizer.getClass(), "af");
-                fh2.setAccessible(true);
-                int w = fw.getInt(rasterizer);
-                int h = fh2.getInt(rasterizer);
-                if (w > 0 && w <= 1024 && h > 0 && h <= 1024 && w * h <= scene.length) {
-                    srcW = w;
-                    srcH = h;
+            if (sceneRasterizerSlots == null) {
+                Class<?> manager = cl.loadClass("fq");
+                java.util.List<java.lang.reflect.Field> slots = new java.util.ArrayList<>();
+                java.util.List<java.lang.reflect.Field> pixelFields = new java.util.ArrayList<>();
+                for (String name : new String[]{"az", "ah", "an"}) {
+                    java.lang.reflect.Field slot = manager.getDeclaredField(name);
+                    slot.setAccessible(true);
+                    Object rasterizer = slot.get(null);
+                    if (rasterizer == null) continue;
+                    java.lang.reflect.Field field = findFieldInChain(rasterizer.getClass(), "ak");
+                    field.setAccessible(true);
+                    slots.add(slot);
+                    pixelFields.add(field);
                 }
-            } catch (Exception ignored) {}
-            int dispW = displayImage.getWidth();
-            int dispH = displayImage.getHeight();
-            for (int y = 0; y < dispH; y++) {
-                int srcY = y * srcH / dispH;
-                int srcRow = srcY * srcW;
-                int dstRow = y * dispW;
-                for (int x = 0; x < dispW; x++) {
-                    int srcX = x * srcW / dispW;
-                    if (srcRow + srcX < scene.length) {
-                        disp[dstRow + x] = scene[srcRow + srcX];
+                sceneRasterizerSlots = slots.toArray(new java.lang.reflect.Field[0]);
+                sceneRasterizerPixels = pixelFields.toArray(new java.lang.reflect.Field[0]);
+            }
+
+            boolean allBound = sceneBoundPixels == pixels;
+            if (allBound) {
+                for (int i = 0; i < sceneRasterizerSlots.length; i++) {
+                    Object rasterizer = sceneRasterizerSlots[i].get(null);
+                    if (rasterizer == null || sceneRasterizerPixels[i].get(rasterizer) != pixels) {
+                        allBound = false;
+                        break;
                     }
                 }
             }
-            if (!sceneCompositeLogged) {
-                sceneCompositeLogged = true;
-                Log.i(TAG, "SceneComposite: src=" + scene.length + " (" + srcW + "x" + srcH
-                    + ") -> " + dispW + "x" + dispH);
+            if (allBound) return;
+
+            int width = (int) bufferProviderIface.getMethod("getWidth").invoke(bufferProvider);
+            int height = (int) bufferProviderIface.getMethod("getHeight").invoke(bufferProvider);
+            Class<?> rasterizer = cl.loadClass("yw");
+            float[] depth = (float[]) rasterizer.getField("aw").get(null);
+            Method bind = rasterizer.getDeclaredMethod("ef", int[].class, int.class, int.class, float[].class);
+            bind.setAccessible(true);
+            bind.invoke(null, pixels, width, height, depth);
+
+            int rebound = 0;
+            for (int i = 0; i < sceneRasterizerSlots.length; i++) {
+                Object instance = sceneRasterizerSlots[i].get(null);
+                if (instance != null) {
+                    sceneRasterizerPixels[i].set(instance, pixels);
+                    rebound++;
+                }
             }
+            sceneBoundPixels = pixels;
+            Log.i(TAG, "Bound " + rebound + " 3D rasterizer(s) to display buffer "
+                + System.identityHashCode(pixels) + "(" + width + "x" + height + ")");
         } catch (Throwable t) {
-            Log.w(TAG, "SceneComposite failed: " + t);
+            Log.w(TAG, "Rasterizer bind failed: " + t);
         }
     }
-
-    private volatile boolean sceneCompositeLogged = false;
-
-    private volatile boolean tileLayoutLogged = false;
 
     private static java.lang.reflect.Field findFieldInChain(Class<?> c, String name) {
         Class<?> cur = c;
@@ -2305,6 +2274,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             sb.append(" scene=ERR");
         }
         return sb.toString();
+    }
+
+    /**
+     * Diagnostic: number of non-zero pixels in the left three quarters (the 3D
+     * world region) of a frame, or -1 when the buffer is absent.
+     */
+    private static int regionNonZero(int[] px, int width, int height) {
+        if (px == null || width <= 0) return -1;
+        int regionWidth = width * 3 / 4;
+        int count = 0;
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            for (int x = 0; x < regionWidth && row + x < px.length; x++) {
+                if (px[row + x] != 0) count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Diagnostic: per-row XOR checksum of the left three quarters (the 3D world
+     * region) of a frame, or -1 when the buffer is absent. Rows are folded with
+     * a multiply so row order matters.
+     */
+    private static int regionXor(int[] px, int width, int height) {
+        if (px == null || width <= 0) return -1;
+        int regionWidth = width * 3 / 4;
+        int acc = 0;
+        for (int y = 0; y < height; y++) {
+            int row = y * width;
+            int rowXor = 0;
+            for (int x = 0; x < regionWidth && row + x < px.length; x++) {
+                rowXor ^= px[row + x];
+            }
+            acc = acc * 31 + rowXor;
+        }
+        return acc;
     }
 
     /**
@@ -2533,13 +2539,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     int destW = awtBridge.getWidth();
                     int destH = awtBridge.getHeight();
 
+                    // The game's software rasterizer writes 3D pixels as
+                    // 0x00RRGGBB (no alpha) while the 2D UI writes 0xFF... .
+                    // The frame is opaque, so force the alpha channel up before
+                    // handing it to canvas.drawBitmap: with alpha 0 the default
+                    // SRC_OVER blend drops every 3D pixel, leaving the previous
+                    // surface content visible (the "static login-screen
+                    // remnants with a live minimap" symptom).
                     for (int y = 0; y < destH; y++) {
                         int srcY = y * GAME_H / destH;
                         int destRowOffset = y * destW;
                         int srcRowOffset = srcY * GAME_W;
                         for (int x = 0; x < destW; x++) {
                             int srcX = x * GAME_W / destW;
-                            destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX];
+                            destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX] | 0xFF000000;
                         }
                     }
 
@@ -2558,9 +2571,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             Object state = clientInterface.getMethod("getGameState").invoke(clientObject);
                             Object loginIdx = clientInterface.getMethod("getLoginIndex").invoke(clientObject);
                             StringBuilder sb = new StringBuilder("GameState: " + state + " loginIndex: " + loginIdx);
-                            for (String probe : new String[]{"getWorld", "getWorldHost", "getCurrentLoginField"}) {
+                            for (String probe : new String[]{"getWorld", "getWorldHost", "getCurrentLoginField",
+                                    "getBaseX", "getBaseY", "getPlane", "getCameraX", "getCameraY", "getCameraZ",
+                                    "getLocalPlayer", "getMapRegions"}) {
                                 try {
                                     Object v = clientInterface.getMethod(probe).invoke(clientObject);
+                                    if (v instanceof int[]) {
+                                        v = ((int[]) v).length + " regions";
+                                    }
                                     sb.append(" ").append(probe).append("=").append(v);
                                 } catch (Exception e) {
                                     sb.append(" ").append(probe).append("=ERR");
@@ -2594,6 +2612,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } catch (InterruptedException ignored) {}
         }
     }
+
+
 
     @Override
     public void onBackPressed() {

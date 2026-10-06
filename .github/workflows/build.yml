@@ -7,6 +7,11 @@ on:
   workflow_dispatch:
     # Allow manual triggers for testing or mid-week hotfixes
 
+# Needed so the distribute job can create a GitHub Release (new repos default
+# the GITHUB_TOKEN to read-only).
+permissions:
+  contents: write
+
 jobs:
   build-android:
     name: Build Android Client (Option A Wrapper)
@@ -28,11 +33,18 @@ jobs:
       - name: Build Android APK
         run: ./gradlew :android:assembleRelease
 
+      - name: Checksum the dexed client
+        run: sha256sum android/src/main/assets/runelite-dex.jar | awk '{print $1}' > android/src/main/assets/runelite-dex.jar.sha256
+
       - name: Upload Android Release APK
         uses: actions/upload-artifact@v4
         with:
           name: runelite-android-release
-          path: android/build/outputs/apk/release/android-release.apk
+          path: |
+            android/build/outputs/apk/release/android-release.apk
+            android/src/main/assets/runelite-dex.jar
+            android/src/main/assets/runelite-dex.jar.sha256
+            android/src/main/assets/client-version.txt
 
   build-ios:
     name: Compile iOS Client (RoboVM Native AOT)
@@ -64,7 +76,10 @@ jobs:
 
   distribute:
     name: Publish Releases
-    needs: [build-android, build-ios]
+    # Only the Android job gates client delivery: a failing macOS-only iOS
+    # skeleton job must never block shipping the client. The IPA stays a
+    # workflow artifact (runelite-ios-unsigned).
+    needs: [build-android]
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts
@@ -79,6 +94,9 @@ jobs:
           prerelease: false
           files: |
             runelite-android-release/*.apk
+            runelite-android-release/runelite-dex.jar
+            runelite-android-release/runelite-dex.jar.sha256
+            runelite-android-release/client-version.txt
             runelite-ios-unsigned/*.ipa
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
