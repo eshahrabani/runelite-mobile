@@ -104,6 +104,7 @@ task downloadAndDexJar {
                             if (entry.name.endsWith(".class")) {
                                 boolean hasConcat = false
                                 boolean hasUnsafe = false
+                                boolean hasBeacon = false
                                 try {
                                     byte[] pattern = "makeConcatWithConstants".getBytes("US-ASCII")
                                     for (int i = 0; i <= bytes.length - pattern.length; i++) {
@@ -147,9 +148,23 @@ task downloadAndDexJar {
                                             break
                                         }
                                     }
+                                    byte[] beaconPattern = "clienterror.ws".getBytes("US-ASCII")
+                                    for (int i = 0; i <= bytes.length - beaconPattern.length; i++) {
+                                        boolean match = true
+                                        for (int j = 0; j < beaconPattern.length; j++) {
+                                            if (bytes[i + j] != beaconPattern[j]) {
+                                                match = false
+                                                break
+                                            }
+                                        }
+                                        if (match) {
+                                            hasBeacon = true
+                                            break
+                                        }
+                                    }
                                 } catch (Exception e) {}
                                 
-                                if (hasConcat || hasUnsafe || entry.name == "client.class" || entry.name == "fu.class" || entry.name == "gp.class" || entry.name == "yw.class" || entry.name == "ff.class" || entry.name == "tg.class") {
+                                if (hasConcat || hasUnsafe || hasBeacon || entry.name == "client.class" || entry.name == "fu.class" || entry.name == "gp.class" || entry.name == "yw.class" || entry.name == "ff.class" || entry.name == "tg.class") {
                                     println "  Transforming class: " + entry.name
                                     try {
                                         bytes = transformClassBytes(bytes)
@@ -811,6 +826,52 @@ byte[] transformClassBytes(byte[] classBytes) {
                     typeInsn.desc = "org/runelite/mobile/ProcessHandle\$Info"
                 }
             }
+        }
+    }
+
+    // Neutralize the crash beacon by construction: any method that builds a
+    // "clienterror.ws..." URL is a caller of Jagex's crash reporter, which ships
+    // a stack trace (possibly containing this port's class names) along with the
+    // player's user id. Force such methods to return immediately. Constructors
+    // and static initializers are left alone so class initialization keeps working.
+    for (org.objectweb.asm.tree.MethodNode method : classNode.methods) {
+        if (method.name == "<init>" || method.name == "<clinit>") {
+            continue
+        }
+        boolean beacon = false
+        for (org.objectweb.asm.tree.AbstractInsnNode insn : method.instructions.toArray()) {
+            if (insn instanceof org.objectweb.asm.tree.LdcInsnNode) {
+                Object cst = ((org.objectweb.asm.tree.LdcInsnNode) insn).cst
+                if (cst instanceof String && ((String) cst).startsWith("clienterror.ws")) {
+                    beacon = true
+                    break
+                }
+            }
+        }
+        if (beacon) {
+            org.objectweb.asm.tree.InsnList ret = new org.objectweb.asm.tree.InsnList()
+            int sort = org.objectweb.asm.Type.getReturnType(method.desc).getSort()
+            if (sort == org.objectweb.asm.Type.VOID) {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.RETURN))
+            } else if (sort == org.objectweb.asm.Type.LONG) {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.LCONST_0))
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.LRETURN))
+            } else if (sort == org.objectweb.asm.Type.FLOAT) {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.FCONST_0))
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.FRETURN))
+            } else if (sort == org.objectweb.asm.Type.DOUBLE) {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DCONST_0))
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.DRETURN))
+            } else if (sort == org.objectweb.asm.Type.OBJECT || sort == org.objectweb.asm.Type.ARRAY) {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.ACONST_NULL))
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.ARETURN))
+            } else {
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.ICONST_0))
+                ret.add(new org.objectweb.asm.tree.InsnNode(org.objectweb.asm.Opcodes.IRETURN))
+            }
+            method.instructions.insert(ret)
+            modified = true
+            println "  [ASM] Neutered crash beacon in " + classNode.name + "." + method.name
         }
     }
 
