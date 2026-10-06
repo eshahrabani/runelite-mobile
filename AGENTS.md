@@ -72,13 +72,18 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   render thread must **not** call `client.paint()` — that blits the live frame
   while the client thread is rendering the next one (torn frames).
   Two port-side invariants keep the world visible; both are easy to break:
-  1. `bindSceneRasterizerToDisplay()` re-points each 3D rasterizer instance's
-     pixel array (`ak`) at the display buffer. The client initialises it from
-     `fq.aq` — a 256×256 scratch — and only the desktop runtime's resize path
-     re-points it, so without this the 3D scene is rasterised into a discarded
-     buffer: a frozen frame with a live minimap. The client-internal names
-     (`fq`, `yw.ef`, `fa.ak`) are version-specific and must be re-derived on a
-     client bump (docs/telemetry-assessment.md §6).
+  1. `bindSceneRasterizerToDisplay()` re-points the software rasterizer's
+     output array (`yw.ah`) at the display buffer through the client's own
+     `yw.ef(int[], int, int, float[])` (the call its `yi.ab(int)` resize path
+     makes). The client only runs that on a desktop resize, so without this the
+     3D scene is rasterised into the client's original target: a frozen frame
+     with a live minimap. `fa.ak` is **not** a pixel target — it is each
+     rasterizer's reference to the `fq.aq` HSL→RGB palette (65536 entries) that
+     every shaded fill reads; re-pointing it at the frame turns those lookups
+     into screen-pixel reads (grey walls, black ground/trees/actors). The
+     client-internal names (`yw.ef`, `yw.ah`, `fq.aq`, `fa.ak`) are
+     version-specific and must be re-derived on a client bump
+     (docs/telemetry-assessment.md §6).
   2. The frame is presented as `pixel | 0xFF000000`. The software rasterizer
      writes 3D pixels with alpha 0 and `canvas.drawBitmap` blends, so an
      alpha-0 pixel is dropped and the previous surface content stays visible
@@ -127,8 +132,13 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
 - **Touch input is wired**: ACTION_DOWN/MOVE/UP → MOUSE_PRESSED/DRAGGED/
   RELEASED/CLICKED, ACTION_SCROLL → MOUSE_WHEEL, dispatched to the client
   component itself, falling back to the canvas from `GameEngine.getCanvas()`
-  (see `resolveInputTarget()` in MainActivity). Keyboard is NOT wired (no
-  on-screen keyboard; in-game chat is future work).
+  (see `resolveInputTarget()` in MainActivity). ACTION_DOWN emits a
+  MOUSE_MOVED at the same point **before** the MOUSE_PRESSED: a mouse always
+  moves before it presses, and the client's own menus (the world list) select
+  the **hovered** row (`ar.bf` selects `dr`, set from `tk.af`/`tk.ac`, not from
+  the press position), so without that move a tap acts on wherever the previous
+  gesture left the cursor. Keyboard is NOT wired (no on-screen keyboard;
+  in-game chat is future work).
 - **`ios/`** — RoboVM `IOSLauncher` skeleton only (empty UIWindow, no rendering).
 
 ## Don't be misled by root-level jars
