@@ -1392,12 +1392,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                                 int[] bridgePx = AWTBridge.activePixels;
                                                 pb.append(" bridge=").append(regionNonZero(bridgePx, GAME_W, GAME_H))
                                                     .append("/").append(Integer.toHexString(regionXor(bridgePx, GAME_W, GAME_H)));
+                                                pb.append(" ").append(paletteInvariant())
+                                                    .append(" blitMs=").append(String.format("%.1f", lastBlitNanos / 1e6));
                                                 Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
                                                     + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
                                             }
+                                            long blitStart = System.nanoTime();
                                             synchronized (renderLock) {
                                                 ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
                                             }
+                                            lastBlitNanos = System.nanoTime() - blitStart;
                                         }
                                     } catch (Throwable e) {
                                         Log.w(TAG, "callbacks.draw failed", e);
@@ -1686,10 +1690,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     pointerDown = true;
                     int x = toGameX(v, event.getX());
                     int y = toGameY(v, event.getY());
-                    dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_PRESSED, x, y, when);
+                    // A mouse always moves before it presses. The client's own
+                    // menus (the world list) pick the row from the *hover*
+                    // position, so without this move a tap acts on wherever the
+                    // previous gesture left the cursor.
                     lastMouseX = x;
                     lastMouseY = y;
                     lastMouseWhen = when;
+                    dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_MOVED, x, y, when);
+                    dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_PRESSED, x, y, when);
                     break;
                 }
                 case MotionEvent.ACTION_MOVE: {
@@ -2099,27 +2108,43 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private static volatile Object bufferProviderStatic;
-    private java.lang.reflect.Field[] sceneRasterizerSlots;
-    private java.lang.reflect.Field[] sceneRasterizerPixels;
-    private int[] sceneBoundPixels;
+    private java.lang.reflect.Field rasterizerTargetField;
+    private int[] rasterizerBoundPixels;
+
+    // Palette diagnostics (throttled log): `fq.aq` is the HSL->RGB palette the
+    // shaded fills and model faces look up, and `fa.ak` is the per-rasterizer
+    // reference to it. The reference must never be re-pointed at a frame buffer.
+    private java.lang.reflect.Field paletteStaticField;
+    private java.lang.reflect.Field[] paletteSlotFields;
+    private java.lang.reflect.Field paletteArrayField;
+
+    private volatile long lastBlitNanos;
+    private volatile long lastScaleNanos;
 
     /**
-     * Points the software 3D rasterizer at the display buffer the app blits.
+     * Points the software 3D rasterizer's output at the display buffer the app
+     * blits.
      *
-     * Each 3D rasterizer instance owns the pixel array it rasterizes into
-     * (`ak`, initialised from `fq.aq` — a 256x256 scratch), and the client never
-     * re-points it on this port: the desktop runtime does that from its resize
-     * path, which never runs here. The result is that the 2D UI lands in the
-     * display buffer (via the static `yw` target) while the 3D scene is drawn
-     * into the discarded scratch — a static, login-screen-stained frame with a
-     * live minimap.
+     * The rasterizer writes its frame through the static `yw.ah` array, which
+     * `yw.ef(int[], int, int, float[])` sets together with the clip and the
+     * depth array. The client only calls that from its resize path (its own
+     * `yi.ab(int)`), which never runs on this port — the frame size is fixed —
+     * so without this call the 2D UI lands in the display buffer while the 3D
+     * scene is rasterised into the client's original target: a frozen frame
+     * with a live minimap.
      *
-     * Nothing in the public API can retarget a rasterizer, so the client's own
+     * Do NOT retarget `fa.ak` (the per-rasterizer palette reference, initialised
+     * from `fq.aq`): it is the 65536-entry HSL->RGB table every shaded fill
+     * reads (`var0.ak[hslIndex]`), not a pixel target. Pointing it at the frame
+     * makes those lookups return screen pixels — walls take grey/stone from the
+     * upper screen while ground, tree trunks and actors go black.
+     *
+     * Nothing in the public API can retarget the rasterizer, so the client's own
      * internals are reached by name; those names are version-specific and must
      * be re-derived on a client bump (docs/telemetry-assessment.md §6).
      *
-     * Idempotent and re-checked per frame: the client re-creates rasterizers
-     * (which resets `ak` to the scratch), and the display array can be replaced.
+     * Idempotent and re-checked per frame: the client can re-point `yw.ah`
+     * behind our back, and the display array can be replaced.
      */
     private void bindSceneRasterizerToDisplay(Object bufferProvider) {
         try {
@@ -2128,35 +2153,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             int[] pixels = (int[]) bufferProviderIface.getMethod("getPixels").invoke(bufferProvider);
             if (pixels == null) return;
 
-            if (sceneRasterizerSlots == null) {
-                Class<?> manager = cl.loadClass("fq");
-                java.util.List<java.lang.reflect.Field> slots = new java.util.ArrayList<>();
-                java.util.List<java.lang.reflect.Field> pixelFields = new java.util.ArrayList<>();
-                for (String name : new String[]{"az", "ah", "an"}) {
-                    java.lang.reflect.Field slot = manager.getDeclaredField(name);
-                    slot.setAccessible(true);
-                    Object rasterizer = slot.get(null);
-                    if (rasterizer == null) continue;
-                    java.lang.reflect.Field field = findFieldInChain(rasterizer.getClass(), "ak");
-                    field.setAccessible(true);
-                    slots.add(slot);
-                    pixelFields.add(field);
-                }
-                sceneRasterizerSlots = slots.toArray(new java.lang.reflect.Field[0]);
-                sceneRasterizerPixels = pixelFields.toArray(new java.lang.reflect.Field[0]);
+            if (rasterizerTargetField == null) {
+                Class<?> rasterizer = cl.loadClass("yw");
+                java.lang.reflect.Field target = rasterizer.getField("ah");
+                target.setAccessible(true);
+                rasterizerTargetField = target;
             }
-
-            boolean allBound = sceneBoundPixels == pixels;
-            if (allBound) {
-                for (int i = 0; i < sceneRasterizerSlots.length; i++) {
-                    Object rasterizer = sceneRasterizerSlots[i].get(null);
-                    if (rasterizer == null || sceneRasterizerPixels[i].get(rasterizer) != pixels) {
-                        allBound = false;
-                        break;
-                    }
-                }
-            }
-            if (allBound) return;
+            if (rasterizerBoundPixels == pixels && rasterizerTargetField.get(null) == pixels) return;
 
             int width = (int) bufferProviderIface.getMethod("getWidth").invoke(bufferProvider);
             int height = (int) bufferProviderIface.getMethod("getHeight").invoke(bufferProvider);
@@ -2166,19 +2169,52 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             bind.setAccessible(true);
             bind.invoke(null, pixels, width, height, depth);
 
-            int rebound = 0;
-            for (int i = 0; i < sceneRasterizerSlots.length; i++) {
-                Object instance = sceneRasterizerSlots[i].get(null);
-                if (instance != null) {
-                    sceneRasterizerPixels[i].set(instance, pixels);
-                    rebound++;
-                }
-            }
-            sceneBoundPixels = pixels;
-            Log.i(TAG, "Bound " + rebound + " 3D rasterizer(s) to display buffer "
+            rasterizerBoundPixels = pixels;
+            Log.i(TAG, "Bound 3D rasterizer target to display buffer "
                 + System.identityHashCode(pixels) + "(" + width + "x" + height + ")");
         } catch (Throwable t) {
             Log.w(TAG, "Rasterizer bind failed: " + t);
+        }
+    }
+
+    /**
+     * Diagnostic: `pal=ok|BAD(<non-zero entries>/65536)` — whether the three
+     * rasterizer palette references still point at `fq.aq` and how much of the
+     * table is actually built. An all-zero table means the client never ran its
+     * palette builder.
+     */
+    private String paletteInvariant() {
+        try {
+            ClassLoader cl = clientClass.getClassLoader();
+            if (paletteStaticField == null) {
+                Class<?> manager = cl.loadClass("fq");
+                paletteStaticField = manager.getField("aq");
+                String[] slots = {"az", "ah", "an"};
+                paletteSlotFields = new java.lang.reflect.Field[slots.length];
+                for (int i = 0; i < slots.length; i++) {
+                    java.lang.reflect.Field slot = manager.getDeclaredField(slots[i]);
+                    slot.setAccessible(true);
+                    paletteSlotFields[i] = slot;
+                }
+                paletteArrayField = findFieldInChain(cl.loadClass("fa"), "ak");
+                paletteArrayField.setAccessible(true);
+            }
+            int[] palette = (int[]) paletteStaticField.get(null);
+            int nonZero = 0;
+            for (int i = 0; i < palette.length; i++) {
+                if (palette[i] != 0) nonZero++;
+            }
+            boolean ok = true;
+            for (java.lang.reflect.Field slot : paletteSlotFields) {
+                Object instance = slot.get(null);
+                if (instance == null || paletteArrayField.get(instance) != palette) {
+                    ok = false;
+                    break;
+                }
+            }
+            return "pal=" + (ok ? "ok" : "BAD") + "(" + nonZero + "/" + palette.length + ")";
+        } catch (Throwable t) {
+            return "pal=ERR";
         }
     }
 
@@ -2528,36 +2564,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         // must NOT call client.paint() here: it blits the game's
                         // LIVE frame buffer while the client thread is rendering
                         // the next frame into it, producing torn frames.
+                        long scaleStart = System.nanoTime();
                         synchronized (renderLock) {
                             System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
                         }
+
+                        int[] destPixels = awtBridge.getRawPixels();
+                        int destW = awtBridge.getWidth();
+                        int destH = awtBridge.getHeight();
+
+                        // The game's software rasterizer writes 3D pixels as
+                        // 0x00RRGGBB (no alpha) while the 2D UI writes 0xFF... .
+                        // The frame is opaque, so force the alpha channel up before
+                        // handing it to canvas.drawBitmap: with alpha 0 the default
+                        // SRC_OVER blend drops every 3D pixel, leaving the previous
+                        // surface content visible (the "static login-screen
+                        // remnants with a live minimap" symptom).
+                        for (int y = 0; y < destH; y++) {
+                            int srcY = y * GAME_H / destH;
+                            int destRowOffset = y * destW;
+                            int srcRowOffset = srcY * GAME_W;
+                            for (int x = 0; x < destW; x++) {
+                                int srcX = x * GAME_W / destW;
+                                destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX] | 0xFF000000;
+                            }
+                        }
+
+                        renderBitmap.setPixels(awtBridge.getRawPixels(), 0, awtBridge.getWidth(), 0, 0, awtBridge.getWidth(), awtBridge.getHeight());
+                        canvas.drawBitmap(renderBitmap, 0, 0, null);
+                        lastScaleNanos = System.nanoTime() - scaleStart;
                     } else {
                         System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
                     }
-
-                    int[] destPixels = awtBridge.getRawPixels();
-                    int destW = awtBridge.getWidth();
-                    int destH = awtBridge.getHeight();
-
-                    // The game's software rasterizer writes 3D pixels as
-                    // 0x00RRGGBB (no alpha) while the 2D UI writes 0xFF... .
-                    // The frame is opaque, so force the alpha channel up before
-                    // handing it to canvas.drawBitmap: with alpha 0 the default
-                    // SRC_OVER blend drops every 3D pixel, leaving the previous
-                    // surface content visible (the "static login-screen
-                    // remnants with a live minimap" symptom).
-                    for (int y = 0; y < destH; y++) {
-                        int srcY = y * GAME_H / destH;
-                        int destRowOffset = y * destW;
-                        int srcRowOffset = srcY * GAME_W;
-                        for (int x = 0; x < destW; x++) {
-                            int srcX = x * GAME_W / destW;
-                            destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX] | 0xFF000000;
-                        }
-                    }
-
-                    renderBitmap.setPixels(awtBridge.getRawPixels(), 0, awtBridge.getWidth(), 0, 0, awtBridge.getWidth(), awtBridge.getHeight());
-                    canvas.drawBitmap(renderBitmap, 0, 0, null);
 
                     canvas.drawText("RuneLite Mobile (AWT Bridge Active)", 40, 70, debugPaint);
                     canvas.drawText(loaderStatus, 40, 130, highlightPaint);
@@ -2570,10 +2608,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             Class<?> clientInterface = clientClass.getClassLoader().loadClass("net.runelite.api.Client");
                             Object state = clientInterface.getMethod("getGameState").invoke(clientObject);
                             Object loginIdx = clientInterface.getMethod("getLoginIndex").invoke(clientObject);
-                            StringBuilder sb = new StringBuilder("GameState: " + state + " loginIndex: " + loginIdx);
+                            StringBuilder sb = new StringBuilder("GameState: " + state + " loginIndex: " + loginIdx
+                                + " scaleMs=" + String.format("%.1f", lastScaleNanos / 1e6));
                             for (String probe : new String[]{"getWorld", "getWorldHost", "getCurrentLoginField",
                                     "getBaseX", "getBaseY", "getPlane", "getCameraX", "getCameraY", "getCameraZ",
-                                    "getLocalPlayer", "getMapRegions"}) {
+                                    "getLocalPlayer", "getMapRegions", "getFPS", "getCanvasWidth", "getCanvasHeight",
+                                    "isStretchedEnabled"}) {
                                 try {
                                     Object v = clientInterface.getMethod(probe).invoke(clientObject);
                                     if (v instanceof int[]) {
