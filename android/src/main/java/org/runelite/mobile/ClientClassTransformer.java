@@ -496,6 +496,53 @@ public final class ClientClassTransformer {
             }
         }
 
+        // Neutralize the crash beacon by construction: any method that builds a
+        // "clienterror.ws..." URL is a caller of Jagex's crash reporter, which
+        // ships a stack trace (possibly containing this port's class names)
+        // along with the player's user id. Force such methods to return
+        // immediately. Constructors and static initializers are left alone so
+        // class initialization keeps working.
+        for (MethodNode method : classNode.methods) {
+            if ("<init>".equals(method.name) || "<clinit>".equals(method.name)) {
+                continue;
+            }
+            boolean beacon = false;
+            for (AbstractInsnNode insn : method.instructions.toArray()) {
+                if (insn instanceof LdcInsnNode) {
+                    Object cst = ((LdcInsnNode) insn).cst;
+                    if (cst instanceof String && ((String) cst).startsWith("clienterror.ws")) {
+                        beacon = true;
+                        break;
+                    }
+                }
+            }
+            if (beacon) {
+                InsnList ret = new InsnList();
+                int sort = Type.getReturnType(method.desc).getSort();
+                if (sort == Type.VOID) {
+                    ret.add(new InsnNode(Opcodes.RETURN));
+                } else if (sort == Type.LONG) {
+                    ret.add(new InsnNode(Opcodes.LCONST_0));
+                    ret.add(new InsnNode(Opcodes.LRETURN));
+                } else if (sort == Type.FLOAT) {
+                    ret.add(new InsnNode(Opcodes.FCONST_0));
+                    ret.add(new InsnNode(Opcodes.FRETURN));
+                } else if (sort == Type.DOUBLE) {
+                    ret.add(new InsnNode(Opcodes.DCONST_0));
+                    ret.add(new InsnNode(Opcodes.DRETURN));
+                } else if (sort == Type.OBJECT || sort == Type.ARRAY) {
+                    ret.add(new InsnNode(Opcodes.ACONST_NULL));
+                    ret.add(new InsnNode(Opcodes.ARETURN));
+                } else {
+                    ret.add(new InsnNode(Opcodes.ICONST_0));
+                    ret.add(new InsnNode(Opcodes.IRETURN));
+                }
+                method.instructions.insert(ret);
+                modified = true;
+                System.out.println("  [ASM] Neutered crash beacon in " + classNode.name + "." + method.name);
+            }
+        }
+
         if (modified) {
             ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_FRAMES) {
                 @Override

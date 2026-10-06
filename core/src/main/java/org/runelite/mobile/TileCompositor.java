@@ -247,7 +247,11 @@ public final class TileCompositor {
      * rasterizer). Counts rasterized textured triangles.
      */
     public static void traceFqCt() {
-        ctCalls++;
+        try {
+            ctCalls++;
+        } catch (Throwable t) {
+            hookFailed(t);
+        }
     }
 
     private static volatile int ctCalls;
@@ -258,7 +262,11 @@ public final class TileCompositor {
      * count comparable to ct proves the pixel writes execute.
      */
     public static void traceFfBh() {
-        bhCalls++;
+        try {
+            bhCalls++;
+        } catch (Throwable t) {
+            hookFailed(t);
+        }
     }
 
     private static volatile int bhCalls;
@@ -268,7 +276,11 @@ public final class TileCompositor {
      * renderer). Counts how often the loading screen is drawn over the world.
      */
     public static void traceDg() {
-        dgCalls++;
+        try {
+            dgCalls++;
+        } catch (Throwable t) {
+            hookFailed(t);
+        }
     }
 
     private static volatile int dgCalls;
@@ -332,15 +344,17 @@ public final class TileCompositor {
      * Reports the number of tiles processed per scene render.
      */
     public static void traceGpEm(Object tiles) {
-        emCalls++;
-        if (emCalls <= 8 || (emCalls % 128) == 0) {
-            int n = -1;
-            try {
+        try {
+            emCalls++;
+            if (emCalls <= 8 || (emCalls % 128) == 0) {
+                int n = -1;
                 if (tiles instanceof Object[]) {
                     n = ((Object[]) tiles).length;
                 }
-            } catch (Throwable ignored) {}
-            System.err.println("[EmTrace] em=" + emCalls + " tiles=" + n);
+                System.err.println("[EmTrace] em=" + emCalls + " tiles=" + n);
+            }
+        } catch (Throwable t) {
+            hookFailed(t);
         }
     }
 
@@ -440,9 +454,13 @@ public final class TileCompositor {
     }
 
     public static void traceMxResult(int result) {
-        mxResults++;
-        if (mxResults <= 16 || (mxResults % 64) == 0) {
-            System.err.println("[MxTrace] result=" + result + " (total ok=" + (mxResults) + ")");
+        try {
+            mxResults++;
+            if (mxResults <= 16 || (mxResults % 64) == 0) {
+                System.err.println("[MxTrace] result=" + result + " (total ok=" + (mxResults) + ")");
+            }
+        } catch (Throwable t) {
+            hookFailed(t);
         }
     }
 

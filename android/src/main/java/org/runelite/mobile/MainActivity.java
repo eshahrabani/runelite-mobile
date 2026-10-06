@@ -69,6 +69,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Thread renderThread;
     private final int[] appletPixels = new int[GAME_W * GAME_H];
     private boolean pointerDown = false;
+    private int lastMouseX = -1;
+    private int lastMouseY = -1;
+    private long lastMouseWhen = 0;
     private long lastStateLog = 0;
     private long lastDrawLog = 0;
     private long drawCount = 0;
@@ -1302,28 +1305,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 new Class<?>[]{configInterface},
                 (Object proxy, Method method, Object[] args) -> {
                     String methodName = method.getName();
-                    switch (methodName) {
-                        case "getCodeBase":
-                            return codebaseUrl;
-                        case "getParameter": {
-                            String paramName = (String) args[0];
-                            String value = appletParameters.get(paramName);
-                            Log.d(TAG, "ClientConfig.getParameter(" + paramName + ") -> "
-                                + (value != null ? value.substring(0, Math.min(value.length(), 40)) : "null"));
-                            return value;
+                    try {
+                        switch (methodName) {
+                            case "getCodeBase":
+                                return codebaseUrl;
+                            case "getParameter": {
+                                String paramName = (String) args[0];
+                                String value = appletParameters.get(paramName);
+                                Log.d(TAG, "ClientConfig.getParameter(" + paramName + ") -> "
+                                    + (value != null ? value.substring(0, Math.min(value.length(), 40)) : "null"));
+                                return value;
+                            }
+                            case "onError":
+                                Log.e(TAG, "ClientConfig.onError: " + args[0]);
+                                return null;
+                            case "toString":
+                                return "MobileClientConfiguration";
+                            case "hashCode":
+                                return System.identityHashCode(proxy);
+                            case "equals":
+                                return proxy == args[0];
+                            default:
+                                Log.w(TAG, "ClientConfig: unhandled method: " + methodName);
+                                return null;
                         }
-                        case "onError":
-                            Log.e(TAG, "ClientConfig.onError: " + args[0]);
-                            return null;
-                        case "toString":
-                            return "MobileClientConfiguration";
-                        case "hashCode":
-                            return System.identityHashCode(proxy);
-                        case "equals":
-                            return proxy == args[0];
-                        default:
-                            Log.w(TAG, "ClientConfig: unhandled method: " + methodName);
-                            return null;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "ClientConfig." + methodName + " failed", t);
+                        return defaultValue(method.getReturnType());
                     }
                 }
             );
@@ -1345,75 +1353,80 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 (Object proxy, Method method, Object[] args) -> {
                     String methodName = method.getName();
                     Class<?> returnType = method.getReturnType();
-                    switch (methodName) {
-                        case "error":
-                            Log.e(TAG, "Callbacks.error: " + args[0], (Throwable) args[1]);
-                            return null;
-                        case "draw": {
-                            // Frame blit: copy the rendered game buffer into the graphics
-                            if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
-                                try {
-                                    bufferProvider = args[0];
-                                    bufferProviderStatic = args[0];
-                                    repointSceneRasterizerOnce();
-                                    Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
-                                    if (image instanceof java.awt.Image) {
-                                        java.awt.Image img = (java.awt.Image) image;
-                                        long now = System.currentTimeMillis();
-                                        drawCount++;
-                                        if (now - lastDrawLog > 2000) {
-                                            long elapsed = now - lastDrawLog;
-                                            long n = drawCount;
-                                            lastDrawLog = now;
-                                            drawCount = 0;
-                                            int[] imgPx = img.getPixels();
-                                            StringBuilder pb = new StringBuilder(" px="
-                                                + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
-                                            if (imgPx != null && imgPx.length >= 765 * 503) {
-                                                int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
-                                                for (int si = 0; si < s.length; si++) {
-                                                    if (s[si] < imgPx.length) {
-                                                        pb.append(String.format(",%08X", imgPx[s[si]]));
+                    try {
+                        switch (methodName) {
+                            case "error":
+                                Log.e(TAG, "Callbacks.error: " + args[0], (Throwable) args[1]);
+                                return null;
+                            case "draw": {
+                                // Frame blit: copy the rendered game buffer into the graphics
+                                if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
+                                    try {
+                                        bufferProvider = args[0];
+                                        bufferProviderStatic = args[0];
+                                        repointSceneRasterizerOnce();
+                                        Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
+                                        if (image instanceof java.awt.Image) {
+                                            java.awt.Image img = (java.awt.Image) image;
+                                            long now = System.currentTimeMillis();
+                                            drawCount++;
+                                            if (now - lastDrawLog > 2000) {
+                                                long elapsed = now - lastDrawLog;
+                                                long n = drawCount;
+                                                lastDrawLog = now;
+                                                drawCount = 0;
+                                                int[] imgPx = img.getPixels();
+                                                StringBuilder pb = new StringBuilder(" px="
+                                                    + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
+                                                if (imgPx != null && imgPx.length >= 765 * 503) {
+                                                    int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
+                                                    for (int si = 0; si < s.length; si++) {
+                                                        if (s[si] < imgPx.length) {
+                                                            pb.append(String.format(",%08X", imgPx[s[si]]));
+                                                        }
                                                     }
                                                 }
+                                                Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
+                                                    + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
                                             }
-                                            Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
-                                                + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
+                                            synchronized (renderLock) {
+                                                ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                            }
                                         }
-                                        synchronized (renderLock) {
-                                            ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
-                                        }
+                                    } catch (Throwable e) {
+                                        Log.w(TAG, "callbacks.draw failed", e);
                                     }
-                                } catch (Exception e) {
-                                    Log.w(TAG, "callbacks.draw failed", e);
                                 }
+                                return returnType.equals(boolean.class) ? Boolean.FALSE : null;
                             }
-                            return returnType.equals(boolean.class) ? Boolean.FALSE : null;
+                            case "mousePressed":
+                            case "mouseReleased":
+                            case "mouseClicked":
+                            case "mouseMoved":
+                            case "mouseDragged":
+                            case "mouseEntered":
+                            case "mouseExited":
+                            case "mouseWheelMoved":
+                                return args[0];
+                            case "isRuneLiteClientOutdated":
+                                return Boolean.FALSE;
+                            case "openUrl":
+                                if (args[0] instanceof String && java.awt.Desktop.openUrlHandler != null) {
+                                    java.awt.Desktop.openUrlHandler.accept((String) args[0]);
+                                }
+                                return null;
+                            default:
+                                if (returnType.equals(boolean.class)) {
+                                    return false;
+                                }
+                                if (returnType.isPrimitive()) {
+                                    return 0;
+                                }
+                                return null;
                         }
-                        case "mousePressed":
-                        case "mouseReleased":
-                        case "mouseClicked":
-                        case "mouseMoved":
-                        case "mouseDragged":
-                        case "mouseEntered":
-                        case "mouseExited":
-                        case "mouseWheelMoved":
-                            return args[0];
-                        case "isRuneLiteClientOutdated":
-                            return Boolean.FALSE;
-                        case "openUrl":
-                            if (args[0] instanceof String && java.awt.Desktop.openUrlHandler != null) {
-                                java.awt.Desktop.openUrlHandler.accept((String) args[0]);
-                            }
-                            return null;
-                        default:
-                            if (returnType.equals(boolean.class)) {
-                                return false;
-                            }
-                            if (returnType.isPrimitive()) {
-                                return 0;
-                            }
-                            return null;
+                    } catch (Throwable t) {
+                        Log.w(TAG, "callbacks." + methodName + " failed", t);
+                        return defaultValue(returnType);
                     }
                 }
             );
@@ -1599,6 +1612,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return null;
     }
 
+    /** Default value for a proxy-invocation return type (proxy methods must never throw). */
+    private static Object defaultValue(Class<?> t) {
+        if (t == boolean.class) return false;
+        if (t == int.class) return 0;
+        if (t == long.class) return 0L;
+        if (t.isPrimitive()) return 0;
+        return null;
+    }
+
     /** True when the APK-bundled client version is newer than the files-dir one. */
     private boolean versionIsOlderThanAsset() {
         String installed = ClientUpdater.installedClientVersion(this);
@@ -1652,39 +1674,99 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 return true;
             }
             int action = event.getActionMasked();
-            int x = (int) (event.getX() * GAME_W / v.getWidth());
-            int y = (int) (event.getY() * GAME_H / v.getHeight());
             long when = System.currentTimeMillis();
             switch (action) {
-                case MotionEvent.ACTION_DOWN:
+                case MotionEvent.ACTION_DOWN: {
                     pointerDown = true;
+                    int x = toGameX(v, event.getX());
+                    int y = toGameY(v, event.getY());
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_PRESSED, x, y, when);
+                    lastMouseX = x;
+                    lastMouseY = y;
+                    lastMouseWhen = when;
                     break;
-                case MotionEvent.ACTION_MOVE:
-                    if (pointerDown) {
-                        dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_DRAGGED, x, y, when);
-                    } else {
-                        dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_MOVED, x, y, when);
+                }
+                case MotionEvent.ACTION_MOVE: {
+                    int motionId = pointerDown
+                        ? java.awt.event.MouseEvent.MOUSE_DRAGGED
+                        : java.awt.event.MouseEvent.MOUSE_MOVED;
+                    for (int i = 0; i < event.getHistorySize(); i++) {
+                        emitSegment(motionId,
+                            toGameX(v, event.getHistoricalX(i)),
+                            toGameY(v, event.getHistoricalY(i)),
+                            wallFor(event, event.getHistoricalEventTime(i)));
                     }
+                    emitSegment(motionId, toGameX(v, event.getX()), toGameY(v, event.getY()), when);
                     break;
-                case MotionEvent.ACTION_UP:
+                }
+                case MotionEvent.ACTION_UP: {
+                    int x = toGameX(v, event.getX());
+                    int y = toGameY(v, event.getY());
+                    emitSegment(pointerDown
+                            ? java.awt.event.MouseEvent.MOUSE_DRAGGED
+                            : java.awt.event.MouseEvent.MOUSE_MOVED,
+                        x, y, when);
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_RELEASED, x, y, when);
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_CLICKED, x, y, when);
                     pointerDown = false;
+                    lastMouseX = -1;
                     break;
+                }
                 case MotionEvent.ACTION_CANCEL:
                     pointerDown = false;
+                    lastMouseX = -1;
                     break;
                 case MotionEvent.ACTION_SCROLL: {
                     int rotation = -(int) Math.round(event.getAxisValue(MotionEvent.AXIS_VSCROLL));
                     if (rotation != 0) {
-                        dispatchMouseWheel(x, y, rotation, when);
+                        dispatchMouseWheel(toGameX(v, event.getX()), toGameY(v, event.getY()), rotation, when);
                     }
                     break;
                 }
             }
             return true;
         });
+    }
+
+    private int toGameX(android.view.View v, float raw) {
+        return (int) (raw * GAME_W / v.getWidth());
+    }
+
+    private int toGameY(android.view.View v, float raw) {
+        return (int) (raw * GAME_H / v.getHeight());
+    }
+
+    /**
+     * Wall-clock time for a sample taken at {@code eventTime}. MotionEvent
+     * times are uptimeMillis, so only the offset from the current event is
+     * applied to the wall clock.
+     */
+    private long wallFor(MotionEvent event, long eventTime) {
+        return System.currentTimeMillis() - (event.getEventTime() - eventTime);
+    }
+
+    /**
+     * Expands the segment from the last emitted point to (x,y) via
+     * {@link org.runelite.mobile.MousePath} and dispatches every point, so the
+     * game sees a continuous motion stream rather than single jumps.
+     */
+    private void emitSegment(int id, int x, int y, long when) {
+        try {
+            if (lastMouseX < 0) {
+                emitPoint(id, x, y, when);
+            } else {
+                long[] pts = org.runelite.mobile.MousePath.expand(
+                    lastMouseX, lastMouseY, lastMouseWhen, x, y, when);
+                for (int i = 0; i < pts.length; i += 3) {
+                    emitPoint(id, (int) pts[i], (int) pts[i + 1], pts[i + 2]);
+                }
+            }
+            lastMouseX = x;
+            lastMouseY = y;
+            lastMouseWhen = when;
+        } catch (Throwable t) {
+            Log.w(TAG, "emitSegment failed", t);
+        }
     }
 
     /**
@@ -1712,9 +1794,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void dispatchMouseEvent(int id, int x, int y, long when) {
-        java.awt.Component target = resolveInputTarget();
-        if (target == null) return;
-        if (id != java.awt.event.MouseEvent.MOUSE_MOVED) {
+        try {
+            java.awt.Component target = resolveInputTarget();
+            if (target == null) return;
+            if (id != java.awt.event.MouseEvent.MOUSE_MOVED) {
             Log.d(TAG, "Dispatch mouse id=" + id + " at (" + x + "," + y + ") to " + target.getClass().getSimpleName());
         }
         if (id == java.awt.event.MouseEvent.MOUSE_PRESSED) {
@@ -1825,30 +1908,48 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 surfaceView.postDelayed(loginReqTicker, 1000);
             }
         }
-        java.awt.event.MouseEvent ev = new java.awt.event.MouseEvent(
-            target, id, when, 0, x, y, 1, false, 1);
-        if (id == java.awt.event.MouseEvent.MOUSE_MOVED || id == java.awt.event.MouseEvent.MOUSE_DRAGGED) {
-            for (java.awt.event.MouseMotionListener listener : target.getMouseMotionListeners()) {
-                if (id == java.awt.event.MouseEvent.MOUSE_MOVED) {
-                    listener.mouseMoved(ev);
-                } else {
-                    listener.mouseDragged(ev);
+            emitPoint(id, x, y, when);
+        } catch (Throwable t) {
+            Log.w(TAG, "dispatchMouseEvent failed", t);
+        }
+    }
+
+    /**
+     * Constructs and dispatches a single synthesized mouse event to the
+     * resolved client component. Guarded so a client listener throw cannot
+     * unwind the calling thread.
+     */
+    private void emitPoint(int id, int x, int y, long when) {
+        try {
+            java.awt.Component target = resolveInputTarget();
+            if (target == null) return;
+            java.awt.event.MouseEvent ev = new java.awt.event.MouseEvent(
+                target, id, when, 0, x, y, 1, false, 1);
+            if (id == java.awt.event.MouseEvent.MOUSE_MOVED || id == java.awt.event.MouseEvent.MOUSE_DRAGGED) {
+                for (java.awt.event.MouseMotionListener listener : target.getMouseMotionListeners()) {
+                    if (id == java.awt.event.MouseEvent.MOUSE_MOVED) {
+                        listener.mouseMoved(ev);
+                    } else {
+                        listener.mouseDragged(ev);
+                    }
+                }
+            } else {
+                for (java.awt.event.MouseListener listener : target.getMouseListeners()) {
+                    switch (id) {
+                        case java.awt.event.MouseEvent.MOUSE_PRESSED:
+                            listener.mousePressed(ev);
+                            break;
+                        case java.awt.event.MouseEvent.MOUSE_RELEASED:
+                            listener.mouseReleased(ev);
+                            break;
+                        case java.awt.event.MouseEvent.MOUSE_CLICKED:
+                            listener.mouseClicked(ev);
+                            break;
+                    }
                 }
             }
-        } else {
-            for (java.awt.event.MouseListener listener : target.getMouseListeners()) {
-                switch (id) {
-                    case java.awt.event.MouseEvent.MOUSE_PRESSED:
-                        listener.mousePressed(ev);
-                        break;
-                    case java.awt.event.MouseEvent.MOUSE_RELEASED:
-                        listener.mouseReleased(ev);
-                        break;
-                    case java.awt.event.MouseEvent.MOUSE_CLICKED:
-                        listener.mouseClicked(ev);
-                        break;
-                }
-            }
+        } catch (Throwable t) {
+            Log.w(TAG, "emitPoint failed", t);
         }
     }
 
