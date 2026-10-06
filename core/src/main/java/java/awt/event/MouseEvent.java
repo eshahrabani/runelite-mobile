@@ -13,6 +13,11 @@ public class MouseEvent extends InputEvent {
     public static final int MOUSE_DRAGGED = 506;
     public static final int MOUSE_WHEEL = 507;
 
+    public static final int BUTTON1 = 1;
+    /** Middle button — the client's camera-drag button (button code 4). */
+    public static final int BUTTON2 = 2;
+    public static final int BUTTON3 = 3;
+
     private final int id;
     private final int x;
     private final int y;

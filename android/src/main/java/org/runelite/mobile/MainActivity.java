@@ -72,9 +72,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int lastMouseX = -1;
     private int lastMouseY = -1;
     private long lastMouseWhen = 0;
+    /** How long a single-finger press is held off so a second finger can start a camera gesture. */
+    private static final long TAP_PRESS_DELAY_MS = 120L;
+    /** The held-off single-finger press, or null when none is scheduled. */
+    private Runnable pendingPress;
+    private int touchDownX = -1;
+    private int touchDownY = -1;
+    private long touchDownWhen = 0;
+    /** Two-finger camera gesture in progress (a synthesized middle-button drag). */
+    private boolean cameraDrag = false;
+    /** A leftover finger after a camera gesture: drop its events until it lifts. */
+    private boolean suppressUntilUp = false;
+    /** Value of the client's camera-drag setting to restore when the gesture ends; null = untouched. */
+    private Boolean forcedCameraSetting;
     private long lastStateLog = 0;
     private long lastDrawLog = 0;
     private long drawCount = 0;
+    private boolean loggedRenderableDraw = false;
     private Button kbButton;
     private LinearLayout kbBar;
     private EditText kbEdit;
@@ -1356,6 +1370,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                 Log.e(TAG, "Callbacks.error: " + args[0], (Throwable) args[1]);
                                 return null;
                             case "draw": {
+                                // Callbacks declares two `draw` methods:
+                                //   boolean draw(Renderable, boolean)                    -> "may the client draw it?"
+                                //   void    draw(MainBufferProvider, Graphics, int, int) -> the frame blit below
+                                // The client draws every world actor (mesh, ground shadow, spot-anims,
+                                // overhead name/level, hint arrow) inside `if (callbacks.draw(actor, true))`,
+                                // so any non-true return suppresses all world entities. Match on the API
+                                // signature, not on argument classes.
+                                if (method.getParameterCount() == 2 && method.getParameterTypes()[1] == boolean.class) {
+                                    if (!loggedRenderableDraw) {
+                                        loggedRenderableDraw = true;
+                                        Log.i(TAG, "Callbacks.draw(Renderable,boolean) -> true");
+                                    }
+                                    return Boolean.TRUE;
+                                }
                                 // Frame blit: copy the rendered game buffer into the graphics
                                 if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
                                     try {
@@ -1687,7 +1715,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             long when = System.currentTimeMillis();
             switch (action) {
                 case MotionEvent.ACTION_DOWN: {
-                    pointerDown = true;
+                    if (suppressUntilUp) {
+                        break;
+                    }
                     int x = toGameX(v, event.getX());
                     int y = toGameY(v, event.getY());
                     // A mouse always moves before it presses. The client's own
@@ -1698,10 +1728,38 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     lastMouseY = y;
                     lastMouseWhen = when;
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_MOVED, x, y, when);
-                    dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_PRESSED, x, y, when);
+                    // The press itself is held off: a second finger arriving
+                    // within TAP_PRESS_DELAY_MS makes this a camera gesture, and
+                    // then no left-button event is ever sent for this finger.
+                    pointerDown = false;
+                    touchDownX = x;
+                    touchDownY = y;
+                    touchDownWhen = when;
+                    pendingPress = this::beginTapPress;
+                    surfaceView.postDelayed(pendingPress, TAP_PRESS_DELAY_MS);
                     break;
                 }
                 case MotionEvent.ACTION_MOVE: {
+                    if (suppressUntilUp) {
+                        break;
+                    }
+                    if (cameraDrag) {
+                        // The client's camera drag tracks the cursor; feed it the
+                        // two-finger centroid as a middle-button drag.
+                        for (int i = 0; i < event.getHistorySize(); i++) {
+                            emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
+                                centroidX(v, event, i, -1),
+                                centroidY(v, event, i, -1),
+                                wallFor(event, event.getHistoricalEventTime(i)),
+                                java.awt.event.MouseEvent.BUTTON2);
+                        }
+                        emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
+                            centroidX(v, event, -1, -1),
+                            centroidY(v, event, -1, -1),
+                            when,
+                            java.awt.event.MouseEvent.BUTTON2);
+                        break;
+                    }
                     int motionId = pointerDown
                         ? java.awt.event.MouseEvent.MOUSE_DRAGGED
                         : java.awt.event.MouseEvent.MOUSE_MOVED;
@@ -1709,28 +1767,105 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         emitSegment(motionId,
                             toGameX(v, event.getHistoricalX(i)),
                             toGameY(v, event.getHistoricalY(i)),
-                            wallFor(event, event.getHistoricalEventTime(i)));
+                            wallFor(event, event.getHistoricalEventTime(i)),
+                            java.awt.event.MouseEvent.BUTTON1);
                     }
-                    emitSegment(motionId, toGameX(v, event.getX()), toGameY(v, event.getY()), when);
+                    emitSegment(motionId, toGameX(v, event.getX()), toGameY(v, event.getY()), when,
+                        java.awt.event.MouseEvent.BUTTON1);
+                    break;
+                }
+                case MotionEvent.ACTION_POINTER_DOWN: {
+                    if (suppressUntilUp) {
+                        break;
+                    }
+                    // Second finger: cancel the held-off press (nothing has been
+                    // sent, so this gesture can never walk or attack), or release
+                    // a left press that was already in flight.
+                    cancelPendingPress();
+                    if (pointerDown) {
+                        dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_RELEASED, lastMouseX, lastMouseY, when);
+                        pointerDown = false;
+                    }
+                    int cx = centroidX(v, event, -1, -1);
+                    int cy = centroidY(v, event, -1, -1);
+                    lastMouseX = cx;
+                    lastMouseY = cy;
+                    lastMouseWhen = when;
+                    if (!cameraDrag) {
+                        cameraDrag = true;
+                        forceCameraDragSetting();
+                        emitPoint(java.awt.event.MouseEvent.MOUSE_PRESSED, cx, cy, when,
+                            java.awt.event.MouseEvent.BUTTON2);
+                    }
+                    break;
+                }
+                case MotionEvent.ACTION_POINTER_UP: {
+                    if (cameraDrag) {
+                        // Release the middle button at the surviving finger and
+                        // ignore that finger's remaining events until it lifts.
+                        int sx = centroidX(v, event, -1, event.getActionIndex());
+                        int sy = centroidY(v, event, -1, event.getActionIndex());
+                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED, sx, sy, when,
+                            java.awt.event.MouseEvent.BUTTON2);
+                        restoreCameraDragSetting();
+                        cameraDrag = false;
+                        pointerDown = false;
+                        lastMouseX = -1;
+                        suppressUntilUp = true;
+                    }
                     break;
                 }
                 case MotionEvent.ACTION_UP: {
+                    if (cameraDrag) {
+                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
+                            centroidX(v, event, -1, -1), centroidY(v, event, -1, -1), when,
+                            java.awt.event.MouseEvent.BUTTON2);
+                        restoreCameraDragSetting();
+                        cameraDrag = false;
+                        pointerDown = false;
+                        lastMouseX = -1;
+                        suppressUntilUp = false;
+                        break;
+                    }
+                    if (suppressUntilUp) {
+                        suppressUntilUp = false;
+                        cancelPendingPress();
+                        pointerDown = false;
+                        lastMouseX = -1;
+                        break;
+                    }
                     int x = toGameX(v, event.getX());
                     int y = toGameY(v, event.getY());
+                    if (pendingPress != null) {
+                        // Tap shorter than the hold-off: send the press it was
+                        // waiting for, then the usual release/click sequence.
+                        cancelPendingPress();
+                        beginTapPress();
+                    }
                     emitSegment(pointerDown
                             ? java.awt.event.MouseEvent.MOUSE_DRAGGED
                             : java.awt.event.MouseEvent.MOUSE_MOVED,
-                        x, y, when);
+                        x, y, when, java.awt.event.MouseEvent.BUTTON1);
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_RELEASED, x, y, when);
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_CLICKED, x, y, when);
                     pointerDown = false;
                     lastMouseX = -1;
                     break;
                 }
-                case MotionEvent.ACTION_CANCEL:
+                case MotionEvent.ACTION_CANCEL: {
+                    cancelPendingPress();
+                    if (cameraDrag) {
+                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
+                            centroidX(v, event, -1, -1), centroidY(v, event, -1, -1), when,
+                            java.awt.event.MouseEvent.BUTTON2);
+                        restoreCameraDragSetting();
+                    }
+                    cameraDrag = false;
+                    suppressUntilUp = false;
                     pointerDown = false;
                     lastMouseX = -1;
                     break;
+                }
                 case MotionEvent.ACTION_SCROLL: {
                     int rotation = -(int) Math.round(event.getAxisValue(MotionEvent.AXIS_VSCROLL));
                     if (rotation != 0) {
@@ -1741,6 +1876,100 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             return true;
         });
+    }
+
+    /** Drops the held-off single-finger press, if one is still scheduled. */
+    private void cancelPendingPress() {
+        if (pendingPress != null) {
+            surfaceView.removeCallbacks(pendingPress);
+            pendingPress = null;
+        }
+    }
+
+    /**
+     * Sends the held-off single-finger press, unless a camera gesture or a
+     * leftover finger superseded it.
+     */
+    private void beginTapPress() {
+        pendingPress = null;
+        if (cameraDrag || suppressUntilUp) {
+            return;
+        }
+        pointerDown = true;
+        dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_MOVED, touchDownX, touchDownY, touchDownWhen);
+        dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_PRESSED, touchDownX, touchDownY, touchDownWhen);
+    }
+
+    /**
+     * Mean x of the active pointers (at most the first two) in game coordinates,
+     * either for historical sample {@code sample} or, with {@code sample < 0},
+     * the current position. {@code excludeIndex} skips one pointer (the one
+     * lifting, on ACTION_POINTER_UP).
+     */
+    private int centroidX(android.view.View v, MotionEvent event, int sample, int excludeIndex) {
+        float sum = 0f;
+        int n = 0;
+        for (int i = 0; i < event.getPointerCount() && i < 2; i++) {
+            if (i == excludeIndex) {
+                continue;
+            }
+            sum += sample < 0 ? event.getX(i) : event.getHistoricalX(i, sample);
+            n++;
+        }
+        return n == 0 ? 0 : toGameX(v, sum / n);
+    }
+
+    private int centroidY(android.view.View v, MotionEvent event, int sample, int excludeIndex) {
+        float sum = 0f;
+        int n = 0;
+        for (int i = 0; i < event.getPointerCount() && i < 2; i++) {
+            if (i == excludeIndex) {
+                continue;
+            }
+            sum += sample < 0 ? event.getY(i) : event.getHistoricalY(i, sample);
+            n++;
+        }
+        return n == 0 ? 0 : toGameY(v, sum / n);
+    }
+
+    /**
+     * Forces the client's "camera drag" setting true for the duration of a
+     * two-finger gesture: with it false the client treats a middle press as a
+     * left click instead of rotating the camera. {@code bn.hc} is a
+     * version-specific internal name (re-derive it on a client bump).
+     */
+    private void forceCameraDragSetting() {
+        if (forcedCameraSetting != null) {
+            return;
+        }
+        try {
+            java.lang.reflect.Field f = clientClass.getClassLoader().loadClass("bn").getDeclaredField("hc");
+            f.setAccessible(true);
+            boolean current = f.getBoolean(null);
+            if (!current) {
+                f.setBoolean(null, true);
+                forcedCameraSetting = Boolean.FALSE;
+            }
+            Log.i(TAG, "camera drag setting bn.hc=" + current + (current ? "" : " (forced true for this gesture)"));
+        } catch (Throwable t) {
+            Log.w(TAG, "camera drag setting unavailable", t);
+        }
+    }
+
+    /** Restores the camera-drag setting a gesture forced, if any. */
+    private void restoreCameraDragSetting() {
+        if (forcedCameraSetting == null) {
+            return;
+        }
+        try {
+            java.lang.reflect.Field f = clientClass.getClassLoader().loadClass("bn").getDeclaredField("hc");
+            f.setAccessible(true);
+            f.setBoolean(null, forcedCameraSetting);
+            Log.i(TAG, "camera drag setting bn.hc restored to " + forcedCameraSetting);
+        } catch (Throwable t) {
+            Log.w(TAG, "camera drag setting restore failed", t);
+        }
+        forcedCameraSetting = null;
     }
 
     private int toGameX(android.view.View v, float raw) {
@@ -1765,15 +1994,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * {@link org.runelite.mobile.MousePath} and dispatches every point, so the
      * game sees a continuous motion stream rather than single jumps.
      */
-    private void emitSegment(int id, int x, int y, long when) {
+    private void emitSegment(int id, int x, int y, long when, int button) {
         try {
             if (lastMouseX < 0) {
-                emitPoint(id, x, y, when);
+                emitPoint(id, x, y, when, button);
             } else {
                 long[] pts = org.runelite.mobile.MousePath.expand(
                     lastMouseX, lastMouseY, lastMouseWhen, x, y, when);
                 for (int i = 0; i < pts.length; i += 3) {
-                    emitPoint(id, (int) pts[i], (int) pts[i + 1], pts[i + 2]);
+                    emitPoint(id, (int) pts[i], (int) pts[i + 1], pts[i + 2], button);
                 }
             }
             lastMouseX = x;
@@ -1923,7 +2152,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 surfaceView.postDelayed(loginReqTicker, 1000);
             }
         }
-            emitPoint(id, x, y, when);
+            emitPoint(id, x, y, when, java.awt.event.MouseEvent.BUTTON1);
         } catch (Throwable t) {
             Log.w(TAG, "dispatchMouseEvent failed", t);
         }
@@ -1934,12 +2163,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * resolved client component. Guarded so a client listener throw cannot
      * unwind the calling thread.
      */
-    private void emitPoint(int id, int x, int y, long when) {
+    private void emitPoint(int id, int x, int y, long when, int button) {
         try {
             java.awt.Component target = resolveInputTarget();
             if (target == null) return;
             java.awt.event.MouseEvent ev = new java.awt.event.MouseEvent(
-                target, id, when, 0, x, y, 1, false, 1);
+                target, id, when, 0, x, y, 1, false, button);
             if (id == java.awt.event.MouseEvent.MOUSE_MOVED || id == java.awt.event.MouseEvent.MOUSE_DRAGGED) {
                 for (java.awt.event.MouseMotionListener listener : target.getMouseMotionListeners()) {
                     if (id == java.awt.event.MouseEvent.MOUSE_MOVED) {
