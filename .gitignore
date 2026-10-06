@@ -27,3 +27,4 @@ screencap.png
 .DS_Store
 Thumbs.db
 *.log
+/java_pid405208.hprof
