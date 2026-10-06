@@ -137,7 +137,12 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   moves before it presses, and the client's own menus (the world list) select
   the **hovered** row (`ar.bf` selects `dr`, set from `tk.af`/`tk.ac`, not from
   the press position), so without that move a tap acts on wherever the previous
-  gesture left the cursor. Keyboard is NOT wired (no on-screen keyboard;
+  gesture left the cursor. A **two-finger drag** instead emits a middle-button
+  (`BUTTON2`) press/drag/release at the two-finger centroid, which drives the
+  client's own camera-drag path (`tk.aj() == 4` with its `bn.hc` setting, forced
+  true for the gesture) to rotate yaw+pitch; the single-finger press is held off
+  `TAP_PRESS_DELAY_MS` so a two-finger gesture can never fire a stray
+  walk/attack. Keyboard is NOT wired (no on-screen keyboard;
   in-game chat is future work).
 - **`ios/`** — RoboVM `IOSLauncher` skeleton only (empty UIWindow, no rendering).
 
