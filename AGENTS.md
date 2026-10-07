@@ -180,6 +180,169 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   in-game chat is future work).
 - **`ios/`** — RoboVM `IOSLauncher` skeleton only (empty UIWindow, no rendering).
 
+## RuneLite plugin runtime (the third jar)
+
+The port ships **three** RuneLite jars, all pinned by one
+`https://static.runelite.net/bootstrap.json` fetch (task `syncRuneLiteJars`, verified
+against the manifest SHA-256, so client/injected-client/api can never drift):
+`client-<ver>.jar` (the plugin API + ~130 core plugins), `injected-client-<ver>.jar`
+(the game) and `runelite-api-<ver>.jar` (the *full* api, checked to be a byte-identical
+superset of the manifest's `-runtime` flavor, because core plugins are compiled against
+the gameval ID tables it adds). All three are ASM-transformed and d8-dexed into `assets/runelite-dex.jar`, together with
+RuneLite's own runtime libraries (guice, gson, okhttp, okio, guava, commons-lang3/text,
+protobuf-javalite, json, jsr305, javax.inject, aopalliance, http-api) and the host shims
+(see below). The **app** dex keeps only the JRE stubs (`core/`), the Android host
+(`org.runelite.mobile.**`), `slf4j-api`/`slf4j-simple` (the slf4j binding; logback is not
+shipped) and the androidx dependencies. The split is load-bearing: **Guice lives in the
+asset dex because it has to resolve the types named in the shims' and plugins'
+signatures** (`net.runelite.api.Client` in `ColorPickerManager.create(...)`, for example).
+With the shims in the app dex, Guice inspected those descriptors through the app
+classloader and 7 plugins (grounditems, groundmarkers, inventorytags, npchighlight,
+objectindicators, cluescrolls, party — every plugin that injects a shim) failed with
+`NoClassDefFoundError: net.runelite.api.Client`.
+
+- **Two class loaders, parent-first.** `MainActivity.bootGameClient` loads the asset jar
+  through a child `DexClassLoader` whose parent is the app classloader. Anything the app
+  dex defines therefore *wins*, and anything only the asset dex defines is invisible to
+  app-dex code. Consequences that shape the code:
+  - `net.runelite.client.ui.*` classes the host replaces are **stripped out of the asset
+    dex** (`HOST_REPLACED_CLASSES`/`HOST_REPLACED_PREFIXES` in `android/build.gradle`,
+    nested classes included — d8 refuses a nest member without its nest host) and the
+    shims take their place *inside that same dex*: their sources live in
+    `hostshims/src/net/runelite/client/ui/**` (deliberately NOT in the app source set)
+    and `compileHostShims()` compiles+packages them as a d8 program input. A stripped
+    class list must stay in sync with those shims (a missing entry is a d8 "defined
+    multiple times" error, which is the intended tripwire).
+  - `org.runelite.mobile.host.RuneLiteHost` reaches everything RuneLite-specific —
+    including the Guice injector, `OkHttpClient` and `RuneLiteAPI.CLIENT` — by **name
+    through the child loader**; the app dex has no compile-time RuneLite/Guice/OkHttp
+    dependency at all (only `java.awt.*` stubs, `android.*` and slf4j). Do not add a
+    compile-time `net.runelite.*`/`com.google.inject.*`/`okhttp3.*` reference to app-dex
+    code, and do not add a compile-time `org.runelite.mobile.*` reference to a shim: the
+    only cross-dex links are lambdas/fields the host installs reflectively (see
+    `ClientToolbar.navigationListener`).
+  - Shim **constructors** may only take parameters resolvable from the asset dex
+    (`Injector`, `java.awt.*`/`javax.swing.*` stubs from the app dex via parent-first
+    delegation, `String`, …): Guice reflects on them. Method *signatures* must match the
+    upstream client jar exactly (that is the binary contract).
+- **Plugin discovery is a build artifact.** `PluginManager`'s own discovery is Guava
+  `ClassPath.from(...)`, which cannot work on ART, so `downloadAndDexJar` scans the
+  client jar with ASM and writes `runelite-plugin-index.txt` into the asset dex (every
+  class under `net/runelite/client/plugins/**` with `@PluginDescriptor` extending
+  `Plugin`, minus `android/plugin-exclusions.txt`). `RuneLiteHost` feeds that list to
+  `PluginManager.loadPlugins` — bulk first (that builds RuneLite's `@PluginDependency`
+  ordering), falling back to one class at a time so a single bad plugin is logged and
+  skipped instead of aborting startup. An excluded plugin can take others with it:
+  `PluginManager.instantiate` refuses a plugin whose `@PluginDependency` is missing
+  ("Unmet dependency for ClueScrollPlugin: BankTagsPlugin"), which is why `BankTagsPlugin`
+  is deliberately *not* excluded even though its Swing bank-tag editor cannot run here.
+  `InfoPlugin` and `KourendLibraryPlugin` are excluded because their `startUp()` builds a
+  Swing panel that cannot exist (`JEditorPane.getEditorKit().getStyleSheet()` and
+  `GroupLayout.createParallelGroup().addComponent(...)` NPE). Verified on the device: the
+  index is 114 classes, 114 instantiate with **0 failures**, 65 are active at boot (the
+  `@PluginDescriptor(enabledByDefault)` set — the side panel toggles the rest), and the
+  plugins register **141** unmodified RuneLite overlays. Note `PluginManager.startPlugins`
+  stops at the first plugin whose `startUp()` throws, so one aborted plugin leaves the rest
+  unstarted until the side panel (or nothing else) starts them.
+- **The Callbacks proxy delegates to `Hooks`.** `MainActivity`'s `Proxy` keeps the
+  `renderLock`/`frameSeq` handshake and the `bindSceneRasterizerToDisplay` call, and
+  forwards every callback to the injector's `net.runelite.api.hooks.Callbacks` instance
+  when the host is running (`RuneLiteHost.hooks()`). `Hooks.draw` renders the plugin
+  overlays into the client's own frame image and then blits that image into the passed
+  `Graphics` (== `appletPixels`), which is why the frame the render thread presents
+  contains the overlays. The proxy's `openUrl` deliberately does **not** delegate
+  (`LinkBrowser` would reach `Runtime.exec`), and a host that failed to start leaves the
+  legacy pass-through behaviour in place.
+- **Plugin lifecycle runs on the UI thread.** `AWTBridge.registerUiThread(mainThread,
+  handler::post)` (called from `MainActivity.onCreate`) is the event dispatch thread:
+  `javax.swing.SwingUtilities.invokeLater/invokeAndWait/isEventDispatchThread` route
+  there, which is what `PluginManager`'s EDT contract and `invokeAndWait` need. The
+  host's own thread does only the blocking work (`RuntimeConfigLoader.get()`) before
+  posting the lifecycle.
+- **`java.awt`/`javax.swing` stubs.** The Android runtime has no `java.desktop`, so
+  `core/` defines the surface the pre-compiled jars reference: hand-written pixel/text
+  code (`Graphics`, `Graphics2D`, `Image`, `BufferedImage`, `Font`, `FontMetrics`) plus
+  ~230 **generated** data-only stubs (`javax.swing.**`, `java.beans.**`,
+  `javax.sound.sampled.**`, `com.sun.net.httpserver.**`, …). Regenerate them after a
+  client bump with `python3 tools/gen_stubs.py --rl-jars android/build/rl-jars
+  --asm-cp <asm:asm-tree jars>`; the member set comes from the real call sites
+  (`tools/RefScan.java`), hierarchy/constants/enums from the local JDK
+  (`tools/JdkInfo.java`), and files without the generator's marker header are never
+  touched. The scan also records **how** each member is used (INVOKESTATIC vs
+  INVOKEVIRTUAL/INVOKEINTERFACE, GETSTATIC vs GETFIELD) and the generator emits `static`
+  accordingly: a stub method that is an instance method where the client uses
+  `invokestatic` is an `IncompatibleClassChangeError` on device
+  (`StyleContext.getDefaultStyleContext()` was exactly that). `tools/HostLinkCheck.java`
+  verifies both the existence and the static/interface shape, and it checks `core/`'s own
+  classes too -- `java.awt.AWTEvent` was hand-written precisely because a generated stub
+  lacked `(Object,int)` and the *game's* UI event dispatch
+  (`ActionEvent.<init> -> super(source, id)`) then killed the client thread with a
+  `NoSuchMethodError` (frozen frame, no error until that code path ran). Two invariants in that surface are load-bearing:
+  1. `Graphics.drawImage` must keep its **opaque** fast paths for `Image` sources: the
+     game frame is a `BufferedImage` built from a 3-mask `DirectColorModel`
+     (`hasAlpha == false`) whose pixels carry alpha 0, so a blending blit would leave the
+     previous frame on screen. Only `hasAlpha` sources blend.
+  2. `Image.getGraphics()`/`BufferedImage.getGraphics()` must return a **`Graphics2D`**:
+     `Hooks.draw` casts the result, and a plain `Graphics` is a `ClassCastException` on
+     the first overlay pass.
+  Text is the one thing core cannot do itself: `org.runelite.mobile.bridge.TextBridge`
+  hands the TTF bytes to `org.runelite.mobile.AndroidTextRenderer` (app dex), which
+  materialises them into `Typeface.Builder` (file-based — there is no `ByteBuffer`
+  constructor) and rasterises into a reused scratch `Bitmap`.
+- **Verification gates.** `./gradlew :android:verifyHostLinks` resolves every JDK-surface
+  reference the client jar and the app classes make against what the app dex + asset dex
+  provide, and fails on any gap (a missing class or a wrong descriptor is otherwise a
+  device-only `NoClassDefFoundError`/`NoSuchMethodError`). `GraphicsSelfTest` runs once
+  per host start and logs `GFX SELFTEST PASS`/`FAIL <case>` (shapes, alpha blending, the
+  opaque frame blit, text).
+- **Native side panel** (`org.runelite.mobile.SidePanel`, opened from the `☰` button):
+  Plugins / Config / Host tabs. Plugin enablement goes through
+  `PluginManager.setPluginEnabled` + `startPlugin`/`stopPlugin` on the UI thread; config
+  forms are generated from `ConfigManager.getConfigDescriptor` (widgets chosen by the
+  item's return type, writes through the config proxy setter so `ConfigChanged` fires).
+  RuneLite's Swing panels are never rendered: `ClientToolbar.addNavigation` records
+  buttons in `PluginPanelRegistry`, and a plugin with a panel gets a "panel not available
+  on mobile" note that opens its config instead.
+- **Third-party plugins are dexed on the device.** A hub jar is Java 11 `.class`
+  bytecode, which ART cannot load, so `org.runelite.mobile.host.MobilePluginHub` scans
+  `files/plugins/` (and the app-specific external dir, which is the adb-push drop box:
+  `adb push <jar> /sdcard/Android/data/org.runelite.mobile/files/plugins/`), imports raw
+  jars into the private dir, and — when the jar still contains `.class` entries — dexes it
+  with `org.runelite.mobile.host.OnDeviceDexer`, which loads the bundled R8/D8 compiler
+  from `assets/rl-dexer.jar` (3.7 MB; `downloadAndDexJar` dexes `<build-tools>/lib/d8.jar`
+  through the same ASM transform in tolerant mode) and calls
+  `D8.run(D8Command.builder()…build())` reflectively. Each jar then gets its own
+  `DexClassLoader` (parent = the client loader) and `runelite_plugin.json` names the plugin
+  classes. Jars can also be pre-dexed on the host with
+  `./gradlew :android:dexHubPlugin -PhubPlugin=<internalName>` (manifest
+  `https://repo.runelite.net/plugins/manifest/<ver>_lite.js`, SHA-256 verified against the
+  manifest's `jarHash`) — those load without any on-device work. `files/plugins` must be
+  readable *and* read-only before ART will open a dex: an imported jar is chmod'ed read-only,
+  and a jar left on shared storage fails with `Writable dex file … is not allowed`.
+- **Where RuneLite keeps its config on this port.** `files/.runelite/profiles2/`
+  (`profiles.json` + `<name>-<id>.properties`), *not* `settings.properties` — 1.13 moved
+  the default profile into the profile store, and `ProfileManager` creates the directory
+  itself. Verified: after a boot that file is ~41 KB, i.e. every plugin's config *item*
+  defaults are written (the write path works). **RuneLite only flushes that file from
+  `ConfigManager.sendConfig()`**, which it runs from a `scheduleWithFixedDelay` task
+  (minutes) and on a profile switch — a desktop process exits gracefully, an Android one
+  is force-stopped without warning, so a panel toggle used to be lost on the next launch.
+  `RuneLiteHost.flushConfig()` therefore calls `sendConfig()` after every panel-driven
+  plugin toggle and config write, and `MainActivity.onStop()` flushes on the way out.
+  Verified: enable FPS Control in the panel (`host=65p` → `66p`), `am force-stop`,
+  relaunch → `66 plugin(s) active`. The side panel's own UI state (open/closed, tab)
+  lives in `SharedPreferences` and persists too. The panel is a `rootLayout` child added
+  *before* the login overlay, so the launcher overlay covers the drawer while it is up
+  (the `☰` handle still toggles it).
+- **Diagnostics.** The throttled `callbacks.draw` line prints `host=` (active plugins),
+  `ovl=` per overlay layer with a couple of names, `iface=<id>/<overlays>` (the last
+  interface the client drew and how many overlays are registered for it), `yellow=`/`red=`
+  (pixels of RuneLite's FPS-overlay text colour in the frame's top-right strip), plus the
+  frame/palette/blit timing. Useful when an overlay "does not appear": `ABOVE_WIDGETS`
+  overlays (the FPS overlay, infoboxes) are registered under *interface ids* and drawn from
+  `OverlayRenderer.renderAfterInterface`, so on the login screen — where the client draws no
+  interface (`iface=-1`) — they legitimately never draw.
+
 ## Don't be misled by root-level jars
 
 `gamepack_*.jar`, `injected_client.jar`, `runelite-api.jar` and `temp_disasm/`

@@ -12,6 +12,8 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.Process;
 import android.util.Log;
 import android.view.Gravity;
@@ -30,6 +32,8 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.runelite.mobile.bridge.AWTBridge;
+import org.runelite.mobile.bridge.TextBridge;
+import org.runelite.mobile.host.RuneLiteHost;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -132,6 +136,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private ProgressBar updateProgress;
     private TextView tvUpdateText;
     private Button btnSettings;
+    private Button btnPanel;
+    private SidePanel sidePanel;
 
     // ── Login (browser-based OAuth) ────────────────────────────────────────
     private LocalCallbackServer callbackServer;
@@ -180,6 +186,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         AWTBridge.activePixels = appletPixels;
         AWTBridge.activeWidth = GAME_W;
         AWTBridge.activeHeight = GAME_H;
+
+        // slf4j-simple is the logging binding (logback is not shipped); INFO reaches
+        // logcat as System.err, which is where RuneLite's own log.info/warn end up.
+        System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "info");
+
+        // The UI thread for the RuneLite runtime: PluginManager asserts the event
+        // dispatch thread and SwingUtilities.invokeAndWait must not deadlock, so both
+        // route here (the Android main thread) instead of a real EDT.
+        Handler mainHandler = new Handler(Looper.getMainLooper());
+        AWTBridge.registerUiThread(Looper.getMainLooper().getThread(), mainHandler::post);
+
+        // Text: overlay text is rasterised by the platform (Typeface/Paint) behind the
+        // core-side TextBridge, because core cannot reference android.* and cannot ship a
+        // TTF rasteriser. The fonts land in the cache dir because Typeface.Builder only
+        // reads files.
+        AndroidTextRenderer.setFontDir(new File(getCacheDir(), "fonts"));
+        TextBridge.renderer = new AndroidTextRenderer();
+
+        // Sideloaded Plugin Hub plugins live in files/plugins (see MobilePluginHub).
+        RuneLiteHost.setAppContext(getApplicationContext());
 
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().addCallback(this);
@@ -438,6 +464,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             launcherScroll.setVisibility(launcherScroll.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         btnSettings.setVisibility(View.GONE);
         rootLayout.addView(btnSettings);
+
+        // ── Native side panel: plugins, config and host status ──
+        // Built before the login overlay so the overlay stays on top. The drawer
+        // consumes touches only inside its own bounds (the game surface underneath
+        // keeps its size, so game input elsewhere is unaffected).
+        sidePanel = new SidePanel(this, rootLayout, GAME_W);
+        View panelToggle = sidePanel.createToggleButton();
+        btnPanel = panelToggle instanceof Button ? (Button) panelToggle : new Button(this);
+        FrameLayout.LayoutParams panelBtnParams = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        panelBtnParams.gravity = Gravity.TOP | Gravity.RIGHT;
+        panelBtnParams.topMargin = (int) (40 * density);
+        panelBtnParams.rightMargin = (int) (150 * density);
+        btnPanel.setLayoutParams(panelBtnParams);
+        btnPanel.setVisibility(View.GONE);
+        btnPanel.setOnClickListener(v -> sidePanel.toggle());
+        rootLayout.addView(btnPanel);
 
         // ── Soft keyboard bridge: the game has no IME of its own, so a
         //    floating "KB" button opens an EditText whose keystrokes are
@@ -1187,6 +1230,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         launcherScroll.setVisibility(View.GONE);
         btnSettings.setVisibility(View.VISIBLE);
         kbButton.setVisibility(View.VISIBLE);
+        btnPanel.setVisibility(View.VISIBLE);
         tvStatus.setText("Starting game...");
         new Thread(this::bootstrapGameClient, "GameClientBootstrapper").start();
     }
@@ -1403,6 +1447,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                 // so any non-true return suppresses all world entities. Match on the API
                                 // signature, not on argument classes.
                                 if (method.getParameterCount() == 2 && method.getParameterTypes()[1] == boolean.class) {
+                                    Object hostHooks = RuneLiteHost.hooks();
+                                    if (hostHooks != null) {
+                                        // RenderCallbackManager.addEntity(): lets plugins veto/observe
+                                        // entity rendering. Hooks answers true unless a plugin says no.
+                                        return hooksMethod(hostHooks, method).invoke(hostHooks, args);
+                                    }
                                     if (!loggedRenderableDraw) {
                                         loggedRenderableDraw = true;
                                         Log.i(TAG, "Callbacks.draw(Renderable,boolean) -> true");
@@ -1417,42 +1467,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                         Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
                                         if (image instanceof java.awt.Image) {
                                             java.awt.Image img = (java.awt.Image) image;
-                                            long now = System.currentTimeMillis();
-                                            drawCount++;
-                                            if (now - lastDrawLog > 2000) {
-                                                long elapsed = now - lastDrawLog;
-                                                long n = drawCount;
-                                                lastDrawLog = now;
-                                                drawCount = 0;
-                                                int[] imgPx = img.getPixels();
-                                                StringBuilder pb = new StringBuilder(" px="
-                                                    + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
-                                                if (imgPx != null && imgPx.length >= 765 * 503) {
-                                                    int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
-                                                    for (int si = 0; si < s.length; si++) {
-                                                        if (s[si] < imgPx.length) {
-                                                            pb.append(String.format(",%08X", imgPx[s[si]]));
-                                                        }
-                                                    }
-                                                }
-                                                // World-region (left three quarters) content of the
-                                                // client's own frame vs the applet bridge the render
-                                                // thread scales: non-zero pixel count + XOR checksum.
-                                                // Constant client values with changing bridge values
-                                                // mean the client stopped redrawing the world.
-                                                pb.append(" world=").append(regionNonZero(imgPx, img.getWidth(), img.getHeight()))
-                                                    .append("/").append(Integer.toHexString(regionXor(imgPx, img.getWidth(), img.getHeight())));
-                                                int[] bridgePx = AWTBridge.activePixels;
-                                                pb.append(" bridge=").append(regionNonZero(bridgePx, GAME_W, GAME_H))
-                                                    .append("/").append(Integer.toHexString(regionXor(bridgePx, GAME_W, GAME_H)));
-                                                pb.append(" ").append(paletteInvariant())
-                                                    .append(" blitMs=").append(String.format("%.1f", lastBlitNanos / 1e6));
-                                                Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
-                                                    + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
-                                            }
+                                            logFrameDiagnostics(img);
+                                            Object hostHooks = RuneLiteHost.hooks();
                                             long blitStart = System.nanoTime();
                                             synchronized (renderLock) {
-                                                ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                                if (hostHooks != null) {
+                                                    // RuneLite's Hooks renders the plugin overlays into the
+                                                    // client's own frame image (mainBufferProvider.getImage())
+                                                    // and then blits that image into args[1] -- which is the
+                                                    // Graphics over appletPixels, the buffer the render thread
+                                                    // presents. Delegating is what puts plugins on screen; the
+                                                    // lock/frameSeq handshake stays here so the render thread
+                                                    // still presents exactly one client frame per draw.
+                                                    hooksMethod(hostHooks, method).invoke(hostHooks, args);
+                                                } else {
+                                                    ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                                }
                                                 // Hand the completed frame to the render thread
                                                 // (it waits for frameSeq to change).
                                                 frameSeq++;
@@ -1474,7 +1504,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             case "mouseEntered":
                             case "mouseExited":
                             case "mouseWheelMoved":
+                            case "keyPressed":
+                            case "keyReleased":
+                            case "keyTyped":
+                                // RuneLite's Hooks run MouseManager/KeyManager (plugin input
+                                // hooks) and return the event the client should process.
+                                Object hostHooks = RuneLiteHost.hooks();
+                                if (hostHooks != null) {
+                                    return hooksMethod(hostHooks, method).invoke(hostHooks, args);
+                                }
                                 return args[0];
+                            case "drawInterface": {
+                                // Which interface the client is drawing, and how many
+                                // ABOVE_WIDGETS overlays are registered for it: that layer is
+                                // rendered from renderAfterInterface, so an overlay only
+                                // appears when its interface is drawn.
+                                if (args.length >= 1 && args[0] instanceof Integer) {
+                                    lastInterfaceDrawn = (Integer) args[0];
+                                    lastInterfaceOverlays = interfaceOverlayCount(lastInterfaceDrawn);
+                                }
+                                Object interfaceHooks = RuneLiteHost.hooks();
+                                if (interfaceHooks != null) {
+                                    return hooksMethod(interfaceHooks, method).invoke(interfaceHooks, args);
+                                }
+                                return null;
+                            }
+                            case "post":
+                            case "postDeferred":
+                            case "tick":
+                            case "tickEnd":
+                            case "frame":
+                            case "serverTick":
+                            case "drawScene":
+                            case "drawAboveOverheads":
+                            case "drawLayer":
+                                // Event-bus delivery and the overlay render passes. Delegating is
+                                // what makes plugins see game events and draw on every layer.
+                                Object eventHooks = RuneLiteHost.hooks();
+                                if (eventHooks != null) {
+                                    return hooksMethod(eventHooks, method).invoke(eventHooks, args);
+                                }
+                                return returnType.equals(boolean.class) ? Boolean.FALSE : null;
                             case "isRuneLiteClientOutdated":
                                 return Boolean.FALSE;
                             case "openUrl":
@@ -1548,6 +1618,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
 
             updateStatus("RUNNING: Injected Client Active!");
+
+            // ── Step 8: Start the RuneLite runtime on top of the live client ──
+            // The plugin API (PluginManager, EventBus, ConfigManager, OverlayManager and
+            // the Hooks Callbacks implementation the proxy above delegates to) lives in
+            // the same asset dex. It boots on its own thread because it performs one
+            // blocking HTTP fetch (runelite.config) before handing the plugin lifecycle
+            // to the UI thread.
+            RuneLiteHost.setClientVersion(ClientUpdater.installedClientVersion(this));
+            Thread hostThread = new Thread(
+                () -> RuneLiteHost.start(clientObject, dexClassLoader), "RuneLiteHost");
+            hostThread.setDaemon(true);
+            hostThread.start();
+
             runOnUiThread(() -> Toast.makeText(this, "Game client initialized!", Toast.LENGTH_LONG).show());
         } catch (Throwable e) {
             Log.e(TAG, "Loader failed to bootstrap client", e);
@@ -1562,6 +1645,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 launcherScroll.setVisibility(View.VISIBLE);
                 btnSettings.setVisibility(View.GONE);
                 kbButton.setVisibility(View.GONE);
+                btnPanel.setVisibility(View.GONE);
                 kbBar.setVisibility(View.GONE);
                 Toast.makeText(this, "Loader Error: " + finalMsg, Toast.LENGTH_LONG).show();
             });
@@ -2393,6 +2477,83 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private volatile long lastBlitNanos;
     private volatile long lastScaleNanos;
 
+    /** Cached Hooks method lookups: the Callbacks proxy runs at frame rate. */
+    private volatile Map<String, Method> hooksMethodCache;
+
+    /**
+     * Resolves {@code method} on the RuneLite {@code Hooks} instance. The proxy's Method
+     * comes from the child class loader's {@code Callbacks} interface, so the parameter
+     * types match the Hooks declaration exactly.
+     */
+    private Method hooksMethod(Object hooks, Method method) throws NoSuchMethodException {
+        Map<String, Method> cache = hooksMethodCache;
+        if (cache == null) {
+            cache = new java.util.concurrent.ConcurrentHashMap<>();
+            hooksMethodCache = cache;
+        }
+        String key = method.getName() + '/' + method.getParameterCount();
+        Method resolved = cache.get(key);
+        if (resolved == null) {
+            resolved = hooks.getClass().getMethod(method.getName(), method.getParameterTypes());
+            cache.put(key, resolved);
+        }
+        return resolved;
+    }
+
+    /**
+     * Throttled (2 s) frame diagnostic: the client's own frame content, the applet bridge
+     * the render thread presents, the rasteriser palette invariant and the blit time.
+     * A frozen {@code world=} with a changing {@code bridge=} means the client stopped
+     * redrawing; differing values mean the blit is dropping content.
+     */
+    private void logFrameDiagnostics(java.awt.Image img) {
+        long now = System.currentTimeMillis();
+        drawCount++;
+        if (now - lastDrawLog <= 2000) {
+            return;
+        }
+        long elapsed = now - lastDrawLog;
+        long n = drawCount;
+        lastDrawLog = now;
+        drawCount = 0;
+        int[] imgPx = img.getPixels();
+        StringBuilder pb = new StringBuilder(" px="
+            + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
+        if (imgPx != null && imgPx.length >= 765 * 503) {
+            int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
+            for (int si = 0; si < s.length; si++) {
+                if (s[si] < imgPx.length) {
+                    pb.append(String.format(",%08X", imgPx[s[si]]));
+                }
+            }
+        }
+        pb.append(" world=").append(regionNonZero(imgPx, img.getWidth(), img.getHeight()))
+            .append("/").append(Integer.toHexString(regionXor(imgPx, img.getWidth(), img.getHeight())));
+        int[] bridgePx = AWTBridge.activePixels;
+        pb.append(" bridge=").append(regionNonZero(bridgePx, GAME_W, GAME_H))
+            .append("/").append(Integer.toHexString(regionXor(bridgePx, GAME_W, GAME_H)));
+        // Top-right strip of the client's own frame: that is where RuneLite's overlays
+        // land (the FPS overlay, infoboxes). The game art behind it is static on the
+        // welcome screen, so a change in this XOR is overlay pixels appearing.
+        int stripW = Math.min(240, img.getWidth());
+        pb.append(" tr=").append(Integer.toHexString(regionXorRegion(imgPx, img.getWidth(),
+            img.getWidth() - stripW, 0, img.getWidth(), Math.min(26, img.getHeight()))));
+        pb.append(" ovl=").append(alwaysOnTopOverlayCount()).append("(").append(overlayNames).append(")");
+        pb.append(" iface=").append(lastInterfaceDrawn).append("/").append(lastInterfaceOverlays);
+        // RuneLite's FPS overlay paints pure yellow (or red when it is enforcing a
+        // limit) at the top-right of the frame; no game art in that strip uses those
+        // colours, so a non-zero count is overlay pixels reaching the frame.
+        pb.append(" yellow=").append(countColour(imgPx, img.getWidth(), img.getWidth() - stripW, 0,
+            img.getWidth(), Math.min(26, img.getHeight()), 0xFFFFFF00));
+        pb.append(" red=").append(countColour(imgPx, img.getWidth(), img.getWidth() - stripW, 0,
+            img.getWidth(), Math.min(26, img.getHeight()), 0xFFFF0000));
+        pb.append(" ").append(paletteInvariant())
+            .append(" host=").append(RuneLiteHost.isRunning() ? RuneLiteHost.activePluginCount() + "p" : "-")
+            .append(" blitMs=").append(String.format("%.1f", lastBlitNanos / 1e6));
+        Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
+            + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
+    }
+
     /**
      * Points the software 3D rasterizer's output at the display buffer the app
      * blits.
@@ -2418,6 +2579,124 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * Idempotent and re-checked per frame: the client can re-point `yw.ah`
      * behind our back, and the display array can be replaced.
      */
+    private volatile int lastInterfaceDrawn = -1;
+    private volatile int lastInterfaceOverlays = -1;
+
+    /**
+     * Number of overlays registered for an interface id ({@code OverlayManager.getForInterface}),
+     * i.e. the ABOVE_WIDGETS overlays that {@code renderAfterInterface} will draw.
+     */
+    private int interfaceOverlayCount(int interfaceId) {
+        try {
+            Object manager = RuneLiteHost.overlayManager();
+            if (manager == null) {
+                return -1;
+            }
+            if (interfaceOverlayMethod == null) {
+                interfaceOverlayMethod = manager.getClass().getDeclaredMethod("getForInterface", int.class);
+                interfaceOverlayMethod.setAccessible(true);
+            }
+            Object result = interfaceOverlayMethod.invoke(manager, interfaceId);
+            return result instanceof java.util.Collection ? ((java.util.Collection<?>) result).size() : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    private volatile Method interfaceOverlayMethod;
+
+    /** Counts pixels of an exact ARGB value inside a rectangle (diagnostics only). */
+    private static int countColour(int[] px, int width, int x0, int y0, int x1, int y1, int argb) {
+        if (px == null) {
+            return 0;
+        }
+        int count = 0;
+        for (int y = Math.max(0, y0); y < y1; y++) {
+            int row = y * width;
+            for (int x = Math.max(0, x0); x < x1 && row + x < px.length; x++) {
+                if (px[row + x] == argb) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    }
+
+    /** XOR checksum of a rectangle inside a pixel array (diagnostics only). */
+    private static int regionXorRegion(int[] px, int width, int x0, int y0, int x1, int y1) {
+        if (px == null) {
+            return 0;
+        }
+        int xor = 0;
+        for (int y = Math.max(0, y0); y < y1; y++) {
+            int row = y * width;
+            for (int x = Math.max(0, x0); x < x1 && row + x < px.length; x++) {
+                xor ^= px[row + x];
+            }
+        }
+        return xor;
+    }
+
+    /**
+     * How many overlays the plugin API has registered for {@code OverlayLayer.ALWAYS_ON_TOP}
+     * (the layer {@code Hooks.draw} renders first). A plugin whose overlay is registered but
+     * invisible is then distinguishable from a plugin that never registered one.
+     */
+    private int alwaysOnTopOverlayCount() {
+        try {
+            Object manager = RuneLiteHost.overlayManager();
+            if (manager == null) {
+                return -1;
+            }
+            if (overlayLayerAlwaysOnTop == null) {
+                Class<?> layerClass = clientClass.getClassLoader()
+                    .loadClass("net.runelite.client.ui.overlay.OverlayLayer");
+                // getLayer(OverlayLayer) is package-private in OverlayManager.
+                overlayLayerMethod = manager.getClass().getDeclaredMethod("getLayer", layerClass);
+                overlayLayerMethod.setAccessible(true);
+                overlayLayerConstants = layerClass.getEnumConstants();
+            }
+            int total = 0;
+            StringBuilder names = new StringBuilder();
+            for (Object layer : overlayLayerConstants) {
+                Object overlays = overlayLayerMethod.invoke(manager, layer);
+                if (!(overlays instanceof java.util.Collection)) {
+                    continue;
+                }
+                java.util.Collection<?> collection = (java.util.Collection<?>) overlays;
+                total += collection.size();
+                names.append(((Enum<?>) layer).name()).append(':').append(collection.size()).append(' ');
+            }
+            // Master list (OverlayManager.overlays): distinguishes "never added" from
+            // "added but not in the layer map".
+            Object master = null;
+            try {
+                java.lang.reflect.Field field = manager.getClass().getDeclaredField("overlays");
+                field.setAccessible(true);
+                master = field.get(manager);
+            } catch (Throwable ignored) {
+                // private field layout changed; the layer counts are enough
+            }
+            if (master instanceof java.util.Collection) {
+                names.append(" master=").append(((java.util.Collection<?>) master).size());
+            }
+            overlayNames = names.toString().trim();
+            return total;
+        } catch (Throwable t) {
+            if (overlayDiagnosticFailure == null) {
+                overlayDiagnosticFailure = t.toString();
+                Log.w(TAG, "overlay count diagnostic failed", t);
+            }
+            return -1;
+        }
+    }
+
+    private volatile Object overlayLayerAlwaysOnTop;
+    private volatile Method overlayLayerMethod;
+    private volatile Object[] overlayLayerConstants;
+    private volatile String overlayNames = "";
+    private volatile String overlayDiagnosticFailure;
+
     private void bindSceneRasterizerToDisplay(Object bufferProvider) {
         try {
             ClassLoader cl = clientClass.getClassLoader();
@@ -2916,6 +3195,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 
     @Override
+    protected void onStop() {
+        super.onStop();
+        // Android may kill a backgrounded process without warning, and RuneLite's own
+        // config flush is a periodic task: flush on the way out so panel changes (plugin
+        // enablement, config edits) survive.
+        RuneLiteHost.flushConfig();
+    }
+
     public void onBackPressed() {
         if (loginOverlay.getVisibility() == View.VISIBLE) {
             cancelLogin();

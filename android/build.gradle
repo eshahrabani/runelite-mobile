@@ -22,6 +22,10 @@ android {
         targetSdk 34
         versionCode 1
         versionName "1.0"
+        // Guice + Gson + OkHttp + Guava + commons + protobuf push the app dex well
+        // past 64 K method references. minSdk is 26, so this is native multidex
+        // (no support library, no Application subclass needed).
+        multiDexEnabled true
         // Base URL the app downloads the pre-dexed client from. Override with
         // -PdistBase=<url>/ to serve the three release-named files from any
         // static host (offline verification). Trailing slash required.
@@ -47,7 +51,339 @@ android {
 // Gradle task to download RuneLite's injected client and compile it to Dex format
 def ClientUpdaterVersionFile = "client-version.txt"
 
+// ---------------------------------------------------------------------------
+// RuneLite runtime artifact set. Every artifact is looked up in
+// https://static.runelite.net/bootstrap.json and verified against the manifest
+// SHA-256, so client / injected-client / runelite-api can never drift apart.
+// Desktop-only jars (discord, jna, lwjgl, flatlaf, rlawt, logback, jopt-simple)
+// are deliberately absent: the Android host replaces the Swing UI, never
+// constructs the GPU/Discord/JNA consumers, and logs through slf4j-simple
+// instead of logback.
+// ---------------------------------------------------------------------------
+project.ext.rlJarsDir = new File(project.buildDir, "rl-jars")
+// Third-party runtime libraries the RuneLite client needs in the *app* dex
+// (Guice injector, Gson, OkHttp, commons, protobuf, slf4j-api). The three
+// RuneLite-specific jars (client / injected-client / runelite-api) are NOT here:
+// they ship pre-dexed in assets/runelite-dex.jar so the in-app updater can
+// replace them without an APK release.
+project.ext.RL_RUNTIME_JAR_PREFIXES = [
+    'http-api-', 'okhttp-', 'okio-', 'gson-', 'guice-', 'javax.inject-',
+    'aopalliance-', 'guava-', 'commons-lang3-', 'commons-text-', 'slf4j-api-',
+    'protobuf-javalite-', 'json-', 'jsr305-',
+]
+project.ext.RL_JAR_PREFIXES = ['client-', 'injected-client-'] + project.ext.RL_RUNTIME_JAR_PREFIXES
+
+// Classes under net/runelite/client/** that the Android host replaces with its
+// own implementations (package net.runelite.client.ui in the app dex). The jar's
+// copies must not ship: they would drag flatlaf and the whole Swing client shell
+// into the asset dex, and the classloader would resolve the jar's ClientUI --
+// which builds a real JFrame -- instead of the host one. Keep in sync with the
+// shims written in android/src/main/java/net/runelite/client/ui/.
+project.ext.HOST_REPLACED_CLASSES = [
+    'net/runelite/client/ui/ClientUI.class',
+    'net/runelite/client/ui/SplashScreen.class',
+    'net/runelite/client/ui/ContainableFrame.class',
+    'net/runelite/client/ui/ClientPanel.class',
+    'net/runelite/client/ui/ClientToolbarPanel.class',
+    'net/runelite/client/ui/FatalErrorDialog.class',
+    'net/runelite/client/ui/OSXFullScreenAdapter.class',
+    'net/runelite/client/ui/MultiplexingPluginPanel.class',
+    'net/runelite/client/ui/ClientToolbar.class',
+    'net/runelite/client/ui/PluginPanel.class',
+    'net/runelite/client/ui/NavigationButton.class',
+    'net/runelite/client/ui/UnitFormatter.class',
+    'net/runelite/client/ui/UnitFormatterFactory.class',
+    'net/runelite/client/ui/Activatable.class',
+]
+project.ext.HOST_REPLACED_PREFIXES = [
+    'net/runelite/client/ui/laf/',
+    'net/runelite/client/ui/components/',
+]
+
+boolean isHostReplaced(String entryName) {
+    if (!entryName.endsWith('.class')) {
+        return false
+    }
+    for (String replaced : project.ext.HOST_REPLACED_CLASSES) {
+        String outer = replaced.substring(0, replaced.length() - '.class'.length())
+        // Nested classes go with their outer class: d8 refuses a nest member
+        // whose nest host is missing ("Class X$Y requires its nest host").
+        if (entryName == outer + '.class' || entryName.startsWith(outer + '$')) {
+            return true
+        }
+    }
+    for (String prefix : project.ext.HOST_REPLACED_PREFIXES) {
+        if (entryName.startsWith(prefix)) {
+            return true
+        }
+    }
+    return false
+}
+
+/**
+ * Copies `input` to `output`, dropping META-INF (the RuneLite jars are signed:
+ * leaving RL.SF/RL.RSA in a repackaged dex asset makes ART reject the jar) and
+ * transforming every .class with transformClassBytes(). `skipClass` decides per
+ * entry which classes are dropped entirely (the host-replaced ones).
+ */
+void transformJar(File input, File output, Closure<Boolean> skipClass, String label) {
+    transformJar(input, output, skipClass, label, false)
+}
+
+void transformJar(File input, File output, Closure<Boolean> skipClass, String label, boolean tolerant) {
+    int transformed = 0
+    int skipped = 0
+    int untransformed = 0
+    new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(output)).withStream { zos ->
+        new java.util.zip.ZipFile(input).withCloseable { zip ->
+            zip.entries().each { entry ->
+                if (entry.isDirectory() || entry.name.startsWith("META-INF/")) {
+                    return
+                }
+                if (entry.name.endsWith(".class") && skipClass(entry.name)) {
+                    skipped++
+                    return
+                }
+                zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                zip.getInputStream(entry).withStream { zis ->
+                    byte[] bytes = zis.bytes
+                    if (entry.name.endsWith(".class")) {
+                        try {
+                            byte[] rewritten = transformClassBytes(bytes)
+                            if (rewritten != bytes) {
+                                transformed++
+                            }
+                            bytes = rewritten
+                        } catch (Exception e) {
+                            if (!tolerant) {
+                                throw new GradleException("Transform failed for " + entry.name + " in " + label, e)
+                            }
+                            // Tolerant mode (the bundled dexer): ship the class untouched
+                            // rather than failing the build; a class the transform cannot
+                            // rewrite usually has nothing to rewrite.
+                            untransformed++
+                            println "  [" + label + "] transform skipped for " + entry.name + ": " + e
+                        }
+                    }
+                    zos.write(bytes)
+                }
+                zos.closeEntry()
+            }
+        }
+    }
+    println("  [" + label + "] transformed " + transformed + " class(es), dropped " + skipped
+        + (untransformed > 0 ? ", left untouched " + untransformed : ""))
+}
+
+/**
+ * Compiles the RuneLite host shims (`hostshims/src/net/runelite/client/**`) into
+ * `build/host-shims/classes`.
+ *
+ * They are NOT part of the app source set: they replace classes of the RuneLite client
+ * jar, so they must be dexed into the *asset* dex and share its class loader. That is
+ * what lets Guice resolve the types in their signatures (`net.runelite.api.Client` in
+ * `ColorPickerManager.create`, for instance) -- a shim in the app dex made those
+ * descriptors unresolvable and broke the 7 plugins that inject a shim.
+ */
+void compileHostShims(File outputDir) {
+    def coreClasses = new File(project.rootDir, "core/build/classes/java/main")
+    def jarsDir = project.ext.rlJarsDir
+    def classpath = [coreClasses.absolutePath]
+    ['client-', 'runelite-api-', 'guice-', 'javax.inject-', 'guava-', 'okhttp-', 'gson-', 'http-api-'].each { prefix ->
+        def jar = jarsDir.listFiles()?.find { it.name.startsWith(prefix) && !it.name.contains('-runtime') }
+        if (jar != null) {
+            classpath.add(jar.absolutePath)
+        }
+    }
+    classpath.add(new File(android.sdkDirectory, "platforms/android-34/android.jar").absolutePath)
+    def sources = fileTree(new File(project.rootDir, "hostshims/src")) { include '**/*.java' }.files
+    if (sources.isEmpty()) {
+        throw new GradleException("no host shim sources under hostshims/src")
+    }
+    outputDir.deleteDir()
+    outputDir.mkdirs()
+    def javac = new File(System.getProperty("java.home"), "bin/javac").absolutePath
+    exec {
+        commandLine([javac, "-nowarn", "-source", "11", "-target", "11",
+                      "--limit-modules", "java.base,jdk.unsupported",
+                      "-cp", classpath.join(File.pathSeparator),
+                      "-d", outputDir.absolutePath] + sources.collect { it.absolutePath })
+    }
+    println "  [host-shims] compiled " + sources.size() + " source(s)"
+
+    // d8 takes jars far more happily than a classes directory ("Unsupported source file
+    // type"), so package the compiled shims first.
+    def jar = new File(outputDir.parentFile, "host-shims.jar")
+    jar.delete()
+    new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(jar)).withStream { zos ->
+        outputDir.eachFileRecurse { file ->
+            if (file.isFile() && file.name.endsWith(".class")) {
+                def rel = outputDir.toPath().relativize(file.toPath()).toString().replace(File.separator, "/")
+                zos.putNextEntry(new java.util.zip.ZipEntry(rel))
+                file.withInputStream { is -> zos << is }
+                zos.closeEntry()
+            }
+        }
+    }
+    println "  [host-shims] packaged " + jar.absolutePath + " (" + jar.length() + " bytes)"
+}
+
+/**
+ * Builds runelite-plugin-index.txt: every class under
+ * net/runelite/client/plugins/** that carries a @PluginDescriptor annotation and
+ * directly extends net/runelite/client/plugins/Plugin, minus the FQCNs listed in
+ * android/plugin-exclusions.txt. PluginManager wants a List<Class<?>> of
+ * subclasses of Plugin/Configurable, which is exactly this set.
+ */
+List<String> generatePluginIndex(File jar) {
+    Set<String> excluded = new java.util.HashSet<>()
+    File exclusions = new File(project.projectDir, "plugin-exclusions.txt")
+    if (exclusions.exists()) {
+        exclusions.eachLine { line ->
+            def trimmed = line.trim()
+            if (trimmed.length() > 0 && !trimmed.startsWith("#")) {
+                excluded.add(trimmed)
+            }
+        }
+    }
+    List<String> index = new ArrayList<>()
+    new java.util.zip.ZipFile(jar).withCloseable { zip ->
+        zip.entries().each { entry ->
+            def name = entry.name
+            if (!name.endsWith(".class") || !name.startsWith("net/runelite/client/plugins/")) {
+                return
+            }
+            org.objectweb.asm.tree.ClassNode node = new org.objectweb.asm.tree.ClassNode()
+            zip.getInputStream(entry).withStream { is ->
+                new org.objectweb.asm.ClassReader(is.bytes).accept(node,
+                    org.objectweb.asm.ClassReader.SKIP_CODE |
+                    org.objectweb.asm.ClassReader.SKIP_DEBUG |
+                    org.objectweb.asm.ClassReader.SKIP_FRAMES)
+            }
+            if (node.superName != "net/runelite/client/plugins/Plugin") {
+                return
+            }
+            boolean descriptor = false
+            node.visibleAnnotations?.each { ann ->
+                if (ann.desc == "Lnet/runelite/client/plugins/PluginDescriptor;") {
+                    descriptor = true
+                }
+            }
+            if (!descriptor) {
+                return
+            }
+            String fqcn = node.name.replace('/', '.')
+            if (excluded.contains(fqcn)) {
+                println "  [excluded]   " + fqcn
+                return
+            }
+            index.add(fqcn)
+        }
+    }
+    index.sort()
+    return index
+}
+
+task syncRuneLiteJars {
+    description = "Downloads the RuneLite client + runtime jars pinned by bootstrap.json"
+    def outDir = project.ext.rlJarsDir
+    outputs.dir(outDir)
+    doLast {
+        outDir.mkdirs()
+        println "Fetching RuneLite bootstrap.json..."
+        def bootstrap = new groovy.json.JsonSlurper().parseText(new URL("https://static.runelite.net/bootstrap.json").text)
+        def clientArtifact = bootstrap.artifacts.find { it.name ==~ /client-(\d[^\/]*)\.jar/ }
+        if (!clientArtifact) {
+            throw new GradleException("Could not find client artifact in bootstrap.json!")
+        }
+        def clientVersion = (clientArtifact.name =~ /client-(.+)\.jar/)[0][1]
+        println "  RuneLite version: " + clientVersion
+
+        def sha256 = { File f ->
+            java.security.MessageDigest.getInstance("SHA-256").digest(f.bytes).encodeHex().toString()
+        }
+        def fetch = { String name, String url, String expected ->
+            def target = new File(outDir, name)
+            if (target.exists() && expected != null && sha256(target) == expected) {
+                println "  [cached]     " + name
+                return target
+            }
+            def part = new File(outDir, name + ".part")
+            part.delete()
+            part.withOutputStream { os -> new URL(url).openStream().withStream { is -> os << is } }
+            def actual = sha256(part)
+            if (expected != null && actual != expected) {
+                part.delete()
+                throw new GradleException("SHA-256 mismatch for " + name +
+                    "\n  manifest: " + expected + "\n  actual:   " + actual)
+            }
+            target.delete()
+            if (!part.renameTo(target)) {
+                throw new GradleException("Could not move " + part + " to " + target)
+            }
+            println "  downloaded   " + name + " (" + target.length() + " bytes)"
+            return target
+        }
+
+        project.ext.RL_JAR_PREFIXES.each { String prefix ->
+            def artifact = bootstrap.artifacts.find { it.name.startsWith(prefix) && it.platform == null }
+            if (!artifact) {
+                println "  [warn] bootstrap.json has no artifact for prefix " + prefix
+                return
+            }
+            fetch(artifact.name, artifact.path, artifact.hash)
+        }
+
+        // runelite-api: bootstrap.json only lists the "-runtime" flavor (that is
+        // what the desktop launcher puts on the classpath). The full api jar in
+        // the same versioned directory is a strict byte-identical superset of it
+        // (the gameval/ID tables the core plugins are compiled against), so ship
+        // the superset and prove the relationship instead of trusting it.
+        def apiArtifact = bootstrap.artifacts.find { it.name.startsWith('runelite-api-') && it.platform == null }
+        if (!apiArtifact) {
+            throw new GradleException("Could not find runelite-api artifact in bootstrap.json!")
+        }
+        def runtimeApi = fetch(apiArtifact.name, apiArtifact.path, apiArtifact.hash)
+        def apiName = apiArtifact.name.replace('-runtime.jar', '.jar')
+        def apiPath = 'https://repo.runelite.net/net/runelite/runelite-api/' + clientVersion + '/' + apiName
+        def fullApi = fetch(apiName, apiPath, null)
+        def runtimeEntries = [:]
+        new java.util.zip.ZipFile(runtimeApi).withCloseable { zip ->
+            zip.entries().each { e ->
+                if (e.name.endsWith('.class')) {
+                    runtimeEntries[e.name] = java.security.MessageDigest.getInstance("SHA-256")
+                        .digest(zip.getInputStream(e).bytes).encodeHex().toString()
+                }
+            }
+        }
+        int mismatched = 0
+        new java.util.zip.ZipFile(fullApi).withCloseable { zip ->
+            runtimeEntries.each { name, hash ->
+                def entry = zip.getEntry(name)
+                if (entry == null) {
+                    throw new GradleException(apiName + " is missing " + name + " present in the verified " + apiArtifact.name)
+                }
+                def actual = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(zip.getInputStream(entry).bytes).encodeHex().toString()
+                if (actual != hash) {
+                    mismatched++
+                }
+            }
+        }
+        if (mismatched > 0) {
+            throw new GradleException(apiName + " disagrees with the manifest-verified " +
+                apiArtifact.name + " in " + mismatched + " class(es); refusing to mix versions")
+        }
+        println "  verified     " + apiName + " is a superset of " + apiArtifact.name +
+            " (" + runtimeEntries.size() + " classes byte-identical)"
+
+        new File(outDir, "version.txt").text = clientVersion
+        println "RuneLite jars ready in " + outDir.absolutePath + " (v" + clientVersion + ")"
+    }
+}
+
 task downloadAndDexJar {
+    dependsOn syncRuneLiteJars
     doLast {
         def buildToolsDir = new File(android.sdkDirectory, "build-tools")
         if (!buildToolsDir.exists()) {
@@ -69,83 +405,45 @@ task downloadAndDexJar {
         def tempDir = new File(project.buildDir, "temp-jars")
         tempDir.mkdirs()
         
-        // 1. Parse bootstrap.json from RuneLite to get active client version
-        println "Fetching RuneLite bootstrap.json..."
-        def bootstrapUrl = new URL("https://static.runelite.net/bootstrap.json")
-        def bootstrapText = bootstrapUrl.text
-        def bootstrapJson = new groovy.json.JsonSlurper().parseText(bootstrapText)
-        
-        // Find the client artifact to extract the version number
-        def clientArtifact = bootstrapJson.artifacts.find { it.name.startsWith("client-") && it.name.endsWith(".jar") }
-        if (!clientArtifact) {
-            throw new GradleException("Could not find client artifact in bootstrap.json!")
+        // 1. Inputs are produced by syncRuneLiteJars: client / injected-client /
+        //    runelite-api pinned to one version and SHA-256 verified against
+        //    bootstrap.json. No network access happens here.
+        def jarsDir = project.ext.rlJarsDir
+        def rlVersionFile = new File(jarsDir, "version.txt")
+        if (!rlVersionFile.exists()) {
+            throw new GradleException("syncRuneLiteJars has not run (" + rlVersionFile + " missing)")
         }
-        // Extract version from artifact name: "client-1.12.28.jar" -> "1.12.28"
-        def versionMatcher = (clientArtifact.name =~ /client-(.+)\.jar/)
-        if (!versionMatcher.matches()) {
-            throw new GradleException("Could not parse version from artifact name: " + clientArtifact.name)
-        }
-        def clientVersion = versionMatcher[0][1]
+        def clientVersion = rlVersionFile.text.trim()
         println "Active RuneLite client version: " + clientVersion
-        
-        // 2. Download injected-client JAR (the real pre-patched OSRS game client)
-        def injectedClientUrl = new URL("https://repo.runelite.net/net/runelite/injected-client/${clientVersion}/injected-client-${clientVersion}.jar")
-        def injectedClientJar = new File(tempDir, "injected-client.jar")
-        println "Downloading injected-client from: " + injectedClientUrl
-        injectedClientUrl.openStream().withStream { is ->
-            injectedClientJar.withOutputStream { os ->
-                os << is
-            }
-        }
-        println "  -> Downloaded: " + injectedClientJar.length() + " bytes"
-        
-        // 2b. Clean/transform the injected-client JAR to replace invokedynamic string concatenations
-        println "Transforming injected-client to remove Java 9+ invokedynamic string concatenations..."
-        def cleanedClientJar = new File(tempDir, "injected-client-cleaned.jar")
-        new java.util.zip.ZipFile(injectedClientJar).withCloseable { clientZip ->
-            new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(cleanedClientJar)).withStream { zos ->
-                clientZip.entries().each { entry ->
-                    zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
-                    if (!entry.isDirectory()) {
-                        clientZip.getInputStream(entry).withStream { zis ->
-                            byte[] bytes = zis.bytes
-                            if (entry.name.endsWith(".class")) {
-                                // Transform EVERY class. The old per-class gate (hasConcat /
-                                // hasUnsafe / hasBeacon byte-scans plus a hardcoded class-name
-                                // list) skipped classes whose only Android-hostile feature is a
-                                // dynamic constant -- e.g. ar.class in clients >= 1.13 -- which
-                                // d8 then rejects with "Unsupported dynamic constant".
-                                // transformClassBytes returns the same array instance when it
-                                // changed nothing, so identity is the change test.
-                                try {
-                                    byte[] transformed = transformClassBytes(bytes)
-                                    if (transformed != bytes) {
-                                        println "  Transformed class: " + entry.name
-                                    }
-                                    bytes = transformed
-                                } catch (Exception e) {
-                                    throw new GradleException("Transform failed for " + entry.name, e)
-                                }
-                            }
-                            zos.write(bytes)
-                        }
-                    }
-                    zos.closeEntry()
-                }
-            }
-        }
-        println "  Cleaned client JAR: " + cleanedClientJar.length() + " bytes (original: " + injectedClientJar.length() + " bytes)"
 
-        // 3. Download runelite-api JAR (interfaces and types referenced by the injected client)
-        def apiUrl = new URL("https://repo.runelite.net/net/runelite/runelite-api/${clientVersion}/runelite-api-${clientVersion}.jar")
-        def apiJar = new File(tempDir, "runelite-api.jar")
-        println "Downloading runelite-api from: " + apiUrl
-        apiUrl.openStream().withStream { is ->
-            apiJar.withOutputStream { os ->
-                os << is
+        def injectedClientJar = new File(jarsDir, "injected-client-" + clientVersion + ".jar")
+        def runeliteClientJar = new File(jarsDir, "client-" + clientVersion + ".jar")
+        def apiJar = new File(jarsDir, "runelite-api-" + clientVersion + ".jar")
+        [injectedClientJar, runeliteClientJar, apiJar].each { f ->
+            if (!f.exists()) {
+                throw new GradleException("Missing artifact " + f.absolutePath + " (run syncRuneLiteJars)")
             }
         }
-        println "  -> Downloaded: " + apiJar.length() + " bytes"
+        
+        // 2. Transform the injected-client JAR. EVERY class is rewritten (the old
+        //    per-class byte-scan gate skipped classes whose only Android-hostile
+        //    feature is a dynamic constant -- e.g. ar.class in clients >= 1.13 --
+        //    which d8 then rejects with "Unsupported dynamic constant").
+        println "Transforming injected-client..."
+        def cleanedClientJar = new File(tempDir, "injected-client-cleaned.jar")
+        transformJar(injectedClientJar, cleanedClientJar, { String name -> false }, "injected-client")
+        println "  Cleaned client JAR: " + cleanedClientJar.size() + " bytes"
+
+        // 2b. The RuneLite client jar is built for Java 11 and needs the same
+        //     transforms (invokedynamic string concat, dynamic constants), plus
+        //     removal of the classes the Android host replaces.
+        println "Transforming RuneLite client..."
+        def cleanedRuneliteJar = new File(tempDir, "client-cleaned.jar")
+        transformJar(runeliteClientJar, cleanedRuneliteJar, { String name -> isHostReplaced(name) }, "runelite-client")
+        println "  Cleaned RuneLite client JAR: " + cleanedRuneliteJar.size() + " bytes"
+
+        // 3. runelite-api JAR (interfaces and types referenced by the injected client
+        //    and by the plugins); already downloaded and verified by syncRuneLiteJars.
         
         // 4. Strip duplicate classes from api JAR that already exist in injected-client
         // (e.g. com.jagex.oldscape.pub.OAuthApi exists in both JARs)
@@ -171,17 +469,66 @@ task downloadAndDexJar {
         }
         println "  Cleaned API JAR: " + cleanedApiJar.length() + " bytes"
         
-        // 5. Compile both JARs together to Dex format
-        println "Compiling injected-client + runelite-api to Dex format using: " + d8Path.absolutePath
+        // 5. Compile the RuneLite side to Dex format: the game client, the api, the
+        //    plugin API jar, the host shims (which replace stripped client classes) and
+        //    RuneLite's own runtime libraries. They share one loader on purpose: Guice
+        //    lives here too, so it can resolve every type in the shims' and plugins'
+        //    signatures. The app dex keeps only the JRE stubs, the Android host and slf4j.
+        def shimClasses = new File(project.buildDir, "host-shims/classes")
+        compileHostShims(shimClasses)
+        def shimJar = new File(project.buildDir, "host-shims/host-shims.jar")
+        println "Compiling the RuneLite runtime to Dex format using: " + d8Path.absolutePath
         def destJar = new File(assetsDir, "runelite-dex.jar")
+        def runtimeJars = project.ext.rlJarsDir.listFiles()
+            .findAll { it.name.endsWith('.jar') && !it.name.contains('-runtime')
+                && !it.name.startsWith('client-') && !it.name.startsWith('injected-client-')
+                && !it.name.startsWith('runelite-api-') }
+            .collect { it.absolutePath }
         
         exec {
-            commandLine d8Path.absolutePath,
-                "--min-api", "26",
-                "--output", destJar.absolutePath,
-                cleanedClientJar.absolutePath,
-                cleanedApiJar.absolutePath
+            commandLine([d8Path.absolutePath, "--min-api", "26", "--output", destJar.absolutePath,
+                cleanedClientJar.absolutePath, cleanedApiJar.absolutePath,
+                cleanedRuneliteJar.absolutePath, shimJar.absolutePath] + runtimeJars)
         }
+        // 5b. Bundle the R8/D8 dexer as its own asset dex (Phase G1): the app needs to
+        //     dex Plugin Hub jars on the device, and d8.jar is a full Java program
+        //     (invokedynamic string concat, sun.misc.Unsafe references) that must go
+        //     through the same transform. It is loaded on demand by a DexClassLoader, so
+        //     the app dex never sees its 7000+ classes.
+        def dexerSource = new File(latestBuildTool, "lib/d8.jar")
+        if (dexerSource.isFile()) {
+            println "Bundling the on-device dexer (d8.jar)..."
+            def cleanedDexerJar = new File(tempDir, "d8-cleaned.jar")
+            transformJar(dexerSource, cleanedDexerJar, { String name -> false }, "d8", true)
+            def dexerJar = new File(assetsDir, "rl-dexer.jar")
+            def dexerDexDir = new File(tempDir, "dexer-dex")
+            if (dexerDexDir.exists()) {
+                dexerDexDir.deleteDir()
+            }
+            dexerDexDir.mkdirs()
+            def dexerStage = new File(tempDir, "dexer-stage.jar")
+            exec {
+                commandLine d8Path.absolutePath, "--min-api", "26",
+                    "--output", dexerStage.absolutePath,
+                    cleanedDexerJar.absolutePath
+            }
+            dexerJar.delete()
+            new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(dexerJar)).withStream { zos ->
+                new java.util.zip.ZipFile(dexerStage).withCloseable { zip ->
+                    zip.entries().each { entry ->
+                        if (entry.name.endsWith(".dex")) {
+                            zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                            zip.getInputStream(entry).withStream { is -> zos << is }
+                            zos.closeEntry()
+                        }
+                    }
+                }
+            }
+            println "  on-device dexer: " + dexerJar.absolutePath + " (" + dexerJar.length() + " bytes)"
+        } else {
+            println "  [warn] no " + dexerSource + "; on-device dexing stays unavailable"
+        }
+
         // 6. Copy resource files (non-class files) from original JARs into the dexed JAR
         println "Copying resources from client and API jars to dexed jar..."
         def tempDexDir = new File(tempDir, "dex-extracted")
@@ -213,35 +560,42 @@ task downloadAndDexJar {
                 }
             }
             
-            // Add non-class resources from cleanedClientJar
-            new java.util.zip.ZipFile(cleanedClientJar).withCloseable { zip ->
+            def writtenEntries = new java.util.HashSet()
+            def copyResources = { java.util.zip.ZipFile zip ->
                 zip.entries().each { entry ->
-                    if (!entry.isDirectory() && !entry.name.endsWith(".class") && !entry.name.startsWith("META-INF/")) {
+                    if (!entry.isDirectory() && !entry.name.endsWith(".class")
+                        && !entry.name.startsWith("META-INF/") && writtenEntries.add(entry.name)) {
                         zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
                         zip.getInputStream(entry).withStream { is -> zos << is }
                         zos.closeEntry()
                     }
                 }
             }
-            
-            // Add non-class resources from cleanedApiJar
-            new java.util.zip.ZipFile(cleanedApiJar).withCloseable { zip ->
-                zip.entries().each { entry ->
-                    if (!entry.isDirectory() && !entry.name.endsWith(".class") && !entry.name.startsWith("META-INF/")) {
-                        try {
-                            zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
-                            zip.getInputStream(entry).withStream { is -> zos << is }
-                            zos.closeEntry()
-                        } catch (java.util.zip.ZipException ze) {
-                            // duplicate entry, ignore
-                        }
-                    }
-                }
+
+            // Resources: runescape{,_bold,_small}.ttf, runelite/index (the overlay
+            // index the injected client reads through OverlayIndex), plugin icons,
+            // the notification sound, externalplugins.crt. First writer wins.
+            new java.util.zip.ZipFile(cleanedClientJar).withCloseable { zip -> copyResources(zip) }
+            new java.util.zip.ZipFile(cleanedApiJar).withCloseable { zip -> copyResources(zip) }
+            new java.util.zip.ZipFile(cleanedRuneliteJar).withCloseable { zip -> copyResources(zip) }
+
+            if (writtenEntries.contains("runelite/index")) {
+                println "  runelite/index copied from the RuneLite client jar"
+            } else {
+                println "  [warn] no runelite/index in the client jar; writing FF FF FF FF placeholder"
+                zos.putNextEntry(new java.util.zip.ZipEntry("runelite/index"))
+                zos.write(new byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF})
+                zos.closeEntry()
             }
-            
-            // Generate runelite/index resource file to prevent NPE in OverlayIndex
-            zos.putNextEntry(new java.util.zip.ZipEntry("runelite/index"))
-            zos.write(new byte[]{(byte)0xFF, (byte)0xFF, (byte)0xFF, (byte)0xFF})
+
+            // The core-plugin index. PluginManager's desktop discovery is
+            // ClassPath.from(getClass().getClassLoader()) -- Guava scanning the
+            // java.class.path -- which cannot work on ART, so the host supplies
+            // the list itself. See generatePluginIndex().
+            def pluginIndex = generatePluginIndex(cleanedRuneliteJar)
+            println "  plugin index: " + pluginIndex.size() + " plugin class(es)"
+            zos.putNextEntry(new java.util.zip.ZipEntry("runelite-plugin-index.txt"))
+            zos.write(pluginIndex.join("\n").getBytes("UTF-8"))
             zos.closeEntry()
         }
         println "RuneLite injected client successfully dexed and bundled! (" + destJar.length() + " bytes)"
@@ -253,15 +607,208 @@ task downloadAndDexJar {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Host-side dexing of a third-party Plugin Hub plugin (Phase F).
+//
+// Hub jars are Java 11 .class jars, which ART cannot load, so they must be dexed.
+// This task dexes one plugin with the same d8 the asset pipeline uses and writes a
+// jar-in-jar the app can hand to a DexClassLoader:
+//
+//     ./gradlew :android:dexHubPlugin -PhubPlugin=<internalName>
+//     ./gradlew :android:dexHubPlugin -PpluginJar=/path/to/plugin.jar
+//
+// The output keeps the hub's file name (<internalName>_<jarHash>.jar) because that is
+// what the app looks up, and it keeps every non-class resource (runelite_plugin.json
+// lists the plugin classes; icons/audio are read at runtime) next to the .dex files.
+// ---------------------------------------------------------------------------
+task dexHubPlugin {
+    description = "Dexes a Plugin Hub jar so the app can load it from files/plugins"
+    doLast {
+        def hubBase = "https://repo.runelite.net/plugins"
+        def version = new File(project.ext.rlJarsDir, "version.txt").text.trim()
+        def work = new File(project.buildDir, "hub-dex")
+        def sourceDir = new File(work, "source")
+        def dexedDir = new File(work, "dexed")
+        sourceDir.mkdirs()
+        dexedDir.mkdirs()
+
+        def sha256base64url = { File f ->
+            java.util.Base64.getUrlEncoder().withoutPadding()
+                .encodeToString(java.security.MessageDigest.getInstance("SHA-256").digest(f.bytes))
+        }
+
+        def pluginJar = project.findProperty("pluginJar")
+        def internalName = project.findProperty("hubPlugin")
+        def jarHash = project.findProperty("jarHash")
+        File source
+        if (pluginJar) {
+            source = new File(pluginJar.toString())
+            if (!source.isFile()) {
+                throw new GradleException("pluginJar not found: " + source)
+            }
+            if (!jarHash) {
+                jarHash = sha256base64url(source)
+            }
+            if (!internalName) {
+                internalName = source.name.replaceAll(/\.jar$/, "")
+            }
+        } else if (internalName) {
+            def manifestUrl = hubBase + "/manifest/" + version + "_lite.js"
+            println "Fetching hub manifest " + manifestUrl
+            def manifest = new URL(manifestUrl).bytes
+            int sigLen = ((manifest[0] & 0xFF) << 24) | ((manifest[1] & 0xFF) << 16) |
+                         ((manifest[2] & 0xFF) << 8) | (manifest[3] & 0xFF)
+            def json = new String(manifest, 4 + sigLen, manifest.length - 4 - sigLen, "UTF-8")
+            def entry = new groovy.json.JsonSlurper().parseText(json).jars.find { it.internalName == internalName.toString() }
+            if (!entry) {
+                throw new GradleException("plugin '" + internalName + "' is not in the hub manifest for v" + version)
+            }
+            jarHash = entry.jarHash
+            println "  " + entry.displayName + " (" + entry.jarSize + " bytes)"
+            source = new File(sourceDir, internalName + "_" + jarHash + ".jar")
+            if (!source.isFile() || sha256base64url(source) != jarHash) {
+                def jarUrl = hubBase + "/jar/" + internalName + "_" + jarHash + ".jar"
+                println "  downloading " + jarUrl
+                source.withOutputStream { os -> new URL(jarUrl).openStream().withStream { is -> os << is } }
+                def actual = sha256base64url(source)
+                if (actual != jarHash) {
+                    source.delete()
+                    throw new GradleException("SHA-256 mismatch for " + internalName +
+                        "\n  manifest: " + jarHash + "\n  actual:   " + actual)
+                }
+            }
+        } else {
+            throw new GradleException("pass -PhubPlugin=<internalName> or -PpluginJar=<path>")
+        }
+        println "Plugin jar: " + source.absolutePath + " (" + source.length() + " bytes)"
+
+        def buildToolsDir = new File(android.sdkDirectory, "build-tools")
+        def latestBuildTool = buildToolsDir.listFiles()?.sort()?.last()
+        if (!latestBuildTool) {
+            throw new GradleException("No Android SDK build-tools found in " + buildToolsDir)
+        }
+        def d8Path = new File(latestBuildTool,
+            System.getProperty("os.name").toLowerCase().contains("windows") ? "d8.bat" : "d8")
+        def platformJar = new File(android.sdkDirectory, "platforms/android-34/android.jar")
+
+        def outDir = new File(work, "out")
+        if (outDir.exists()) {
+            outDir.deleteDir()
+        }
+        outDir.mkdirs()
+        println "Dexing with " + d8Path.absolutePath
+        exec {
+            commandLine d8Path.absolutePath, "--min-api", "26",
+                "--lib", platformJar.absolutePath,
+                "--output", outDir.absolutePath,
+                source.absolutePath
+        }
+
+        def outJar = new File(dexedDir, internalName + "_" + jarHash + ".jar")
+        outJar.delete()
+        new java.util.zip.ZipOutputStream(new java.io.FileOutputStream(outJar)).withStream { zos ->
+            outDir.eachFileRecurse { file ->
+                if (file.isFile() && file.name.endsWith(".dex")) {
+                    zos.putNextEntry(new java.util.zip.ZipEntry(file.name))
+                    file.withInputStream { is -> zos << is }
+                    zos.closeEntry()
+                }
+            }
+            new java.util.zip.ZipFile(source).withCloseable { zip ->
+                zip.entries().each { entry ->
+                    if (!entry.isDirectory() && !entry.name.endsWith(".class") && !entry.name.startsWith("META-INF/")) {
+                        zos.putNextEntry(new java.util.zip.ZipEntry(entry.name))
+                        zip.getInputStream(entry).withStream { is -> zos << is }
+                        zos.closeEntry()
+                    }
+                }
+            }
+        }
+        println "Dexed plugin: " + outJar.absolutePath + " (" + outJar.length() + " bytes)"
+        println "Install it with:"
+        println "  adb push " + outJar.absolutePath + " /sdcard/Android/data/" +
+            android.defaultConfig.applicationId + "/files/plugins/" + outJar.name
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Host link check (tools/HostLinkCheck.java).
+//
+// The RuneLite client jar is pre-compiled Java 11 bytecode: a class or member the app
+// dex does not provide is a NoClassDefFoundError / NoSuchMethodError on the device, at
+// whatever moment that code path first runs. This task resolves every JDK-surface
+// reference made by the client jar and by our own app classes against what the app dex
+// and the asset dex actually contain, and fails the build on any gap. Run it after
+// every change to core/ stubs or to the host shims:
+//
+//     ./gradlew :android:verifyHostLinks
+//
+// It is deliberately not wired into assembleRelease: it depends on the release javac
+// output and would otherwise block device builds while a stub is being written.
+// ---------------------------------------------------------------------------
+task verifyHostLinks {
+    description = "Resolves the client jar's JDK-surface references against the app's stubs"
+    dependsOn downloadAndDexJar
+    dependsOn ':core:compileJava'
+    dependsOn 'compileReleaseJavaWithJavac'
+    doLast {
+        def root = project.rootDir
+        def toolOut = new File(root, "build/tools")
+        toolOut.mkdirs()
+        def asmCp = buildscript.configurations.classpath.files
+            .findAll { it.name.startsWith('asm') }.join(File.pathSeparator)
+        def javac = new File(System.getProperty("java.home"), "bin/javac").absolutePath
+        exec {
+            commandLine javac, "-cp", asmCp, "-d", toolOut.absolutePath,
+                new File(root, "tools/HostLinkCheck.java").absolutePath
+        }
+
+        def coreClasses = new File(root, "core/build/classes/java/main")
+        def shimClasses = new File(project.buildDir, "host-shims/classes")
+        def androidClasses = new File(project.buildDir, "intermediates/javac/release/classes")
+        def cleanedClient = new File(project.buildDir, "temp-jars/client-cleaned.jar")
+        def cleanedInjected = new File(project.buildDir, "temp-jars/injected-client-cleaned.jar")
+
+        def provided = [coreClasses.absolutePath, androidClasses.absolutePath, shimClasses.absolutePath,
+                        new File(android.sdkDirectory, "platforms/android-34/android.jar").absolutePath]
+        provided += project.ext.rlJarsDir.listFiles()
+            .findAll { it.name.endsWith('.jar') && !it.name.contains('-runtime') }
+            .collect { it.absolutePath }
+        // core/ is checked as well as provided: its own stubs call each other (e.g.
+        // ActionEvent -> AWTEvent), and a missing member there is just as fatal on the
+        // device while invisible to the client-jar-only scan.
+        def use = [cleanedClient.absolutePath, cleanedInjected.absolutePath,
+                   androidClasses.absolutePath, shimClasses.absolutePath, coreClasses.absolutePath]
+
+        def cmd = ["java", "-cp", toolOut.absolutePath + File.pathSeparator + asmCp, "HostLinkCheck",
+                   "--provided"] + provided + ["--use"] + use
+        println "HostLinkCheck " + cmd.join(" ")
+        exec { commandLine cmd }
+    }
+}
+
 // Hook the task into the preBuild lifecycle
 project.afterEvaluate {
     tasks.findByName("preBuild").dependsOn(downloadAndDexJar)
+    // The android module compiles and dexes against the RuneLite runtime jars,
+    // so every JVM compile has to wait for syncRuneLiteJars (which is what puts
+    // build/rl-jars/*.jar on disk).
+    tasks.withType(JavaCompile).configureEach {
+        dependsOn syncRuneLiteJars
+    }
+    tasks.matching { it.name.startsWith("dex") || it.name.startsWith("mergeDex") }.configureEach {
+        dependsOn syncRuneLiteJars
+    }
 }
 
 configurations {
     all {
-        exclude group: 'com.google.guava', module: 'listenablefuture'
+        // jsr305 is provided by the asset dex (bootstrap.json ships it for RuneLite).
         exclude group: 'com.google.code.findbugs', module: 'jsr305'
+        // `listenablefuture` must NOT be excluded any more: Guava (which used to satisfy
+        // it) moved to the asset dex, and androidx's profileinstaller/
+        // AbstractResolvableFuture links against com.google.common.util.concurrent.
+        // ListenableFuture, so the app dex needs the standalone interface artifact.
     }
 }
 
@@ -269,9 +816,19 @@ dependencies {
     implementation project(':core')
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.11.0'
-    // Dependencies referenced by the injected client at runtime
-    implementation 'com.google.guava:guava:23.2-jre'
-    implementation 'org.slf4j:slf4j-api:1.7.25'
+
+    // RuneLite's own runtime (guice, gson, okhttp, guava, commons, protobuf, http-api,
+    // ...) is NOT an app-dex dependency: it is dexed into assets/runelite-dex.jar so
+    // RuneLite, its plugins and the host shims share one loader (see compileHostShims).
+    // The host reaches all of it by name through the child DexClassLoader.
+    implementation fileTree(dir: project.ext.rlJarsDir, include: ['slf4j-api-*.jar'])
+
+    // slf4j-simple is the slf4j binding that replaces RuneLite's logback: it
+    // prints net.runelite.* log.info/warn to System.err, which Android surfaces
+    // through logcat under the System.err tag.
+    implementation('org.slf4j:slf4j-simple:1.7.25') {
+        exclude group: 'org.slf4j', module: 'slf4j-api'
+    }
 }
 
 byte[] transformClassBytes(byte[] classBytes) {

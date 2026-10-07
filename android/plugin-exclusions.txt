@@ -1,0 +1,37 @@
+# Core RuneLite plugins the Android host does not load, one FQCN per line.
+#
+# Read by downloadAndDexJar when it writes runelite-plugin-index.txt (the plugin
+# list PluginManager.loadPlugins() is fed, because PluginManager's own Guava
+# ClassPath scan cannot work on ART). Anything listed here is still present in
+# the asset dex, it is simply never instantiated.
+#
+# Admission rule: the plugin delivers its function through the desktop Swing
+# client shell (config panel, plugin-owned window) or needs lwjgl / JNA / a
+# desktop web browser. The native side panel replaces the shell; it cannot host
+# foreign JPanels.
+#
+# BankTagsPlugin is deliberately NOT excluded: ClueScrollPlugin declares
+# @PluginDependency(BankTagsPlugin) and PluginManager refuses to instantiate a
+# plugin whose dependency is missing ("Unmet dependency for ClueScrollPlugin:
+# BankTagsPlugin"), so excluding bank tags would cost the clue-scroll overlays too.
+net.runelite.client.plugins.config.ConfigPlugin
+net.runelite.client.plugins.worldmap.WorldMapPlugin
+net.runelite.client.plugins.gpu.GpuPlugin
+net.runelite.client.plugins.devtools.DevToolsPlugin
+net.runelite.client.plugins.discord.DiscordPlugin
+net.runelite.client.plugins.hiscore.HiscorePlugin
+net.runelite.client.plugins.grandexchange.GrandExchangePlugin
+net.runelite.client.plugins.worldhopper.WorldHopperPlugin
+net.runelite.client.plugins.notes.NotesPlugin
+net.runelite.client.plugins.timetracking.TimeTrackingPlugin
+net.runelite.client.plugins.screenmarkers.ScreenMarkerPlugin
+net.runelite.client.plugins.skillcalculator.SkillCalculatorPlugin
+net.runelite.client.plugins.screenshot.ScreenshotPlugin
+net.runelite.client.plugins.loottracker.LootTrackerPlugin
+# startUp() builds its Swing panel, which cannot exist here:
+#   InfoPlugin    -> InfoPanel.<init>: JEditorPane.getEditorKit().getStyleSheet() NPE
+#   KourendLibrary-> GroupLayout.createParallelGroup().addComponent(...) NPE
+# Both are panel-only features (the info window / the library panel); the plugins
+# themselves never start, so they are excluded rather than left half-broken.
+net.runelite.client.plugins.info.InfoPlugin
+net.runelite.client.plugins.kourendlibrary.KourendLibraryPlugin
