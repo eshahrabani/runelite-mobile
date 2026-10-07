@@ -12,28 +12,6 @@ public class AWTBridge {
     public static volatile int activeWidth;
     public static volatile int activeHeight;
 
-    private final int[] rawPixels;
-    private final int width;
-    private final int height;
-
-    public AWTBridge(int width, int height) {
-        this.width = width;
-        this.height = height;
-        this.rawPixels = new int[width * height];
-    }
-
-    public int[] getRawPixels() {
-        return rawPixels;
-    }
-
-    public int getWidth() {
-        return width;
-    }
-
-    public int getHeight() {
-        return height;
-    }
-
     /**
      * MousePathSmoother generates human-like curves between coordinates.
      */
