@@ -1,16 +1,71 @@
 package java.awt;
 
+import java.awt.geom.Point2D;
+
 /**
  * AWT Point compatibility stub for Android runtime.
  */
-public class Point {
+public class Point extends Point2D {
     public int x;
     public int y;
 
     public Point() {}
-    
+
     public Point(int x, int y) {
         this.x = x;
         this.y = y;
+    }
+
+    public Point(Point p) {
+        this(p.x, p.y);
+    }
+
+    @Override
+    public double getX() {
+        return x;
+    }
+
+    @Override
+    public double getY() {
+        return y;
+    }
+
+    @Override
+    public void setLocation(double x, double y) {
+        this.x = (int) Math.floor(x + 0.5);
+        this.y = (int) Math.floor(y + 0.5);
+    }
+
+    public void setLocation(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    public void setLocation(Point p) {
+        setLocation(p.x, p.y);
+    }
+
+    public void translate(int dx, int dy) {
+        this.x += dx;
+        this.y += dy;
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (!(obj instanceof Point)) {
+            return false;
+        }
+        Point p = (Point) obj;
+        return x == p.x && y == p.y;
+    }
+
+    @Override
+    public int hashCode() {
+        return x * 31 + y;
+    }
+
+    @Override
+    public String toString() {
+        return "java.awt.Point[x=" + x + ",y=" + y + "]";
     }
 }
