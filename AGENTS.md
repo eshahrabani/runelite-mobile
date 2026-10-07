@@ -68,7 +68,12 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   client's Callbacks field): the client's own loop renders a frame and then
   calls back `callbacks.draw(buffer, Graphics, x, y)`; the proxy blits
   `buffer.getImage()` into the passed Graphics via `drawImage` (which fills
-  `AWTBridge.activePixels`); mouse hooks pass the event through. The app's
+  `AWTBridge.activePixels`); mouse hooks pass the event through. `drawImage`
+  is the per-frame hot path and has two bytecode paths (interpreted on this
+  device, so both matter): a 1:1 `System.arraycopy` per row when the requested
+  size equals the source size (the game's `drawImage(img, 0, 0, null)`), and a
+  divide-free nearest-neighbour accumulator loop for scaled draws (the splash
+  logo). The app's
   render thread must **not** call `client.paint()` — that blits the live frame
   while the client thread is rendering the next one (torn frames).
   Two port-side invariants keep the world visible; both are easy to break:
@@ -84,10 +89,13 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
      client-internal names (`yw.ef`, `yw.ah`, `fq.aq`, `fa.ak`) are
      version-specific and must be re-derived on a client bump
      (docs/telemetry-assessment.md §6).
-  2. The frame is presented as `pixel | 0xFF000000`. The software rasterizer
-     writes 3D pixels with alpha 0 and `canvas.drawBitmap` blends, so an
-     alpha-0 pixel is dropped and the previous surface content stays visible
-     (stale login-screen remnants).
+  2. The frame bitmap is drawn with alpha disabled
+     (`renderBitmap.setHasAlpha(false)`, created 765×503 in `surfaceChanged`).
+     The software rasterizer writes 3D pixels with alpha 0 and
+     `canvas.drawBitmap` blends, so an alpha-0 pixel of an *alpha* bitmap is
+     dropped and the previous surface content stays visible (stale login-screen
+     remnants). `setHasAlpha(false)` makes Skia treat the bitmap as opaque,
+     which is what the older `pixel | 0xFF000000` pass did per pixel.
   A no-op proxy leaves a static gray screen — this is the #1 thing to check if
   rendering "stops". The throttled `callbacks.draw` log prints `world=`/`bridge=`
   (non-zero pixel count + XOR checksum of the left three quarters) for the
@@ -125,10 +133,36 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
 - **Render loop is fixed 765×503** (the client's own frame size — `GAME_W` in
   MainActivity must match it): `appletPixels` (MainActivity) ↔
   `AWTBridge.activePixels/activeWidth/activeHeight`. Change all three
-  together. A render thread scales the buffer nearest-neighbor to the surface
-  size; it sleeps 500 ms when the client isn't running and only clears the
-  buffer then — the game overwrites every pixel via the frame blit. A debug
-  overlay + 5 s GameState log are drawn on top of the frame.
+  together. The render thread (`runRenderLoop`) blocks on `renderLock` until
+  `callbacks.draw` has bumped `frameSeq` — it never presents on a timer, and
+  each presented frame is exactly one client frame. Presentation is two native
+  calls: `renderBitmap.setPixels(appletPixels, …)` and one
+  `canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint)` that lets
+  Skia scale 765×503 to the surface (nearest-neighbour:
+  `scalePaint.setFilterBitmap(false)`). Do **not** reintroduce per-pixel Java
+  loops here — the old scale loop + `| 0xFF000000` pass cost 172-229 ms/frame
+  on a Pixel 8 Pro; this path costs ~12-15 ms of one core at 2244×1008.
+  The thread runs at `THREAD_PRIORITY_DISPLAY` and idles (no canvas lock) while
+  `renderBitmap == null`. A debug overlay + 5 s GameState log (`scaleMs=`) are
+  drawn on top of the frame.
+- **Frame pacing is client-side** (`FPS_TARGET = 60` in MainActivity):
+  `initialize()` is followed by `Client.setUnlockedFps(true)` +
+  `setUnlockedFpsTarget(FPS_TARGET)` (that order — turning unlocked fps off
+  clears the target). The default clock's `mo.xg` sets `mo.bd` once per 20 ms
+  catch-up batch, so the client presented only once per up-to-10 cycles
+  (~0.87 fps); the unlocked `mo.ag` clock sleeps to the `1e9/FPS_TARGET`
+  boundary and presents every rendered frame. Game ticks are unaffected.
+- **The client JAR must be AOT-compiled on the device** (this device runs
+  `dalvik.vm.usejit=false`, so interpreted code is ~10x slower): the app
+  pre-registers `files/runelite-dex.jar` with a `DexClassLoader` on every
+  launch (MainActivity step 5b) so the ART Service knows its class-loader
+  context, and the operator then runs
+  `cmd package compile -m speed -f --secondary-dex org.runelite.mobile`
+  (+ the same without `--secondary-dex`) after every client-jar update.
+  `pm art dump` must show `[status=speed]` — **not** `run-from-apk` and not
+  `[status=verify]`. The installed APK must not be debuggable: ART Service
+  rewrites `-m speed` to `verify` for debuggable packages, so AOT only works on
+  the release build (same debug signing key → `install -r` keeps app data).
 - **Touch input is wired**: ACTION_DOWN/MOVE/UP → MOUSE_PRESSED/DRAGGED/
   RELEASED/CLICKED, ACTION_SCROLL → MOUSE_WHEEL, dispatched to the client
   component itself, falling back to the canvas from `GameEngine.getCanvas()`

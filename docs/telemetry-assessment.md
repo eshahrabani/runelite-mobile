@@ -92,9 +92,10 @@ Notes:
   per-instance pixel target is re-pointed at the display buffer by
   `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a
   256×256 scratch and only the desktop runtime's resize path re-points it), and
-  the frame is presented as `pixel | 0xFF000000` because the rasterizer emits
-  alpha-0 3D pixels that `canvas.drawBitmap` would otherwise blend away. Both are
-  required for the world to be visible at all.
+  the 765×503 frame bitmap is drawn with alpha disabled
+  (`renderBitmap.setHasAlpha(false)`) because the rasterizer emits alpha-0 3D
+  pixels that `canvas.drawBitmap` would otherwise blend away. Both are required
+  for the world to be visible at all.
 - **OS fingerprint is truthful** (Linux/aarch64, no Windows spoofing); the JVM
   properties emulated are only the ones Android lacks.
 

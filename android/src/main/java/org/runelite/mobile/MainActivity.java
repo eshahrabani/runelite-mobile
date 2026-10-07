@@ -9,6 +9,7 @@ import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Paint;
+import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
 import android.os.Process;
@@ -53,14 +54,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "RuneLiteMobile";
     private static final int GAME_W = 765;
     private static final int GAME_H = 503;
+    /**
+     * Client frame-pacing target (Client.setUnlockedFpsTarget). The default
+     * card-deck clock presents once per 20 ms cycle batch, i.e. once per up to
+     * 10 cycles, which decouples the presented rate from the rendered rate; the
+     * unlocked clock sleeps to a 1e9/FPS_TARGET boundary instead.
+     */
+    private static final int FPS_TARGET = 60;
     private static final String PREFS_NAME = "RuneLiteMobilePrefs";
 
     // ── Rendering ───────────────────────────────────────────────────────────
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
-    private AWTBridge awtBridge;
     private volatile boolean isRunning = false;
     private Bitmap renderBitmap;
+    private int surfaceW, surfaceH;
+    /** Frame counter bumped by the callbacks.draw blit; the render thread waits on it. */
+    private long frameSeq, lastDrawnSeq;
+    private final Rect srcRect = new Rect();
+    private final Rect dstRect = new Rect();
+    private final Paint scalePaint = new Paint();
     private Paint debugPaint;
     private Paint highlightPaint;
     private static java.awt.Component clientInstance;
@@ -94,7 +107,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private EditText kbEdit;
     private String kbPrevText = "";
     private final Object renderLock = new Object();
-    private final int[] frameScratch = new int[GAME_W * GAME_H];
     private long lastListenerLog = 0;
     private Runnable loginReqTicker;
 
@@ -180,6 +192,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         highlightPaint.setColor(Color.YELLOW);
         highlightPaint.setTextSize(32f);
 
+        // Nearest-neighbour upscale of the 765x503 frame (today's look: the
+        // previous per-pixel loop sampled the same way).
+        scalePaint.setFilterBitmap(false);
+        scalePaint.setDither(false);
+
         // Bridge Desktop.browse() to the Android browser for in-game links
         java.awt.Desktop.openUrlHandler = url -> {
             try {
@@ -210,9 +227,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // 5b. Pre-register the game dex with ART so dex2oat can AOT it. This
         // device has dalvik.vm.usejit=false (JIT disabled), so without AOT the
-        // game runs interpreted (~0.2 fps). The DexClassLoader construction
-        // mirrors bootstrapGameClient exactly, which lets `cmd package compile
-        // --secondary-dex` record the class-loader context before login.
+        // game runs interpreted. The DexClassLoader construction mirrors
+        // bootstrapGameClient exactly, which records the class-loader context
+        // before login. AOT is an operator step (the app has no root and cannot
+        // run `pm compile` itself), re-run after every client-jar update:
+        //   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
+        //   adb shell cmd package compile -m speed -f org.runelite.mobile
+        //   adb shell pm art dump org.runelite.mobile   # expect [status=speed] on both
+        // The installed APK must NOT be debuggable: ART Service rewrites `-m
+        // speed` to `verify` for debuggable packages, and a verify-only odex
+        // still executes interpreted. Use the release build (signed with the
+        // debug key, so `install -r` keeps app data).
         try {
             File dexJar = new File(getFilesDir(), ClientUpdater.DEX_ASSET_NAME);
             if (dexJar.exists() && dexJar.length() > 0) {
@@ -1428,6 +1453,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                             long blitStart = System.nanoTime();
                                             synchronized (renderLock) {
                                                 ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
+                                                // Hand the completed frame to the render thread
+                                                // (it waits for frameSeq to change).
+                                                frameSeq++;
+                                                renderLock.notifyAll();
                                             }
                                             lastBlitNanos = System.nanoTime() - blitStart;
                                         }
@@ -1503,6 +1532,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             Method initializeMethod = gameEngineClass.getMethod("initialize");
             initializeMethod.invoke(clientObject);
             Log.i(TAG, "client.initialize() completed");
+
+            // Unlock the client's frame pacing so it presents at FPS_TARGET
+            // instead of once per 20 ms catch-up batch (the default clock's
+            // `mo.xg` sets `mo.bd` once per up-to-10-cycle run). Order matters:
+            // setUnlockedFps first, setUnlockedFpsTarget second (turning
+            // unlocked fps off clears the target).
+            try {
+                Class<?> clientIface = dexClassLoader.loadClass("net.runelite.api.Client");
+                clientIface.getMethod("setUnlockedFps", boolean.class).invoke(clientObject, true);
+                clientIface.getMethod("setUnlockedFpsTarget", int.class).invoke(clientObject, FPS_TARGET);
+                Log.i(TAG, "unlocked fps target=" + FPS_TARGET);
+            } catch (Throwable t) {
+                Log.w(TAG, "unlocked fps unavailable", t);
+            }
 
             updateStatus("RUNNING: Injected Client Active!");
             runOnUiThread(() -> Toast.makeText(this, "Game client initialized!", Toast.LENGTH_LONG).show());
@@ -2748,8 +2791,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     @Override
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
-        awtBridge = new AWTBridge(width, height);
-        renderBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        surfaceW = width;
+        surfaceH = height;
+        // The frame buffer is the client's own fixed 765x503 size; Skia scales
+        // it to the surface in drawBitmap (nearest-neighbour, see scalePaint).
+        renderBitmap = Bitmap.createBitmap(GAME_W, GAME_H, Bitmap.Config.ARGB_8888);
+        // The rasterizer writes 3D pixels with alpha 0. An alpha bitmap would
+        // have its alpha-0 pixels dropped by Skia's SRC_OVER blend, leaving the
+        // previous surface content visible (the "stale login-screen remnants"
+        // symptom); setHasAlpha(false) replaces the old `| 0xFF000000` pass.
+        renderBitmap.setHasAlpha(false);
+        srcRect.set(0, 0, GAME_W, GAME_H);
+        dstRect.set(0, 0, surfaceW, surfaceH);
     }
 
     @Override
@@ -2767,64 +2820,45 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void runRenderLoop() {
+        // The frame is presented with native calls only: one row copy of the
+        // client's 765x503 int[] into the bitmap and one scaled drawBitmap.
+        // DISPLAY priority keeps this thread scheduled while the client thread
+        // saturates the CPU with its software renderer.
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY);
         while (isRunning) {
-            if (clientInstance == null) {
-                // Nothing to render yet - idle so background work (updates,
-                // dexing) isn't starved by a 60fps no-op loop.
+            if (renderBitmap == null) {
+                // No surface yet - idle so background work (updates, dexing)
+                // isn't starved.
                 try {
-                    Thread.sleep(500);
+                    Thread.sleep(50);
                 } catch (InterruptedException ignored) {}
                 continue;
+            }
+            // Wait for the client's next completed frame (delivered by the
+            // callbacks.draw proxy). We must NOT present on a timer, nor call
+            // client.paint(): that blits the game's LIVE frame buffer while the
+            // client thread is rendering the next frame into it (torn frames).
+            long scaleStart;
+            synchronized (renderLock) {
+                while (isRunning && frameSeq == lastDrawnSeq) {
+                    try {
+                        renderLock.wait(100);
+                    } catch (InterruptedException ignored) {}
+                }
+                if (!isRunning) break;
+                lastDrawnSeq = frameSeq;
+                scaleStart = System.nanoTime();
+                renderBitmap.setPixels(appletPixels, 0, GAME_W, 0, 0, GAME_W, GAME_H);
             }
             Canvas canvas = null;
             try {
                 canvas = surfaceHolder.lockCanvas();
-                if (canvas != null && awtBridge != null) {
-                    // Only clear the applet when the game isn't running - the game
-                    // overwrites every pixel each frame via the callbacks.draw blit.
-                    if (clientInstance == null) {
-                        int stoneGray = 0xFF2B2824;
-                        java.util.Arrays.fill(appletPixels, stoneGray);
-                    }
-
-                    if (clientInstance != null) {
-                        // The client thread delivers completed frames via the
-                        // callbacks.draw proxy (drawImage under renderLock). We
-                        // must NOT call client.paint() here: it blits the game's
-                        // LIVE frame buffer while the client thread is rendering
-                        // the next frame into it, producing torn frames.
-                        long scaleStart = System.nanoTime();
-                        synchronized (renderLock) {
-                            System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
-                        }
-
-                        int[] destPixels = awtBridge.getRawPixels();
-                        int destW = awtBridge.getWidth();
-                        int destH = awtBridge.getHeight();
-
-                        // The game's software rasterizer writes 3D pixels as
-                        // 0x00RRGGBB (no alpha) while the 2D UI writes 0xFF... .
-                        // The frame is opaque, so force the alpha channel up before
-                        // handing it to canvas.drawBitmap: with alpha 0 the default
-                        // SRC_OVER blend drops every 3D pixel, leaving the previous
-                        // surface content visible (the "static login-screen
-                        // remnants with a live minimap" symptom).
-                        for (int y = 0; y < destH; y++) {
-                            int srcY = y * GAME_H / destH;
-                            int destRowOffset = y * destW;
-                            int srcRowOffset = srcY * GAME_W;
-                            for (int x = 0; x < destW; x++) {
-                                int srcX = x * GAME_W / destW;
-                                destPixels[destRowOffset + x] = frameScratch[srcRowOffset + srcX] | 0xFF000000;
-                            }
-                        }
-
-                        renderBitmap.setPixels(awtBridge.getRawPixels(), 0, awtBridge.getWidth(), 0, 0, awtBridge.getWidth(), awtBridge.getHeight());
-                        canvas.drawBitmap(renderBitmap, 0, 0, null);
-                        lastScaleNanos = System.nanoTime() - scaleStart;
-                    } else {
-                        System.arraycopy(appletPixels, 0, frameScratch, 0, appletPixels.length);
-                    }
+                if (canvas != null) {
+                    // One native capped draw: Skia scales the frame buffer to the
+                    // surface (nearest-neighbour, see scalePaint) and composites
+                    // it opaquely (setHasAlpha(false)).
+                    canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint);
+                    lastScaleNanos = System.nanoTime() - scaleStart;
 
                     canvas.drawText("RuneLite Mobile (AWT Bridge Active)", 40, 70, debugPaint);
                     canvas.drawText(loaderStatus, 40, 130, highlightPaint);
@@ -2876,9 +2910,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     surfaceHolder.unlockCanvasAndPost(canvas);
                 }
             }
-            try {
-                Thread.sleep(16);
-            } catch (InterruptedException ignored) {}
         }
     }
 
