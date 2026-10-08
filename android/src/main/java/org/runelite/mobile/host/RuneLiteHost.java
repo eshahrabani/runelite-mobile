@@ -496,6 +496,40 @@ public final class RuneLiteHost {
         return plugin.getClass().getSimpleName();
     }
 
+    /**
+     * The config interface a plugin uses, or {@code null} when it has none.
+     *
+     * <p>RuneLite does not expose a plugin's config through a method on the plugin: the
+     * {@code @ConfigGroup}-annotated interface is the type of an injected field (or the
+     * return type of a helper method, e.g. {@code getConfig(ConfigManager)}). The
+     * annotation is RUNTIME-retained and TYPE-targeted, so the type alone identifies it.
+     */
+    public static Class<?> pluginConfigClass(Object plugin) {
+        if (plugin == null) {
+            return null;
+        }
+        Class<? extends java.lang.annotation.Annotation> group;
+        try {
+            group = clientLoader().loadClass("net.runelite.client.config.ConfigGroup")
+                .asSubclass(java.lang.annotation.Annotation.class);
+        } catch (Throwable t) {
+            return null;
+        }
+        for (Class<?> c = plugin.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (f.getType().isAnnotationPresent(group)) {
+                    return f.getType();
+                }
+            }
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (m.getParameterCount() <= 1 && m.getReturnType().isAnnotationPresent(group)) {
+                    return m.getReturnType();
+                }
+            }
+        }
+        return null;
+    }
+
     // ------------------------------------------------------------------ reflection
     /** An instance of the named RuneLite class from the injector. */
     public static Object get(String className) throws Exception {

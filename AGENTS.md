@@ -285,6 +285,21 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   2. `Image.getGraphics()`/`BufferedImage.getGraphics()` must return a **`Graphics2D`**:
      `Hooks.draw` casts the result, and a plain `Graphics` is a `ClassCastException` on
      the first overlay pass.
+  3. The `java.awt.event.*` stubs must declare every member the client's own mouse/key
+     path calls — `MouseEvent.getPoint()`/`getComponent()`, `InputEvent.getModifiersEx()`
+     /`getModifiersExText(int)`, `KeyEvent.getKeyText(int)`/`getExtendedKeyCode()`
+     /`setKeyCode`/`setKeyChar`/`paramString`, the `(Component,…)` `MouseEvent` /
+     `MouseWheelEvent` / `Window(Window,int)` constructors. A missing one is a
+     device-only `NoSuchMethodError` thrown *inside* `emitPoint`/`deliverKeyEvent`,
+     which catches `Throwable`: the tap/key is then silently dropped while logcat still
+     shows the `Dispatch mouse id=501 …` line (that is what "taps no longer act on the
+     game" looked like). Two rules keep the stub set buildable: a hand-written stub must
+     have a **no-arg constructor** (`tools/gen_stubs.py` models a hand-written supertype
+     as "a plain class with a no-arg ctor" and emits `super()` into generated subclasses —
+     `ItemEvent`/`AdjustmentEvent` extend `java.awt.AWTEvent`), and a hand-written stub's
+     supertype must be hand-written too, because the generator only emits the classes the
+     client *names*: `java.awt.image.RGBImageFilter` exists by hand solely so
+     `javax.swing.GrayFilter` (which `ImageUtil.grayscaleImage` calls) can link.
   Text is the one thing core cannot do itself: `org.runelite.mobile.bridge.TextBridge`
   hands the TTF bytes to `org.runelite.mobile.AndroidTextRenderer` (app dex), which
   materialises them into `Typeface.Builder` (file-based — there is no `ByteBuffer`
@@ -300,6 +315,11 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   `PluginManager.setPluginEnabled` + `startPlugin`/`stopPlugin` on the UI thread; config
   forms are generated from `ConfigManager.getConfigDescriptor` (widgets chosen by the
   item's return type, writes through the config proxy setter so `ConfigChanged` fires).
+  A plugin's config interface is resolved the way RuneLite declares it — the
+  `@ConfigGroup`-annotated interface that is the type of an injected field, or of a
+  helper method's return type (`RuneLiteHost.pluginConfigClass`); there is no
+  `getConfig()` on a plugin, and one that has no config at all (`AccountPlugin`) gets
+  "this plugin has no configuration" instead of an error.
   RuneLite's Swing panels are never rendered: `ClientToolbar.addNavigation` records
   buttons in `PluginPanelRegistry`, and a plugin with a panel gets a "panel not available
   on mobile" note that opens its config instead.

@@ -45,8 +45,15 @@ public class AWTEvent extends EventObject {
         this.id = id;
     }
 
-    public AWTEvent(int id) {
-        this(null, id);
+    /**
+     * No-arg constructor required by {@code tools/gen_stubs.py}: it models a hand-written
+     * supertype as "a plain class with a no-arg constructor" and therefore emits
+     * {@code super()} into every generated subclass ({@code ItemEvent},
+     * {@code AdjustmentEvent}). {@code java.util.EventObject} rejects a null source, so a
+     * placeholder is used; nothing instantiates those event stubs.
+     */
+    public AWTEvent() {
+        this(AWTEvent.class, 0);
     }
 
     public int getID() {

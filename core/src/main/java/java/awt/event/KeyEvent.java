@@ -18,19 +18,55 @@ public class KeyEvent extends InputEvent {
     public static final int VK_SPACE = 32;
     public static final int VK_DELETE = 127;
 
-    private final int id;
-    private final char keyChar;
-    private final int keyCode;
+    private int keyCode;
+    private char keyChar;
 
-    public KeyEvent(Object source, int id, long when, int modifiers, int keyCode, char keyChar) {
-        this.id = id;
-        this.when = when;
-        this.modifiers = modifiers;
+    public KeyEvent(java.awt.Component source, int id, long when, int modifiers,
+                    int keyCode, char keyChar) {
+        super(source, id, when, modifiers);
         this.keyCode = keyCode;
         this.keyChar = keyChar;
     }
 
-    public int getID() { return id; }
     public int getKeyCode() { return keyCode; }
+
     public char getKeyChar() { return keyChar; }
+
+    public void setKeyCode(int keyCode) { this.keyCode = keyCode; }
+
+    public void setKeyChar(char keyChar) { this.keyChar = keyChar; }
+
+    /** Without a native keyboard mapping the extended code is the key code itself. */
+    public int getExtendedKeyCode() { return keyCode; }
+
+    /** {@code "Enter"}, {@code "Space"}, … for the VK_* constants declared here. */
+    public static String getKeyText(int keyCode) {
+        switch (keyCode) {
+            case VK_ENTER:
+                return "Enter";
+            case VK_ESCAPE:
+                return "Escape";
+            case VK_SPACE:
+                return "Space";
+            case VK_TAB:
+                return "Tab";
+            case VK_BACK_SPACE:
+                return "Backspace";
+            case VK_CLEAR:
+                return "Clear";
+            case VK_DELETE:
+                return "Delete";
+            case VK_SHIFT:
+                return "Shift";
+            case VK_CONTROL:
+                return "Ctrl";
+            default:
+                return "Key " + keyCode;
+        }
+    }
+
+    @Override
+    public String paramString() {
+        return super.paramString() + ",keyCode=" + keyCode + ",keyChar=" + keyChar;
+    }
 }

@@ -11,6 +11,7 @@ public class ActionEvent extends java.awt.AWTEvent {
     public static final int ALT_MASK = 8;
 
     private final String command;
+    private int modifiers;
 
     public ActionEvent(Object source, int id, String command) {
         super(source, id);
