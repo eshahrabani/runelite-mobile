@@ -462,12 +462,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             return;
         }
         try {
-            Object configClass = plugin.getClass().getMethod("getConfig").invoke(plugin);
-            if (!(configClass instanceof Class)) {
+            Class<?> iface = RuneLiteHost.pluginConfigClass(plugin);
+            if (iface == null) {
                 configList.addView(label("this plugin has no configuration", 12f, 0xFFB0B0B0));
                 return;
             }
-            Class<?> iface = (Class<?>) configClass;
             Object proxy = configManager.getClass().getMethod("getConfig", Class.class)
                 .invoke(configManager, iface);
             Class<?> configIface = RuneLiteHost.clientLoader()

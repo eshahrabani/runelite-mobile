@@ -11,14 +11,18 @@ public class MouseWheelEvent extends MouseEvent {
     private final int scrollAmount;
     private final int wheelRotation;
 
-    public MouseWheelEvent(Object source, int id, long when, int modifiers, int x, int y, int clickCount, boolean popupTrigger, int scrollType, int scrollAmount, int wheelRotation) {
-        super(source, id, when, modifiers, x, y, clickCount, popupTrigger, 0);
+    public MouseWheelEvent(java.awt.Component source, int id, long when, int modifiers,
+                           int x, int y, int clickCount, boolean popupTrigger,
+                           int scrollType, int scrollAmount, int wheelRotation) {
+        super(source, id, when, modifiers, x, y, clickCount, popupTrigger, NOBUTTON);
         this.scrollType = scrollType;
         this.scrollAmount = scrollAmount;
         this.wheelRotation = wheelRotation;
     }
 
     public int getScrollType() { return scrollType; }
+
     public int getScrollAmount() { return scrollAmount; }
+
     public int getWheelRotation() { return wheelRotation; }
 }
