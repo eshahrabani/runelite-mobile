@@ -23,7 +23,7 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
 - **`core/`** — java-library that compiles with
   `--limit-modules java.base,jdk.unsupported` (core/build.gradle) so it can
   define stub classes in the **`java.applet.*` / `java.awt.*` namespace**
-  (~85 files under `core/src/main/java/java/`). The game client paints into
+  (134 files under `core/src/main/java/java/`). The game client paints into
   these. Never remove the `--limit-modules` flag — it's what legally lets a
   `java.*` package compile outside the JDK.
 - **`core` stubs that replace missing Android JVM APIs**: `UnsafeHelper`
@@ -49,8 +49,10 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   others read it back). A plain `INVOKESTATIC` rewrite hands out a fresh array
   every evaluation and `client.init` then NPEs.
 - **`MainActivity.java`** is the launcher + game host. Flow: launcher screen
-  (sign in → character picker → Play) → Jagex login via two-leg OAuth in an
-  in-app WebView (`JagexOAuthClient` — see below) → bootstrap: emulate only
+  (sign in → character picker → Play) → Jagex login via two-leg OAuth driven
+  through the device's external browser (`Intent.ACTION_VIEW`) with a loopback
+  callback server (`JagexOAuthClient` / `LocalCallbackServer` — see below) →
+  bootstrap: emulate only
   the JVM properties Android lacks (`user.home`/`jagex.userhome` → files dir,
   `java.version` "11.0.22", `java.vendor`) — **the OS fingerprint is truthful**
   (Linux/aarch64, no Windows spoofing) → apply `JX_SESSION_ID`/
@@ -108,7 +110,9 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   `secure.runescape.com/m=weblogin/launcher-redirect`) then the consent client
   (`1fddee4e-b100-4f4e-b2b0-097f9088f9d2`, redirect `http://localhost`,
   `response_type=id_token code` — the id_token arrives in the URL **fragment**,
-  intercepted by `shouldOverrideUrlLoading`). Game session:
+  which a browser never sends to a server; `LocalCallbackServer` serves a page
+  whose JS POSTs the fragment back to `127.0.0.1:80`/`[::1]:80`, and
+  `handleConsentFragment` reads it there — there is no WebView). Game session:
   `auth.jagex.com/game-session/v1/sessions` → `sessionId`,
   `…/v1/accounts` (Bearer sessionId) → character picker. Legacy
   (`login_provider=runescape`) accounts are rejected with a message.
@@ -186,8 +190,13 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   client's own camera-drag path (`tk.aj() == 4` with its `bn.hc` setting, forced
   true for the gesture) to rotate yaw+pitch; the single-finger press is held off
   `TAP_PRESS_DELAY_MS` so a two-finger gesture can never fire a stray
-  walk/attack. Keyboard is NOT wired (no on-screen keyboard;
-  in-game chat is future work).
+  walk/attack. Keyboard is wired through a floating `KB` bar (hidden until the
+  client runs): an EditText whose `TextWatcher` diffs the text and emits a
+  `VK_BACK_SPACE` per removed char plus `dispatchKeyText(added)` for the
+  inserted run, with `Enter`/`Hide` buttons; `dispatchKeyText` sends
+  KEY_PRESSED + KEY_TYPED + KEY_RELEASED per char and `deliverKeyEvent` walks
+  `getKeyListeners()` on the client component and the canvas. It is an AWT
+  `KeyEvent` bridge, not an in-game IME.
 - **`ios/`** — RoboVM `IOSLauncher` skeleton only (empty UIWindow, no rendering).
 
 ## RuneLite plugin runtime (the third jar)
@@ -445,7 +454,7 @@ inputs**. The build downloads its own copies. Don't edit or depend on them.
 
 ## Repo state
 
-`git init`-ed but **zero commits** — every file is untracked, no history/PRs.
-`local.properties` holds the machine-specific `sdk.dir` — keep it out of any
-future VCS. No tests exist; manual verification is via the APK on a
-device/emulator.
+`master` with **17 commits**, clean working tree; `origin` is
+`https://github.com/eshahrabani/runelite-mobile.git`. `local.properties` holds the
+machine-specific `sdk.dir` and is already in `.gitignore`. No tests exist; manual
+verification is via the APK on a device/emulator.
