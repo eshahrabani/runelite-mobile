@@ -26,6 +26,11 @@ public interface Shape {
         return false;
     }
 
+    /** Hit test for a point; null is not contained. */
+    default boolean contains(java.awt.geom.Point2D p) {
+        return p != null && contains(p.getX(), p.getY());
+    }
+
     default boolean contains(int x, int y) {
         return contains((double) x, (double) y);
     }
@@ -37,6 +42,11 @@ public interface Shape {
     default boolean intersects(double x, double y, double w, double h) {
         Rectangle2D b = getBounds2D();
         return b != null && b.intersects(x, y, w, h);
+    }
+
+    /** Hit test for a rectangle; null never intersects. */
+    default boolean intersects(Rectangle2D r) {
+        return r != null && intersects(r.getX(), r.getY(), r.getWidth(), r.getHeight());
     }
 
     default boolean contains(double x, double y, double w, double h) {

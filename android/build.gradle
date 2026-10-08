@@ -55,21 +55,22 @@ def ClientUpdaterVersionFile = "client-version.txt"
 // RuneLite runtime artifact set. Every artifact is looked up in
 // https://static.runelite.net/bootstrap.json and verified against the manifest
 // SHA-256, so client / injected-client / runelite-api can never drift apart.
-// Desktop-only jars (discord, jna, lwjgl, flatlaf, rlawt, logback, jopt-simple)
-// are deliberately absent: the Android host replaces the Swing UI, never
-// constructs the GPU/Discord/JNA consumers, and logs through slf4j-simple
-// instead of logback.
+// Desktop-only jars (discord, jna, lwjgl, flatlaf, rlawt, logback) are deliberately
+// absent: the Android host replaces the Swing UI, never constructs the GPU/Discord/JNA
+// consumers, and logs through slf4j-simple instead of logback.
 // ---------------------------------------------------------------------------
 project.ext.rlJarsDir = new File(project.buildDir, "rl-jars")
 // Third-party runtime libraries the RuneLite client needs in the *app* dex
-// (Guice injector, Gson, OkHttp, commons, protobuf, slf4j-api). The three
+// (Guice injector, Gson, OkHttp, commons, protobuf, slf4j-api, jopt-simple -- the
+// last one is called from a shipped plugin, MusicPlugin.onScriptCallbackEvent, so it
+// is not "desktop-only"). The three
 // RuneLite-specific jars (client / injected-client / runelite-api) are NOT here:
 // they ship pre-dexed in assets/runelite-dex.jar so the in-app updater can
 // replace them without an APK release.
 project.ext.RL_RUNTIME_JAR_PREFIXES = [
     'http-api-', 'okhttp-', 'okio-', 'gson-', 'guice-', 'javax.inject-',
     'aopalliance-', 'guava-', 'commons-lang3-', 'commons-text-', 'slf4j-api-',
-    'protobuf-javalite-', 'json-', 'jsr305-',
+    'protobuf-javalite-', 'json-', 'jsr305-', 'jopt-simple-',
 ]
 project.ext.RL_JAR_PREFIXES = ['client-', 'injected-client-'] + project.ext.RL_RUNTIME_JAR_PREFIXES
 
@@ -766,22 +767,35 @@ task verifyHostLinks {
         def coreClasses = new File(root, "core/build/classes/java/main")
         def shimClasses = new File(project.buildDir, "host-shims/classes")
         def androidClasses = new File(project.buildDir, "intermediates/javac/release/classes")
-        def cleanedClient = new File(project.buildDir, "temp-jars/client-cleaned.jar")
-        def cleanedInjected = new File(project.buildDir, "temp-jars/injected-client-cleaned.jar")
+        def tempJars = new File(project.buildDir, "temp-jars")
+        def cleanedClient = new File(tempJars, "client-cleaned.jar")
+        def cleanedInjected = new File(tempJars, "injected-client-cleaned.jar")
+        def cleanedApi = new File(tempJars, "runelite-api-cleaned.jar")
 
         def provided = [coreClasses.absolutePath, androidClasses.absolutePath, shimClasses.absolutePath,
                         new File(android.sdkDirectory, "platforms/android-34/android.jar").absolutePath]
+        // The *cleaned* jars below are the ones that ship, so the runtime libraries must
+        // not be shadowed by the raw client/injected-client/api jars here: the raw
+        // injected-client has no $dync$ fields (they are emitted by transformClassBytes),
+        // and a raw copy of class `client` would hide the transformed one.
         provided += project.ext.rlJarsDir.listFiles()
-            .findAll { it.name.endsWith('.jar') && !it.name.contains('-runtime') }
+            .findAll { it.name.endsWith('.jar') && !it.name.contains('-runtime')
+                && !it.name.startsWith('client-') && !it.name.startsWith('injected-client-')
+                && !it.name.startsWith('runelite-api-') }
             .collect { it.absolutePath }
+        provided += [cleanedClient.absolutePath, cleanedInjected.absolutePath, cleanedApi.absolutePath]
         // core/ is checked as well as provided: its own stubs call each other (e.g.
         // ActionEvent -> AWTEvent), and a missing member there is just as fatal on the
-        // device while invisible to the client-jar-only scan.
-        def use = [cleanedClient.absolutePath, cleanedInjected.absolutePath,
+        // device while invisible to the client-jar-only scan. The api jar is checked
+        // too so the full api surface (gameval ID tables included) is covered.
+        def use = [cleanedClient.absolutePath, cleanedInjected.absolutePath, cleanedApi.absolutePath,
                    androidClasses.absolutePath, shimClasses.absolutePath, coreClasses.absolutePath]
 
         def cmd = ["java", "-cp", toolOut.absolutePath + File.pathSeparator + asmCp, "HostLinkCheck",
-                   "--provided"] + provided + ["--use"] + use
+                   "--provided"] + provided + ["--use"] + use +
+                   ["--ignore-list", new File(project.projectDir, "hostlink-ignore.txt").absolutePath,
+                    "--platform-extra",
+                    new File(project.projectDir, "hostlink-platform-extra.txt").absolutePath]
         println "HostLinkCheck " + cmd.join(" ")
         exec { commandLine cmd }
     }

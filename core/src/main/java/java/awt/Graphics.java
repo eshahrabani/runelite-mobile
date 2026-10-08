@@ -164,7 +164,8 @@ public class Graphics {
             int ty = (int) Math.round(transform.getTranslateY());
             drawLineDevice(x1 + tx, y1 + ty, x2 + tx, y2 + ty, colorARGB);
         } else {
-            double[] p = transform.transform(new double[] {x1, y1, x2, y2}, 0, new double[4], 0, 2);
+            double[] p = new double[4];
+            transform.transform(new double[] {x1, y1, x2, y2}, 0, p, 0, 2);
             drawLineDevice((int) Math.round(p[0]), (int) Math.round(p[1]),
                     (int) Math.round(p[2]), (int) Math.round(p[3]), colorARGB);
         }
@@ -174,7 +175,8 @@ public class Graphics {
         if (destPixels == null) {
             return;
         }
-        double[] p = transform.transform(new double[] {x1, y1, x2, y2}, 0, new double[4], 0, 2);
+        double[] p = new double[4];
+        transform.transform(new double[] {x1, y1, x2, y2}, 0, p, 0, 2);
         drawLineDevice((int) Math.round(p[0]), (int) Math.round(p[1]),
                 (int) Math.round(p[2]), (int) Math.round(p[3]), colorARGB);
     }
@@ -342,7 +344,8 @@ public class Graphics {
             dx += (int) Math.round(transform.getTranslateX());
             dy += (int) Math.round(transform.getTranslateY());
         } else {
-            double[] p = transform.transform(new double[] {x, y}, 0, new double[2], 0, 1);
+            double[] p = new double[2];
+            transform.transform(new double[] {x, y}, 0, p, 0, 1);
             dx = (int) Math.round(p[0]);
             dy = (int) Math.round(p[1]);
         }
@@ -478,7 +481,8 @@ public class Graphics {
     }
 
     protected int[] transformedBounds(double[] rect) {
-        double[] out = transform.transform(rect, 0, new double[8], 0, 4);
+        double[] out = new double[8];
+        transform.transform(rect, 0, out, 0, 4);
         double minX = Math.min(Math.min(out[0], out[2]), Math.min(out[4], out[6]));
         double maxX = Math.max(Math.max(out[0], out[2]), Math.max(out[4], out[6]));
         double minY = Math.min(Math.min(out[1], out[3]), Math.min(out[5], out[7]));
@@ -492,7 +496,8 @@ public class Graphics {
             return new int[] {x + (int) Math.round(transform.getTranslateX()),
                     y + (int) Math.round(transform.getTranslateY())};
         }
-        double[] p = transform.transform(new double[] {x, y}, 0, new double[2], 0, 1);
+        double[] p = new double[2];
+        transform.transform(new double[] {x, y}, 0, p, 0, 1);
         return new int[] {(int) Math.round(p[0]), (int) Math.round(p[1])};
     }
 

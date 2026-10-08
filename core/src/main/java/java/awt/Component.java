@@ -14,6 +14,12 @@ import java.util.List;
  * AWT Component compatibility stub for Android runtime.
  */
 public class Component implements Serializable {
+    /**
+     * One shared tree lock for the whole stub component tree, matching real AWT
+     * semantics where every component of a tree synchronizes on the same object.
+     */
+    protected static final Object TREE_LOCK = new Object();
+
     protected int x;
     protected int y;
     protected int width;
@@ -75,11 +81,41 @@ public class Component implements Serializable {
 
     public void validate() {}
 
+    public Object getTreeLock() { return TREE_LOCK; }
+
+    public boolean isDisplayable() {
+        // No native peer or displayable window is ever realised on this port.
+        return false;
+    }
+
+    public boolean isValid() {
+        // No layout pass runs on this port (validate() is a no-op), so the component
+        // never reaches AWT's "laid out" state.
+        return false;
+    }
+
+    public void setIgnoreRepaint(boolean ignoreRepaint) {
+        // No repaint machinery exists on this port; there is nothing for the flag to affect.
+    }
+
+    public Dimension getPreferredSize() {
+        // No layout manager runs, but callers dereference the result, so return the
+        // component's own stored size instead of null.
+        return getSize();
+    }
+
+    public void removeNotify() {
+        // No native peer to detach on this port.
+    }
+
     public synchronized void addMouseListener(MouseListener l) { mouseListeners.add(l); }
     public synchronized void removeMouseListener(MouseListener l) { mouseListeners.remove(l); }
     public synchronized void addMouseMotionListener(MouseMotionListener l) { mouseMotionListeners.add(l); }
+    public synchronized void removeMouseMotionListener(MouseMotionListener l) { mouseMotionListeners.remove(l); }
     public synchronized void addMouseWheelListener(MouseWheelListener l) { mouseWheelListeners.add(l); }
+    public synchronized void removeMouseWheelListener(MouseWheelListener l) { mouseWheelListeners.remove(l); }
     public synchronized void addKeyListener(KeyListener l) { keyListeners.add(l); }
+    public synchronized void removeKeyListener(KeyListener l) { keyListeners.remove(l); }
     public synchronized void addFocusListener(FocusListener l) { focusListeners.add(l); }
     public synchronized void removeFocusListener(FocusListener l) { focusListeners.remove(l); }
     public synchronized void addComponentListener(java.awt.event.ComponentListener l) { componentListeners.add(l); }

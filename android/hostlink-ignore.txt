@@ -1,0 +1,17 @@
+# Prefixes HostLinkCheck must not report. One per line; '#' starts a comment.
+#
+# A prefix matches either the *referenced owner* or the *referencing class*:
+#  - a referenced owner is a library/subsystem the port never loads (lwjgl, JNA, flatlaf);
+#  - a referencing class is a desktop-only consumer the port never runs (Updater).
+# Everything else is a real gap: it is fixed inside the port (runtime jar, core/ stub) or,
+# when the whole consumer cannot run here, by excluding its plugin from the index.
+# A gap *inside* a plugin that stays in the index is never fixed here.
+org/lwjgl/                                    # GPU/lwjgl consumers; GpuPlugin is excluded
+com/sun/jna/                                  # native/JNA consumers; WorldHopperPlugin is excluded
+net/runelite/discord/                         # DiscordPlugin is excluded
+net/runelite/rlawt/                           # desktop AWT shell
+ch/qos/logback/                               # slf4j-simple replaces logback on this port
+com/formdev/flatlaf/                          # host replaces the Swing laf; laf/ is stripped
+net/runelite/jshell/                          # DevToolsPlugin is excluded
+net/runelite/client/plugins/worldhopper/ping/ # JNA ping helper of an excluded plugin
+net/runelite/client/Updater                    # desktop self-updater; ClientUpdater.java replaces it (never executed)
