@@ -158,11 +158,21 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   launch (MainActivity step 5b) so the ART Service knows its class-loader
   context, and the operator then runs
   `cmd package compile -m speed -f --secondary-dex org.runelite.mobile`
-  (+ the same without `--secondary-dex`) after every client-jar update.
+  (+ the same without `--secondary-dex`) after every client-jar update — and
+  after **every APK install**: a new install lands in a new `/data/app/~~…==/`
+  dir, whose path+checksums are part of the class-loader context the odex is
+  keyed to, so ART rejects the existing `speed` odex (artd:
+  `kOatContextOutOfDate … ClassLoaderContext check failed`) and runs the
+  `verify` vdex instead.
   `pm art dump` must show `[status=speed]` — **not** `run-from-apk` and not
   `[status=verify]`. The installed APK must not be debuggable: ART Service
   rewrites `-m speed` to `verify` for debuggable packages, so AOT only works on
   the release build (same debug signing key → `install -r` keeps app data).
+  The app reports that state itself: the side panel's Host tab has a `client AOT`
+  row and the launcher version line turns red with `NOT AOT-COMPILED` when the
+  odex is stale or missing (`ClientUpdater.clientDexAotStatus` — an mtime
+  heuristic over `files/oat/<isa>/runelite-dex.odex` vs the jar/APK,
+  `AOT_UNKNOWN` when `files/oat` is unreadable).
 - **Touch input is wired**: ACTION_DOWN/MOVE/UP → MOUSE_PRESSED/DRAGGED/
   RELEASED/CLICKED, ACTION_SCROLL → MOUSE_WHEEL, dispatched to the client
   component itself, falling back to the canvas from `GameEngine.getCanvas()`
