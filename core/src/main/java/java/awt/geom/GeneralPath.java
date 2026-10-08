@@ -78,6 +78,15 @@ public class GeneralPath implements Shape {
         count++;
     }
 
+    /**
+     * Appends a line segment to {@code (x, y)}. The path stores single-precision
+     * coordinates, so this delegates to {@link #lineTo(float, float)} to keep a
+     * single implementation.
+     */
+    public void lineTo(double x, double y) {
+        lineTo((float) x, (float) y);
+    }
+
     public void closePath() {
         if (count > 0) {
             lineTo(xs[count - 1], ys[count - 1]);

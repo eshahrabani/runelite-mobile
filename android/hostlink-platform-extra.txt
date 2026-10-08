@@ -1,0 +1,17 @@
+# References the SHIPPED runtime resolves but android.jar does not model.
+#
+# Not an ignore list: an entry here means "the device runtime has this member", verified
+# by a reflection probe run on the attached device (Pixel 8 Pro, API 34): javac --release 11
+# probe class -> d8 --min-api 26 -> adb shell dalvikvm -cp /data/local/tmp/probe.dex Probe,
+# which printed e.g. "METHOD FOUND java.lang.ClassLoader.getPlatformClassLoader" and
+# "KEY_SETS_OK java.util.concurrent.ConcurrentHashMap$KeySetView". The gate still reports
+# every other reference to the same owner, and an entry that matches nothing is printed
+# as a warning, so a stale entry cannot hide a real gap.
+#
+# Member entries are `owner.name desc` (the kind prefix HostLinkCheck prints is dropped);
+# a bare `owner` is the class-presence form.
+java/lang/ClassLoader.getPlatformClassLoader ()Ljava/lang/ClassLoader;
+java/nio/file/Files.readString (Ljava/nio/file/Path;)Ljava/lang/String;
+java/nio/file/Files.writeString (Ljava/nio/file/Path;Ljava/lang/CharSequence;Ljava/nio/charset/Charset;[Ljava/nio/file/OpenOption;)Ljava/nio/file/Path;
+java/util/concurrent/ConcurrentHashMap.keySet ()Ljava/util/concurrent/ConcurrentHashMap$KeySetView;
+sun/misc/Unsafe

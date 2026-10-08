@@ -6,6 +6,8 @@ package java.awt;
 public class Frame extends Window {
     private String title = "";
     private boolean resizable = true;
+    /** Window state; default NORMAL (0). Nothing reads it on this port. */
+    private int state = 0;
 
     public Frame() {}
     
@@ -27,6 +29,10 @@ public class Frame extends Window {
 
     public boolean isResizable() {
         return resizable;
+    }
+
+    public void setState(int state) {
+        this.state = state;
     }
 
     public Insets getInsets() {

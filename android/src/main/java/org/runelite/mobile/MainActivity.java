@@ -33,6 +33,7 @@ import android.widget.Toast;
 
 import org.runelite.mobile.bridge.AWTBridge;
 import org.runelite.mobile.bridge.TextBridge;
+import org.runelite.mobile.host.PluginConformance;
 import org.runelite.mobile.host.RuneLiteHost;
 
 import java.io.BufferedReader;
@@ -106,6 +107,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private long lastDrawLog = 0;
     private long drawCount = 0;
     private boolean loggedRenderableDraw = false;
+
+    // ── Conformance instrumentation (read by PluginConformance) ─────────────
+    /**
+     * The client asks {@code callbacks.draw(Renderable, boolean)} for every world actor
+     * (mesh, shadow, overhead text, hint arrow). {@code entityDrawCalls} counts those
+     * questions, {@code entityDrawDenied} the ones RuneLite answered with "no" — which is
+     * how a hiding plugin (Entity Hider) becomes observable. {@code calls == 0} means the
+     * client never asks, i.e. nothing in the scene can be vetoed at all.
+     */
+    private static volatile long entityDrawCalls;
+    private static volatile long entityDrawDenied;
+    private static volatile long playerDrawCalls;
+    private static volatile long npcDrawCalls;
+    /** {@code net.runelite.api.Player}/{@code NPC}, resolved once through the client loader. */
+    private static volatile Class<?> playerInterface;
+    private static volatile Class<?> npcInterface;
+    /** Event-bus {@code post} calls since boot, keyed by the event object's class name. */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> eventPosts =
+        new java.util.concurrent.ConcurrentHashMap<>();
     private Button kbButton;
     private LinearLayout kbBar;
     private EditText kbEdit;
@@ -1467,12 +1487,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                     if (hostHooks != null) {
                                         // RenderCallbackManager.addEntity(): lets plugins veto/observe
                                         // entity rendering. Hooks answers true unless a plugin says no.
-                                        return hooksMethod(hostHooks, method).invoke(hostHooks, args);
+                                        Object renderable = args.length > 0 ? args[0] : null;
+                                        boolean allowed = Boolean.TRUE.equals(
+                                            hooksMethod(hostHooks, method).invoke(hostHooks, args));
+                                        countEntityDraw(renderable, allowed);
+                                        return allowed;
                                     }
                                     if (!loggedRenderableDraw) {
                                         loggedRenderableDraw = true;
                                         Log.i(TAG, "Callbacks.draw(Renderable,boolean) -> true");
                                     }
+                                    countEntityDraw(args.length > 0 ? args[0] : null, true);
                                     return Boolean.TRUE;
                                 }
                                 // Frame blit: copy the rendered game buffer into the graphics
@@ -1556,6 +1581,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             case "drawLayer":
                                 // Event-bus delivery and the overlay render passes. Delegating is
                                 // what makes plugins see game events and draw on every layer.
+                                // `post` and `postDeferred` both reach the bus (deferred ones at
+                                // the end of the client tick), so both are counted: the
+                                // conformance run needs to tell "the plugin subscribes but the
+                                // event never fires" from "the subscriber never got registered".
+                                // What this cannot see are the events RuneLite's own Hooks posts
+                                // straight to the bus (GameTick/BeforeRender are built inside
+                                // Hooks, never through this proxy).
+                                if (("post".equals(methodName) || "postDeferred".equals(methodName))
+                                    && args.length > 0 && args[0] != null) {
+                                    countEventPost(args[0].getClass().getName());
+                                }
                                 Object eventHooks = RuneLiteHost.hooks();
                                 if (eventHooks != null) {
                                     return hooksMethod(eventHooks, method).invoke(eventHooks, args);
@@ -2516,6 +2552,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return resolved;
     }
 
+    // ── Conformance instrumentation ─────────────────────────────────────────
+
+    /**
+     * Counts one {@code Callbacks.draw(Renderable, boolean)} question. See
+     * {@link #entityDrawCalls()} — Entity Hider's veto shows up as {@code denied}.
+     */
+    private void countEntityDraw(Object renderable, boolean allowed) {
+        entityDrawCalls++;
+        if (!allowed) {
+            entityDrawDenied++;
+        }
+        Class<?> player = playerInterface;
+        if (player == null) {
+            ClassLoader loader = RuneLiteHost.clientLoader();
+            if (loader == null) {
+                return;
+            }
+            try {
+                player = loader.loadClass("net.runelite.api.Player");
+                npcInterface = loader.loadClass("net.runelite.api.NPC");
+                playerInterface = player;
+            } catch (Throwable t) {
+                return;
+            }
+        }
+        if (renderable == null) {
+            return;
+        }
+        if (player.isInstance(renderable)) {
+            playerDrawCalls++;
+        } else if (npcInterface != null && npcInterface.isInstance(renderable)) {
+            npcDrawCalls++;
+        }
+    }
+
+    private static void countEventPost(String eventClass) {
+        eventPosts.computeIfAbsent(eventClass, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
+    }
+
+    /** How often the client asked whether a world entity may be drawn (since boot). */
+    public static long entityDrawCalls() {
+        return entityDrawCalls;
+    }
+
+    /** How often RuneLite answered that question with "no" (since boot). */
+    public static long entityDrawDenied() {
+        return entityDrawDenied;
+    }
+
+    /** How many of the counted entities were {@code net.runelite.api.Player}s. */
+    public static long playerDrawCalls() {
+        return playerDrawCalls;
+    }
+
+    /** How many of the counted entities were {@code net.runelite.api.NPC}s. */
+    public static long npcDrawCalls() {
+        return npcDrawCalls;
+    }
+
+    /** {@code post} calls the proxy saw for an event class, 0 when it never arrived. */
+    public static long eventPostCount(String eventClassName) {
+        java.util.concurrent.atomic.AtomicLong n = eventPosts.get(eventClassName);
+        return n == null ? 0L : n.get();
+    }
+
     /**
      * Throttled (2 s) frame diagnostic: the client's own frame content, the applet bridge
      * the render thread presents, the rasteriser palette invariant and the blit time.
@@ -2556,6 +2657,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             img.getWidth() - stripW, 0, img.getWidth(), Math.min(26, img.getHeight()))));
         pb.append(" ovl=").append(alwaysOnTopOverlayCount()).append("(").append(overlayNames).append(")");
         pb.append(" iface=").append(lastInterfaceDrawn).append("/").append(lastInterfaceOverlays);
+        // Cumulative entity-draw counters: `denied > 0` is a plugin vetoing entity
+        // rendering (e.g. Entity Hider). `p=`/`npc=` are the player/NPC subsets.
+        pb.append(" entities=").append(entityDrawCalls).append("/").append(entityDrawDenied)
+            .append("(p=").append(playerDrawCalls).append(" npc=").append(npcDrawCalls).append(")");
         // RuneLite's FPS overlay paints pure yellow (or red when it is enforcing a
         // limit) at the top-right of the frame; no game art in that strip uses those
         // colours, so a non-zero count is overlay pixels reaching the frame.
@@ -3162,6 +3267,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     long now = System.currentTimeMillis();
                     if (now - lastStateLog > 5000 && clientObject != null) {
                         lastStateLog = now;
+                        // adb trigger for the per-plugin conformance pass: the operator
+                        // drops conformance.request into the app-specific external files
+                        // dir, this consumes it and PluginConformance writes
+                        // conformance-report.txt next to it.
+                        File conformanceRequest = PluginConformance.requestFile(this);
+                        if (conformanceRequest.isFile() && conformanceRequest.delete()) {
+                            Log.i(TAG, "conformance requested via " + conformanceRequest.getAbsolutePath());
+                            runOnUiThread(() -> PluginConformance.run(this));
+                        }
                         try {
                             Class<?> clientInterface = clientClass.getClassLoader().loadClass("net.runelite.api.Client");
                             Object state = clientInterface.getMethod("getGameState").invoke(clientObject);

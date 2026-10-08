@@ -168,15 +168,30 @@ public class AffineTransform {
         return m00 * m11 - m01 * m10;
     }
 
-    /** Maps {@code ptSrc[srcOff..]} through this transform into {@code ptDst[destOff..]}. */
-    public double[] transform(double[] ptSrc, int srcOff, double[] ptDst, int destOff, int numPts) {
+    /**
+     * Maps {@code src[srcOff..srcOff+2*numPts)} through this transform into
+     * {@code dst[dstOff..dstOff+2*numPts)}. {@code src} and {@code dst} may be
+     * the same array: each point is read before it is written, so an in-place
+     * pass is safe. This is the JDK descriptor the client calls
+     * ({@code ([DI[DI I)V}), not the previous value-returning stub signature.
+     */
+    public void transform(double[] src, int srcOff, double[] dst, int dstOff, int numPts) {
         for (int i = 0; i < numPts; i++) {
-            double x = ptSrc[srcOff + i * 2];
-            double y = ptSrc[srcOff + i * 2 + 1];
-            ptDst[destOff + i * 2] = m00 * x + m01 * y + m02;
-            ptDst[destOff + i * 2 + 1] = m10 * x + m11 * y + m12;
+            double x = src[srcOff + i * 2];
+            double y = src[srcOff + i * 2 + 1];
+            dst[dstOff + i * 2] = m00 * x + m01 * y + m02;
+            dst[dstOff + i * 2 + 1] = m10 * x + m11 * y + m12;
         }
-        return ptDst;
+    }
+
+    /** Single-precision array form; math is done in double and rounded to float. */
+    public void transform(float[] src, int srcOff, float[] dst, int dstOff, int numPts) {
+        for (int i = 0; i < numPts; i++) {
+            float x = src[srcOff + i * 2];
+            float y = src[srcOff + i * 2 + 1];
+            dst[dstOff + i * 2] = (float) (m00 * x + m01 * y + m02);
+            dst[dstOff + i * 2 + 1] = (float) (m10 * x + m11 * y + m12);
+        }
     }
 
     /** Maps one point; returns {@code {x', y'}}. */

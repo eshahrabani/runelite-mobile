@@ -200,8 +200,12 @@ against the manifest SHA-256, so client/injected-client/api can never drift):
 superset of the manifest's `-runtime` flavor, because core plugins are compiled against
 the gameval ID tables it adds). All three are ASM-transformed and d8-dexed into `assets/runelite-dex.jar`, together with
 RuneLite's own runtime libraries (guice, gson, okhttp, okio, guava, commons-lang3/text,
-protobuf-javalite, json, jsr305, javax.inject, aopalliance, http-api) and the host shims
-(see below). The **app** dex keeps only the JRE stubs (`core/`), the Android host
+protobuf-javalite, json, jsr305, javax.inject, aopalliance, http-api, jopt-simple) and the host shims
+(see below). `jopt-simple` is *not* desktop-only: `MusicPlugin.onScriptCallbackEvent` calls
+`joptsimple.internal.Strings.isNullOrEmpty`, and without the jar that shipped plugin threw
+`NoClassDefFoundError` on every `ScriptCallbackEvent` (113× in one device log) while every
+loader counter stayed green — which is what the `verifyHostLinks` gate below now catches.
+The **app** dex keeps only the JRE stubs (`core/`), the Android host
 (`org.runelite.mobile.**`), `slf4j-api`/`slf4j-simple` (the slf4j binding; logback is not
 shipped) and the androidx dependencies. The split is load-bearing: **Guice lives in the
 asset dex because it has to resolve the types named in the shims' and plugins'
@@ -314,12 +318,33 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   hands the TTF bytes to `org.runelite.mobile.AndroidTextRenderer` (app dex), which
   materialises them into `Typeface.Builder` (file-based — there is no `ByteBuffer`
   constructor) and rasterises into a reused scratch `Bitmap`.
-- **Verification gates.** `./gradlew :android:verifyHostLinks` resolves every JDK-surface
-  reference the client jar and the app classes make against what the app dex + asset dex
-  provide, and fails on any gap (a missing class or a wrong descriptor is otherwise a
-  device-only `NoClassDefFoundError`/`NoSuchMethodError`). `GraphicsSelfTest` runs once
-  per host start and logs `GFX SELFTEST PASS`/`FAIL <case>` (shapes, alpha blending, the
-  opaque frame blit, text).
+- **Verification gates.** `./gradlew :android:verifyHostLinks` resolves every reference the
+  *shipped* classes make — the cleaned client jars (`temp-jars/{client,injected-client,
+  runelite-api}-cleaned.jar`, i.e. what d8 is fed, so `client.$dync$*` and the other
+  `transformClassBytes` output resolve against the transformed jar), plus `core/`, the app
+  dex classes and the host shims — against the app dex + asset dex + `android.jar` +
+  runtime jars, and fails on any gap (a missing class or a wrong descriptor is otherwise a
+  device-only `NoClassDefFoundError`/`NoSuchMethodError`). Two checked-in lists keep it
+  honest:
+  - `android/hostlink-ignore.txt` — prefixes of subsystems/consumers the port never runs
+    (`org/lwjgl/`, `com/sun/jna/`, `net/runelite/client/Updater`, …), each with a reason.
+    A prefix matches the *referenced owner* or the *referencing class*; a gap inside a
+    plugin that stays in the index is never fixed here.
+  - `android/hostlink-platform-extra.txt` — references `android.jar` does not model but the
+    *device* runtime resolves, verified by a reflection probe on the device
+    (`ClassLoader.getPlatformClassLoader`, `Files.readString/writeString`,
+    `ConcurrentHashMap.keySet()KeySetView`, `sun.misc.Unsafe`). It is not an ignore list:
+    an entry that matches nothing is printed as a warning, and everything else about the
+    same owner is still reported.
+  The tool also models the pipeline rather than the raw jars: d8's covariant-return rewrite
+  of the `java.nio.Buffer` family (`ByteBuffer.position(I)Buffer` in the shipped dex),
+  JVMS 5.4.3.3/5.4.3.4 call-site shapes (INVOKESTATIC on an interface, a virtual call
+  resolving to a superinterface method, `Object`'s public methods on an interface), the
+  array-typed constant-pool owners (`[Lnet/…;` from `ANEWARRAY`/enum `values()`), and the
+  signature-polymorphic `MethodHandle.invoke*`/`VarHandle` members. Each gap line names the
+  *referencing* class, which is what makes a failure actionable.
+  `GraphicsSelfTest` runs once per host start and logs `GFX SELFTEST PASS`/`FAIL <case>`
+  (shapes, alpha blending, the opaque frame blit, text).
 - **Native side panel** (`org.runelite.mobile.SidePanel`, opened from the `☰` button):
   Plugins / Config / Host tabs. Plugin enablement goes through
   `PluginManager.setPluginEnabled` + `startPlugin`/`stopPlugin` on the UI thread; config
@@ -333,6 +358,41 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   RuneLite's Swing panels are never rendered: `ClientToolbar.addNavigation` records
   buttons in `PluginPanelRegistry`, and a plugin with a panel gets a "panel not available
   on mobile" note that opens its config instead.
+  Two things the panel has to say out loud, because both were read as "this plugin is
+  broken": the Config tab renders a plugin's *enabled* state (`"<name> (disabled)"` in the
+  header plus an orange "config changes do nothing — tap to enable" row that flips the
+  flag), and the Host tab has a **Run plugin conformance** button (see the next bullet)
+  showing the last summary and the report path. A `Color` config item must be written as
+  the *decimal ARGB int* (`String.valueOf(color.getRGB())`) — that is what
+  `ConfigManager.objectToString` stores and `ColorUtil.fromString` reads back with
+  `Integer.decode` + `new Color(int, true)`; a hex string is silently lost (`"00FF00"`
+  decodes as *octal* → `NumberFormatException` → null).
+- **Plugin conformance run** (`org.runelite.mobile.host.PluginConformance`). The loader
+  counters all derive from successful *instantiation* (`index=114`, `N plugin(s) active`,
+  `141 overlays`) and say nothing about behaviour — a plugin can be listed as active and
+  still throw on its first event. This pass starts every plugin itself, measures it, and
+  puts the client back the way it found it: **subs** (declared `@Subscribe` methods vs
+  subscribers the bus actually holds), **ovl** (every overlay the plugin registered is
+  asked to render into a scratch 512×512 image — *on the client thread*, because
+  `Overlay.render` calls client getters that assert it), **cfg** (every `@ConfigItem` is
+  read, set to a different value through `ConfigManager` so `ConfigChanged` fires, read
+  back and restored), **rc** (entity render callbacks that appeared while it started) and
+  **probes** — `entityVeto` (the client's own `Callbacks.draw(Renderable, boolean)` counts,
+  so "hide NPCs" becomes a number), `menuEntry` (a synthetic `MenuEntryAdded` seeded from
+  the last real menu entry and posted through the real bus; a plugin that reacts neither
+  modifies nor appends entries is recorded as a skip, not a failure — a synthetic entry
+  cannot reproduce every plugin's target conditions) and `eventFlow` (per-event-class
+  `post`/`postDeferred` counts the proxy saw; `GameTick`/`BeforeRender` are posted by
+  RuneLite's own `Hooks` straight to the bus, so they are never asserted on). An exception
+  while the game is not `LOGGED_IN` is recorded as `SKIP(state)`, a link error always fails.
+  Trigger it from the Host tab or from adb (the render loop consumes the request file
+  every 5 s):
+  `adb shell "echo 1 > /sdcard/Android/data/org.runelite.mobile/files/conformance.request"`,
+  then `adb pull …/files/conformance-report.txt`; the summary also goes to logcat as
+  `CONFORMANCE: plugins=… pass=… fail=… skip=…`. Verified on the device logged in:
+  115/115 plugins reported, 0 FAIL, `subs=<n>/<n>` equal on every line, `cfg=<n>/0`,
+  `ovl=<n>/0`, `rc=1` and `entityVeto(entities=112 denied=24)` for `EntityHiderPlugin`
+  (denials stop the moment the plugin is stopped, so the veto is provably the plugin's).
 - **Third-party plugins are dexed on the device.** A hub jar is Java 11 `.class`
   bytecode, which ART cannot load, so `org.runelite.mobile.host.MobilePluginHub` scans
   `files/plugins/` (and the app-specific external dir, which is the adb-push drop box:
@@ -366,7 +426,11 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   (the `☰` handle still toggles it).
 - **Diagnostics.** The throttled `callbacks.draw` line prints `host=` (active plugins),
   `ovl=` per overlay layer with a couple of names, `iface=<id>/<overlays>` (the last
-  interface the client drew and how many overlays are registered for it), `yellow=`/`red=`
+  interface the client drew and how many overlays are registered for it),
+  `entities=<calls>/<denied>(p=<players> npc=<npcs>)` (cumulative since boot: how often the
+  client asked `callbacks.draw(Renderable, boolean)` and how often the answer was "no", so
+  a hiding plugin is visible as `denied > 0`; `calls=0` means nothing in the scene can be
+  vetoed at all), `yellow=`/`red=`
   (pixels of RuneLite's FPS-overlay text colour in the frame's top-right strip), plus the
   frame/palette/blit timing. Useful when an overlay "does not appear": `ABOVE_WIDGETS`
   overlays (the FPS overlay, infoboxes) are registered under *interface ids* and drawn from

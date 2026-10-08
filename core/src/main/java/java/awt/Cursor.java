@@ -11,6 +11,10 @@ public class Cursor {
         this.type = type;
     }
 
+    public int getType() {
+        return type;
+    }
+
     public static Cursor getPredefinedCursor(int type) {
         return new Cursor(type);
     }

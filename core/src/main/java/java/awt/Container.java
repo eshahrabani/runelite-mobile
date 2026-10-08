@@ -16,6 +16,27 @@ public class Container extends Component {
         return comp;
     }
 
+    public void add(Component comp, Object constraints) {
+        // Nothing is laid out on this port, so the constraint form is a no-op.
+    }
+
+    public Component getComponent(int index) {
+        return components.get(index);
+    }
+
+    public Insets getInsets() {
+        // No native window decorations exist on this port.
+        return new Insets(0, 0, 0, 0);
+    }
+
+    public void invalidate() {
+        // No layout pass runs on this port.
+    }
+
+    public void revalidate() {
+        // No layout pass runs on this port.
+    }
+
     public void remove(Component comp) {
         components.remove(comp);
     }

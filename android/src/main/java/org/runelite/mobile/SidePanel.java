@@ -27,6 +27,7 @@ import android.widget.Switch;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.runelite.mobile.host.PluginConformance;
 import org.runelite.mobile.host.PluginPanelRegistry;
 import org.runelite.mobile.host.RuneLiteHost;
 
@@ -452,9 +453,30 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         configPlugin = plugin;
         configList.removeAllViews();
         String name = RuneLiteHost.pluginName(plugin);
-        TextView header = label(name, 14f, 0xFFFFC83D);
+        boolean enabled = RuneLiteHost.isPluginEnabled(plugin);
+        TextView header = label(enabled ? name : name + " (disabled)", 14f, 0xFFFFC83D);
         header.setPadding(0, (int) (6 * density), 0, (int) (10 * density));
         configList.addView(header);
+
+        if (!enabled) {
+            // This list shows every plugin and edits config for all of them, but a
+            // disabled plugin does nothing with its config. Without this row that reads
+            // as "the setting has no effect / the plugin is broken" (it is how the
+            // Entity Hider report was produced), so say it and offer the one tap that
+            // fixes it.
+            TextView warn = label(name + " is disabled — config changes do nothing. Tap to enable.",
+                12f, 0xFFFF9800);
+            warn.setPadding(0, (int) (4 * density), 0, (int) (8 * density));
+            warn.setOnClickListener(v -> {
+                if (RuneLiteHost.setPluginEnabled(plugin, true)) {
+                    toast(name + " enabled");
+                } else {
+                    toast("could not enable " + name);
+                }
+                showConfigFor(plugin);
+            });
+            configList.addView(warn);
+        }
 
         Object configManager = RuneLiteHost.configManager();
         if (configManager == null) {
@@ -726,10 +748,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
 
     private String stringify(Object value) {
         if (value instanceof java.awt.Color) {
-            int rgb = ((java.awt.Color) value).getRGB();
-            int alpha = (rgb >>> 24) & 0xFF;
-            return alpha == 0xFF ? String.format("%06X", rgb & 0xFFFFFF)
-                : String.format("%08X", rgb);
+            // The decimal ARGB int, not hex: that is what ConfigManager.objectToString()
+            // writes for a Color and what ColorUtil.fromString() reads back
+            // (Integer.decode + new Color(int, true)). A hex string silently loses the
+            // write ("00FF00" decodes as octal -> NumberFormatException -> null).
+            return String.valueOf(((java.awt.Color) value).getRGB());
         }
         if (value instanceof Enum) {
             return ((Enum<?>) value).name();
@@ -759,6 +782,18 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             ? label("client AOT: " + aotText, 11f, 0xFFE57373)
             : hostLine("client AOT", aotText));
         hostList.addView(hostLine("on-device dexer", "unavailable"));
+        hostList.addView(hostLine("conformance", PluginConformance.isRunning()
+            ? "running…" : PluginConformance.lastSummary()));
+        Button conformance = new Button(activity);
+        conformance.setText("Run plugin conformance");
+        conformance.setTextSize(12f);
+        conformance.setEnabled(!PluginConformance.isRunning() && RuneLiteHost.isRunning());
+        conformance.setOnClickListener(v -> {
+            PluginConformance.run(activity);
+            toast("conformance running — report: "
+                + PluginConformance.reportFile(activity).getName());
+        });
+        hostList.addView(conformance);
         Button refresh = new Button(activity);
         refresh.setText("Refresh");
         refresh.setTextSize(12f);

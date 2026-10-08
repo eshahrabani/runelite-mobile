@@ -18,7 +18,7 @@ import java.awt.Point;
  * {@code Graphics.drawImage}'s opaque arraycopy fast path, while sprites built
  * as {@code TYPE_INT_ARGB} blend.
  */
-public class BufferedImage extends Image {
+public class BufferedImage extends Image implements java.awt.image.RenderedImage {
     public static final int TYPE_INT_RGB = 1;
     public static final int TYPE_INT_ARGB = 2;
     public static final int TYPE_INT_ARGB_PRE = 3;

@@ -442,26 +442,24 @@ public final class RuneLiteHost {
         }
     }
 
-    /** Enables/disables a plugin; must be called on the UI thread. */
+    /**
+     * Enables/disables a plugin and starts/stops it; must be called on the UI thread.
+     * Flushes the config so the enablement survives a force-stop (see
+     * {@link #flushConfig()}).
+     *
+     * <p>The enabled flag is set first on purpose: {@code PluginManager.startPlugin}
+     * refuses a plugin that is not enabled, so a disabled plugin can only be started by
+     * flipping the flag in the same step.
+     */
     public static boolean setPluginEnabled(Object plugin, boolean enabled) {
-        Object pm = pluginManager;
-        if (pm == null || plugin == null) {
+        if (!setPluginEnabledFlag(plugin, enabled)) {
             return false;
         }
-        try {
-            findMethod(pm.getClass(), "setPluginEnabled", 2).invoke(pm, plugin, enabled);
-            if (enabled) {
-                findMethod(pm.getClass(), "startPlugin", 1).invoke(pm, plugin);
-            } else {
-                findMethod(pm.getClass(), "stopPlugin", 1).invoke(pm, plugin);
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, (enabled ? "enable" : "disable") + " failed for " + pluginName(plugin), t);
-            return false;
+        boolean ok = enabled ? startPlugin(plugin) : stopPlugin(plugin);
+        if (ok) {
+            flushConfig();
         }
-        activePlugins = countActivePlugins();
-        flushConfig();
-        return true;
+        return ok;
     }
 
     public static boolean isPluginEnabled(Object plugin) {
@@ -474,6 +472,83 @@ public final class RuneLiteHost {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * The plugin's running state ({@code PluginManager.isPluginActive}). Distinct from
+     * {@link #isPluginEnabled}: a plugin can be enabled but not active, because
+     * {@code PluginManager.startPlugins} stops at the first plugin whose {@code startUp}
+     * throws and leaves the rest unstarted.
+     */
+    public static boolean isPluginActive(Object plugin) {
+        Object pm = pluginManager;
+        if (pm == null || plugin == null) {
+            return false;
+        }
+        try {
+            return Boolean.TRUE.equals(findMethod(pm.getClass(), "isPluginActive", 1).invoke(pm, plugin));
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Sets the enabled flag without starting/stopping or flushing. {@code
+     * PluginManager.startPlugin} refuses a plugin that is not enabled, so toggling the
+     * flag is what makes an otherwise disabled plugin startable.
+     */
+    public static boolean setPluginEnabledFlag(Object plugin, boolean enabled) {
+        Object pm = pluginManager;
+        if (pm == null || plugin == null) {
+            return false;
+        }
+        try {
+            findMethod(pm.getClass(), "setPluginEnabled", 2).invoke(pm, plugin, enabled);
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "setPluginEnabled(" + enabled + ") failed for " + pluginName(plugin), t);
+            return false;
+        }
+    }
+
+    /**
+     * Starts a plugin ({@code PluginManager.startPlugin}, which requires the enabled flag
+     * and the UI thread). No config flush: the conformance run toggles every plugin in one
+     * pass and flushes once at the end.
+     */
+    public static boolean startPlugin(Object plugin) {
+        Object pm = pluginManager;
+        if (pm == null || plugin == null) {
+            return false;
+        }
+        try {
+            if (!Boolean.TRUE.equals(findMethod(pm.getClass(), "startPlugin", 1).invoke(pm, plugin))) {
+                return false;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "start failed for " + pluginName(plugin), unwrap(t));
+            return false;
+        }
+        activePlugins = countActivePlugins();
+        return true;
+    }
+
+    /** Stops a plugin ({@code PluginManager.stopPlugin}); no config flush. */
+    public static boolean stopPlugin(Object plugin) {
+        Object pm = pluginManager;
+        if (pm == null || plugin == null) {
+            return false;
+        }
+        try {
+            if (!Boolean.TRUE.equals(findMethod(pm.getClass(), "stopPlugin", 1).invoke(pm, plugin))) {
+                return false;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "stop failed for " + pluginName(plugin), unwrap(t));
+            return false;
+        }
+        activePlugins = countActivePlugins();
+        return true;
     }
 
     /** The plugin's {@code @PluginDescriptor(name)} or its simple class name. */
@@ -535,6 +610,112 @@ public final class RuneLiteHost {
     public static Object get(String className) throws Exception {
         Class<?> type = clientLoader.loadClass(className);
         return injector.getClass().getMethod("getInstance", Class.class).invoke(injector, type);
+    }
+
+    /**
+     * How many entity render callbacks plugins registered ({@code RenderCallbackManager}'s
+     * own list). Non-zero is the precondition for the entity-draw probe: a plugin that
+     * vetoes rendering (Entity Hider) has to appear here first.
+     */
+    public static int renderCallbackCount() {
+        try {
+            Object manager = get("net.runelite.client.callback.RenderCallbackManager");
+            java.lang.reflect.Field field = manager.getClass().getDeclaredField("callbacks");
+            field.setAccessible(true);
+            Object callbacks = field.get(manager);
+            return callbacks instanceof java.util.Collection ? ((java.util.Collection<?>) callbacks).size() : -1;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * The overlays {@code plugin} registered, from {@code OverlayManager}'s own list.
+     * RuneLite keeps the plugin as a private field on {@code Overlay} (it owns the
+     * overlay's config group), which is the only way to attribute an overlay to a plugin.
+     */
+    public static List<Object> overlaysFor(Object plugin) {
+        Object manager = overlayManager;
+        if (manager == null || plugin == null) {
+            return Collections.emptyList();
+        }
+        List<Object> out = new ArrayList<>();
+        try {
+            java.lang.reflect.Field field = manager.getClass().getDeclaredField("overlays");
+            field.setAccessible(true);
+            Object overlays = field.get(manager);
+            if (!(overlays instanceof java.util.Collection)) {
+                return out;
+            }
+            for (Object overlay : (java.util.Collection<?>) overlays) {
+                java.lang.reflect.Field pluginField = overlayPluginField(overlay.getClass());
+                if (pluginField != null && pluginField.get(overlay) == plugin) {
+                    out.add(overlay);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "overlay attribution failed", t);
+        }
+        return out;
+    }
+
+    /** {@code overlaysFor(plugin).size()}; -1 when the manager is unavailable. */
+    public static int overlayCountFor(Object plugin) {
+        if (overlayManager == null || plugin == null) {
+            return -1;
+        }
+        return overlaysFor(plugin).size();
+    }
+
+    /** {@code Overlay.plugin}, found by walking the overlay's own hierarchy. */
+    private static java.lang.reflect.Field overlayPluginField(Class<?> overlayClass) {
+        for (Class<?> c = overlayClass; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field field = c.getDeclaredField("plugin");
+                field.setAccessible(true);
+                return field;
+            } catch (NoSuchFieldException ignored) {
+                // keep walking up
+            }
+        }
+        return null;
+    }
+
+    /**
+     * How many event-bus subscribers belong to {@code plugin}. This is the number a
+     * plugin's {@code @Subscribe} methods should have produced, and unlike the plugin
+     * counters it comes from the bus itself rather than from the loader.
+     *
+     * <p>Reached through {@code Multimap.values()} by reflection: the bus lives in the
+     * RuneLite dex and Guava is not on this dex's class path (see the class comment).
+     */
+    public static int subscriberCountFor(Object plugin) {
+        Object bus = eventBus;
+        if (bus == null || plugin == null) {
+            return -1;
+        }
+        try {
+            java.lang.reflect.Field field = bus.getClass().getDeclaredField("subscribers");
+            field.setAccessible(true);
+            Object subscribers = field.get(bus);
+            if (subscribers == null) {
+                return -1;
+            }
+            Object values = subscribers.getClass().getMethod("values").invoke(subscribers);
+            if (!(values instanceof java.util.Collection)) {
+                return -1;
+            }
+            int count = 0;
+            for (Object value : (java.util.Collection<?>) values) {
+                Object owner = value.getClass().getMethod("getObject").invoke(value);
+                if (owner == plugin) {
+                    count++;
+                }
+            }
+            return count;
+        } catch (Throwable t) {
+            return -1;
+        }
     }
 
     /**
