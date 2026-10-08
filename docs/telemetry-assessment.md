@@ -1,5 +1,9 @@
 # Client telemetry assessment
 
+**Audience:** developer
+**Read this when:** you need to know exactly what the running client can send to Jagex, or you are re-checking this port after a client version bump.
+**Verified against:** `android/build.gradle` `transformClassBytes`, `MainActivity.bootstrapGameClient`, `docs/rendering.md`, `docs/diagnostics.md`
+
 What this port can and cannot send to Jagex, and how to re-check it.
 
 ## 1. Purpose & scope
@@ -10,9 +14,12 @@ by mapping the client-side telemetry substrate that the app actually runs.
 - The port does **not** ship a client. At runtime it downloads RuneLite's official
   `injected-client` + `runelite-api` jars and runs them under `DexClassLoader`
   (`android/src/main/java/org/runelite/mobile/MainActivity.java`, bootstrap step 5).
-- The checked-in marker is `android/src/main/assets/client-version.txt` (**1.12.35**);
-  `ClientUpdater` re-downloads `static.runelite.net/bootstrap.json` at launch and
-  bakes/dexes whatever version is current (observed live: **1.13.1**).
+- The version marker `android/src/main/assets/client-version.txt` is **generated** by
+  `downloadAndDexJar` (the version pinned by `bootstrap.json`) and is gitignored; it is not
+  checked in. Its value in this working tree is **1.13.1**. On the device, `ClientUpdater`
+  fetches the *published* `client-version.txt` from the CI release base
+  (`BuildConfig.DIST_BASE`) and downloads the matching pre-dexed `runelite-dex.jar`; it never
+  fetches `bootstrap.json`.
 - The static reverse-engineering corpus is `~/git/re-osrs` (`java/BOT_DETECTION_J.md`,
   `java/DUPE_HUNT.md`, `java/JAVA_RE.md`), taken against `injected-client-1.12.38`.
   Class names are obfuscated per version; treat its names as the 1.12.x mapping and
@@ -50,9 +57,10 @@ Notes:
   (`MainActivity` bootstrap step 6) — the label never reaches the network here.
 - **Keys never go on the wire**: the only consumer of the keyboard queue is local
   widget dispatch (§1.1).
-- No third-party analytics/crash SDK is present in this app; `android/build.gradle`
-  depends only on `androidx.appcompat`, `com.google.android.material`, `guava`,
-  `slf4j-api` (ASM/R8 are build-script-only: `org.ow2.asm:*` is on the buildscript
+- No third-party analytics/crash SDK is present in this app; the `:android` module depends
+  only on `:core`, `androidx.appcompat:appcompat:1.6.1`, `com.google.android.material:material:1.11.0`,
+  an `slf4j-api-*.jar` picked out of the downloaded RuneLite jars, and `org.slf4j:slf4j-simple:1.7.25`
+  (ASM/R8 are build-script-only: `org.ow2.asm:*` is on the buildscript
   classpath, and d8 comes from the SDK build-tools — neither is an app dependency).
 
 ## 3. What the client does NOT send
