@@ -29,6 +29,64 @@ public class ClientUpdater {
     public static final String VERSION_FILE_NAME = "client-version.txt";
     private static final String SHA256_FILE = "runelite-dex.jar.sha256";
 
+    /** {@code cmd package compile} invocation that makes this dex AOT again (the app cannot run it). */
+    public static final String AOT_FIX_COMMAND =
+        "cmd package compile -m speed -f --secondary-dex org.runelite.mobile";
+
+    public static final int AOT_OK = 0;       // usable [status=speed] odex
+    public static final int AOT_STALE = 1;    // odex present but older than the APK/jar: ART runs the vdex (verify)
+    public static final int AOT_MISSING = 2;  // no odex at all
+    public static final int AOT_UNKNOWN = 3;  // files/oat unreadable: do not claim anything
+
+    /**
+     * Whether ART has a usable AOT odex for the client dex.
+     *
+     * <p>ART keys the odex to the invoking class-loader context, which embeds the base APK
+     * path plus the checksums of the APK and the dex. A new install therefore invalidates
+     * it, and with {@code dalvik.vm.usejit=false} the game then runs interpreted (~10x
+     * slower). This is a heuristic: the odex is stale when it is older than both inputs,
+     * which covers both the install case and a downloaded client-jar update.
+     */
+    public static int clientDexAotStatus(Context context) {
+        try {
+            File jar = new File(context.getFilesDir(), DEX_ASSET_NAME);
+            if (!jar.isFile()) {
+                return AOT_MISSING;
+            }
+            String odexName = DEX_ASSET_NAME.substring(0, DEX_ASSET_NAME.length() - 4) + ".odex";
+            File oatRoot = new File(context.getFilesDir(), "oat");   // oat/<isa>/runelite-dex.odex
+            File[] isaDirs = oatRoot.listFiles();
+            if (isaDirs == null) {
+                return AOT_UNKNOWN;
+            }
+            long newestOdex = 0;
+            for (File isaDir : isaDirs) {
+                File odex = new File(isaDir, odexName);
+                if (odex.isFile()) {
+                    newestOdex = Math.max(newestOdex, odex.lastModified());
+                }
+            }
+            if (newestOdex == 0) {
+                return AOT_MISSING;
+            }
+            long newestInput = Math.max(jar.lastModified(), new File(context.getPackageCodePath()).lastModified());
+            return newestOdex >= newestInput ? AOT_OK : AOT_STALE;
+        } catch (Throwable t) {
+            Log.w(TAG, "client dex AOT check failed: " + t);
+            return AOT_UNKNOWN;
+        }
+    }
+
+    /** One-line human description of {@link #clientDexAotStatus} for the UI and logcat. */
+    public static String clientDexAotText(Context context) {
+        switch (clientDexAotStatus(context)) {
+            case AOT_OK:      return "compiled (speed)";
+            case AOT_STALE:   return "stale - not AOT-compiled, game runs interpreted (~10x slower); fix: adb shell " + AOT_FIX_COMMAND;
+            case AOT_MISSING: return "missing - not AOT-compiled, game runs interpreted (~10x slower); fix: adb shell " + AOT_FIX_COMMAND;
+            default:          return "unknown (files/oat unreadable)";
+        }
+    }
+
     public interface ProgressListener {
         /** @param stage human-readable current phase, @param percent 0-100 overall,
          *               @param etaMillis estimated milliseconds remaining */

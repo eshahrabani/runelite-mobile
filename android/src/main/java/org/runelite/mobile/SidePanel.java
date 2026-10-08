@@ -752,6 +752,12 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         for (String entry : pluginFailures) {
             hostList.addView(label("  " + entry, 10f, 0xFFE57373));
         }
+        int aot = ClientUpdater.clientDexAotStatus(activity);
+        boolean aotBad = aot == ClientUpdater.AOT_STALE || aot == ClientUpdater.AOT_MISSING;
+        String aotText = ClientUpdater.clientDexAotText(activity);
+        hostList.addView(aotBad
+            ? label("client AOT: " + aotText, 11f, 0xFFE57373)
+            : hostLine("client AOT", aotText));
         hostList.addView(hostLine("on-device dexer", "unavailable"));
         Button refresh = new Button(activity);
         refresh.setText("Refresh");

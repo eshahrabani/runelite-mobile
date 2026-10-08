@@ -256,7 +256,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // game runs interpreted. The DexClassLoader construction mirrors
         // bootstrapGameClient exactly, which records the class-loader context
         // before login. AOT is an operator step (the app has no root and cannot
-        // run `pm compile` itself), re-run after every client-jar update:
+        // run `pm compile` itself), re-run after every client-jar update AND
+        // after every APK install: an install lands in a new /data/app/~~…==/
+        // dir, whose path+checksums are part of the class-loader context the
+        // odex is keyed to, so ART discards the `speed` odex and falls back to
+        // the `verify` vdex (interpreted, ~10x slower).
         //   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
         //   adb shell cmd package compile -m speed -f org.runelite.mobile
         //   adb shell pm art dump org.runelite.mobile   # expect [status=speed] on both
@@ -273,6 +277,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         } catch (Throwable t) {
             Log.w(TAG, "Pre-register dex failed: " + t.getMessage());
+        }
+
+        int aot = ClientUpdater.clientDexAotStatus(this);
+        if (aot != ClientUpdater.AOT_OK && aot != ClientUpdater.AOT_UNKNOWN) {
+            Log.w(TAG, "Client dex is NOT AOT-compiled: " + ClientUpdater.clientDexAotText(this)
+                + " -- dalvik.vm.usejit=false, so the game runs interpreted (~10x slower)");
+        } else {
+            Log.i(TAG, "Client dex AOT: " + ClientUpdater.clientDexAotText(this));
         }
 
         // 6. JIT sanity benchmark: proves whether ART is compiling hot code in
@@ -660,11 +672,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         String current = ClientUpdater.currentClientVersion(this);
         String installed = ClientUpdater.installedClientVersion(this);
-        if (!current.equals(installed)) {
-            tvVersion.setText("Client v" + installed + " (APK ships v" + current + ")");
-        } else {
-            tvVersion.setText("Client v" + current);
+        int aot = ClientUpdater.clientDexAotStatus(this);
+        boolean aotBad = aot == ClientUpdater.AOT_STALE || aot == ClientUpdater.AOT_MISSING;
+        tvVersion.setText(current.equals(installed)
+            ? "Client v" + current
+            : "Client v" + installed + " (APK ships v" + current + ")");
+        if (aotBad) {
+            tvVersion.append("\nNOT AOT-COMPILED - expect ~5 fps (Host tab)");
         }
+        tvVersion.setTextColor(aotBad ? 0xFFE57373 : 0xFF70707E);
         swJxMode.setChecked(signedIn);
         etSessionId.setText(sessionId);
         etCharacterId.setText(characterId);
