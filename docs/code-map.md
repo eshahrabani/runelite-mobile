@@ -37,7 +37,7 @@ stub contract.
 | `gradle.properties` | 1 | Single property: `android.useAndroidX=true`. |
 | `local.properties` | 8 | Local SDK path (`sdk.dir`) for the Android plugin. Gitignored — never commit it. |
 | `.gitignore` | 31 | Build outputs, the two generated assets (`android/src/main/assets/runelite-dex.jar`, `client-version.txt`), IDE files, and the root debug dumps listed at the end of this page. |
-| `AGENTS.md` | 451 | Agent brief. Not a build input; contains known drift relative to source. |
+| `AGENTS.md` | 507 | Agent brief. Not a build input; may drift from source — the source wins. |
 | `docs/telemetry-assessment.md` | - | Frame-rendering telemetry assessment (rasterizer/palette/interface-overlay instrumentation). Its obfuscated-name derivation method is the re-derivation procedure for a client bump. |
 | `.github/workflows/build.yml` | 104 | The only `.github` file. Weekly cron plus `workflow_dispatch`; builds the Android release, the unsigned iOS IPA, and publishes the release assets. Described in [build-and-release.md](build-and-release.md). |
 
@@ -47,16 +47,17 @@ module; see [core-stubs.md](core-stubs.md)).
 
 ## `android/` app sources
 
-Marker: `app`. Twelve files under `android/src/main/java/org/runelite/mobile/`, all compiled into
+Marker: `app`. Thirteen files under `android/src/main/java/org/runelite/mobile/`, all compiled into
 the app dex. Line counts are from this session.
 
 | Path | Lines | Classes defined | Owns |
 |---|---|---|---|
-| `MainActivity.java` | 3349 | `MainActivity` (extends `Activity`, implements `SurfaceHolder.Callback`) | Activity lifecycle, game boot, the render loop and `Callbacks` proxy, touch/key input, the OAuth/login flow, and the instrumentation surface. The largest file; hosts `bootstrapGameClient`, `bindSceneRasterizerToDisplay`, `runRenderLoop`, `dispatchMouseEvent`/`Wheel`, `toGameX`/`toGameY`, and the keyboard bridge (`kbBar`/`dispatchKeyText`/`deliverKeyEvent`). See [architecture.md](architecture.md), [rendering.md](rendering.md), [input.md](input.md). |
-| `SidePanel.java` | 825 | `SidePanel` (implements `PluginPanelRegistry.Listener`) | Native right-edge drawer with Plugins, Config, and Host tabs. Builds config widgets from `ConfigManager` descriptors, plugin enable toggles, and host status; `open`/`close`/`selectTab`/`showConfigFor`/`writeConfig`. See [side-panel.md](side-panel.md). |
+| `MainActivity.java` | 3733 | `MainActivity` (extends `Activity`, implements `SurfaceHolder.Callback`) | Activity lifecycle, game boot, the render loop and `Callbacks` proxy, touch/key input, the OAuth/login flow, and the instrumentation surface. The largest file; hosts `bootstrapGameClient`, `bindSceneRasterizerToDisplay`, `runRenderLoop`, `dispatchMouseEvent`/`Wheel`, `toGameX`/`toGameY`, the gesture router (`handleTwoFingerMove`, `startCameraDrag`/`endCameraDrag`), the launcher/boot-overlay UI, `applyGameInsets`, and the keyboard bridge (`kbBar`/`dispatchKeyText`/`deliverKeyEvent`). See [architecture.md](architecture.md), [rendering.md](rendering.md), [input.md](input.md). |
+| `UiTheme.java` | 103 | `UiTheme` (final, static helpers) | The port's palette and drawable helpers (`rounded`/`corners`/`ripple`/`tintSwitch`) shared by `MainActivity` and `SidePanel`; the only place the stone/gold colours are defined. |
+| `SidePanel.java` | 957 | `SidePanel` (implements `PluginPanelRegistry.Listener`) | Native right-edge chrome: the always-present column (chevron handle + `⌨` keyboard toggle) plus the drawer with Plugins, Config, and Host tabs. Builds config widgets from `ConfigManager` descriptors, plugin enable toggles, and host status; `setAvailable`/`occupiedWidthPx`/`toggle`/`selectTab`/`showConfigFor`/`writeConfig`. See [side-panel.md](side-panel.md). |
 | `host/RuneLiteHost.java` | 773 | `RuneLiteHost` | Boots the real RuneLite runtime (`PluginManager`, `EventBus`, `ConfigManager`, `OverlayManager`, `Hooks`/`Callbacks`) via reflection over the child loader; plugin index, `startPlugins`, config flush, navigation hook. See [plugin-runtime.md](plugin-runtime.md). |
 | `host/PluginConformance.java` | 989 | `PluginConformance` | Drives every indexed plugin and writes a per-plugin PASS/FAIL/SKIP report; metrics `subs`/`ovl`/`cfg`/`rc`; probes `entityVeto`/`menuEntry`/`eventFlow`. See [diagnostics.md](diagnostics.md). |
-| `ClientUpdater.java` | 304 | `ClientUpdater` | Downloads the pre-dexed `runelite-dex.jar` from `DIST_BASE`, verifies SHA-256, atomically installs it; AOT status mtime heuristic. See [client-updates.md](client-updates.md). |
+| `ClientUpdater.java` | 314 | `ClientUpdater` | Downloads the pre-dexed `runelite-dex.jar` from `DIST_BASE`, verifies SHA-256, atomically installs it; AOT status heuristic over the client jar's mtime (logs `AOT check: odex= jar= apk=`). See [client-updates.md](client-updates.md). |
 | `JagexOAuthClient.java` | 292 | `JagexOAuthClient` | Two-leg Jagex OAuth (launcher + consent) with PKCE: `buildAuthorizeUrl`/`buildConsentAuthorizeUrl`/`createChallenge`/`createSession`/`exchangeCode`/`listAccounts`/`refreshTokens`. See [login-and-sessions.md](login-and-sessions.md). |
 | `AndroidTextRenderer.java` | 285 | `AndroidTextRenderer` (implements `TextBridge.TextRenderer`) | Turns `Font` TTF bytes into `android.graphics.Typeface` and rasterises text draws into a reused scratch `Bitmap`. See [rendering.md](rendering.md). |
 | `host/MobilePluginHub.java` | 236 | `MobilePluginHub` | Loads sideloaded hub jars from `files/plugins` plus the app-external dir, one `DexClassLoader` per jar. See [third-party-plugins.md](third-party-plugins.md). |

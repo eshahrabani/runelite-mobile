@@ -183,20 +183,27 @@ effect. See [device-runbook.md](device-runbook.md) for the compile commands.
    `AOT_UNKNOWN` ("do not claim anything").
 4. For every ISA subdirectory, look for `oat/<isa>/runelite-dex.odex` and keep the newest
    mtime. If none exists → `AOT_MISSING`.
-5. Compare the newest odex mtime against
-   `max(runelite-dex.jar.lastModified(), getPackageCodePath().lastModified())`. If the
-   odex is at least as new → `AOT_OK`, else → `AOT_STALE`.
+5. Compare the newest odex mtime against `runelite-dex.jar.lastModified()` — the **client
+   dex**, not the APK. If the odex is at least as new → `AOT_OK`, else → `AOT_STALE`.
 6. Any `Throwable` → log `client dex AOT check failed: <t>` and return `AOT_UNKNOWN`.
+7. Every call also logs `AOT check: odex=<ms> jar=<ms> apk=<ms>` so the verdict can be
+   explained without guessing.
 
-The rationale, from the method's own javadoc: ART keys the odex to the invoking
-class-loader context, which embeds the base APK path plus the checksums of the APK and the
-dex. A new APK install therefore invalidates the odex, and a downloaded client-jar update
-changes the dex checksum — both covered by the timestamp rule above.
+**Why the APK mtime is not a validity input.** The earlier rule used
+`max(jar.lastModified(), getPackageCodePath().lastModified())`, which produced a permanent
+false `NOT AOT-COMPILED` after every install + recompile: measured on the target device,
+`pm art dump` reports `[status=speed]` for `files/runelite-dex.jar` while the odex file is
+still older than the freshly installed APK — ART does not rewrite an odex whose dex input
+is unchanged, so the file timestamp cannot see the operator's recompile. The actionable
+event (the client dex changing, i.e. a downloaded update or an APK that ships a different
+client) does move the jar's mtime, and that is what the rule now compares. `pm art dump`
+remains the ground truth for the install-dir case (see
+[device-runbook.md](device-runbook.md)).
 
 | Constant | Value | Meaning |
 |---|---|---|
 | `AOT_OK` | `0` | usable `[status=speed]` odex |
-| `AOT_STALE` | `1` | odex present but older than the APK/jar (ART runs the `verify` vdex) |
+| `AOT_STALE` | `1` | odex present but older than the client jar (ART runs the `verify` vdex) |
 | `AOT_MISSING` | `2` | no odex at all |
 | `AOT_UNKNOWN` | `3` | `files/oat` unreadable — claim nothing |
 

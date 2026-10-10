@@ -69,8 +69,18 @@ public class ClientUpdater {
             if (newestOdex == 0) {
                 return AOT_MISSING;
             }
-            long newestInput = Math.max(jar.lastModified(), new File(context.getPackageCodePath()).lastModified());
-            return newestOdex >= newestInput ? AOT_OK : AOT_STALE;
+            // Only the client dex (the jar) is a validity input here. Observed on the target
+            // device: after an APK install plus the operator's recompile, `pm art dump`
+            // reports [status=speed] for files/runelite-dex.jar while the odex file is still
+            // older than the freshly installed APK -- so comparing against the APK's mtime
+            // (the previous heuristic) reported a permanent false "NOT AOT-COMPILED" after
+            // every install + recompile. The mtimes of all three inputs are logged so the
+            // operator can see why the verdict was reached; `pm art dump` stays the ground
+            // truth (see docs/device-runbook.md).
+            long jarTime = jar.lastModified();
+            Log.i(TAG, "AOT check: odex=" + newestOdex + " jar=" + jarTime
+                + " apk=" + new File(context.getPackageCodePath()).lastModified());
+            return newestOdex >= jarTime ? AOT_OK : AOT_STALE;
         } catch (Throwable t) {
             Log.w(TAG, "client dex AOT check failed: " + t);
             return AOT_UNKNOWN;

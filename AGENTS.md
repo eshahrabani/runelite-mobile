@@ -141,14 +141,20 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   `callbacks.draw` has bumped `frameSeq` — it never presents on a timer, and
   each presented frame is exactly one client frame. Presentation is two native
   calls: `renderBitmap.setPixels(appletPixels, …)` and one
-  `canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint)` that lets
-  Skia scale 765×503 to the surface (nearest-neighbour:
-  `scalePaint.setFilterBitmap(false)`). Do **not** reintroduce per-pixel Java
-  loops here — the old scale loop + `| 0xFF000000` pass cost 172-229 ms/frame
-  on a Pixel 8 Pro; this path costs ~12-15 ms of one core at 2244×1008.
-  The thread runs at `THREAD_PRIORITY_DISPLAY` and idles (no canvas lock) while
-  `renderBitmap == null`. A debug overlay + 5 s GameState log (`scaleMs=`) are
-  drawn on top of the frame.
+  `canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)` that lets
+  Skia scale 765×503 into the **letterbox fit rect** (nearest-neighbour:
+  `scalePaint.setFilterBitmap(false)`); four `drawRect`s paint the bars around
+  it first, because the surface buffer is not cleared by the system. Do **not**
+  reintroduce per-pixel Java loops here — the old scale loop + `| 0xFF000000`
+  pass cost 172-229 ms/frame on a Pixel 8 Pro; this path costs ~12-15 ms of one
+  core at 2244×1008. The thread runs at `THREAD_PRIORITY_DISPLAY` and idles (no
+  canvas lock) while `renderBitmap == null`. Nothing is drawn on the canvas: the
+  loader's progress lives in a themed boot overlay (`bootOverlay`/`tvBootStatus`,
+  hidden by the first presented frame), and the 5 s GameState log (`scaleMs=`)
+  is logcat-only. `surfaceChanged` recomputes `fitLeft/Top/W/H` and logs
+  `surface <w>x<h> fit <w>x<h> at <l>,<t>` — the same surface is inset by the
+  right-edge chrome, so opening the drawer fires a resize and the game
+  reletterboxes instead of being overlapped (`applyGameInsets`).
 - **Frame pacing is client-side** (`FPS_TARGET = 60` in MainActivity):
   `initialize()` is followed by `Client.setUnlockedFps(true)` +
   `setUnlockedFpsTarget(FPS_TARGET)` (that order — turning unlocked fps off
@@ -161,8 +167,11 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   pre-registers `files/runelite-dex.jar` with a `DexClassLoader` on every
   launch (MainActivity step 5b) so the ART Service knows its class-loader
   context, and the operator then runs
-  `cmd package compile -m speed -f --secondary-dex org.runelite.mobile`
-  (+ the same without `--secondary-dex`) after every client-jar update — and
+  `cmd package compile -m speed -f org.runelite.mobile` **then**
+  `cmd package compile -m speed -f --secondary-dex org.runelite.mobile` — that order, the
+  `--secondary-dex` pass last: compiling the package without it rewrites the app's oat state and
+  drops the client dex back to `verify`, so the documented reverse order leaves the game
+  interpreted — after every client-jar update — and
   after **every APK install**: a new install lands in a new `/data/app/~~…==/`
   dir, whose path+checksums are part of the class-loader context the odex is
   keyed to, so ART rejects the existing `speed` odex (artd:
@@ -174,9 +183,13 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   the release build (same debug signing key → `install -r` keeps app data).
   The app reports that state itself: the side panel's Host tab has a `client AOT`
   row and the launcher version line turns red with `NOT AOT-COMPILED` when the
-  odex is stale or missing (`ClientUpdater.clientDexAotStatus` — an mtime
-  heuristic over `files/oat/<isa>/runelite-dex.odex` vs the jar/APK,
-  `AOT_UNKNOWN` when `files/oat` is unreadable).
+  odex is stale or missing (`ClientUpdater.clientDexAotStatus` — a heuristic over
+  `files/oat/<isa>/runelite-dex.odex` vs the **client jar's** mtime, logging
+  `AOT check: odex=… jar=… apk=…`; `AOT_UNKNOWN` when `files/oat` is unreadable).
+  Comparing against the APK's mtime instead was a permanent false alarm after
+  every install + recompile (ART does not rewrite an odex whose dex input is
+  unchanged), so the APK is logged but not compared; `pm art dump` is the ground
+  truth.
 - **Touch input is wired**: ACTION_DOWN/MOVE/UP → MOUSE_PRESSED/DRAGGED/
   RELEASED/CLICKED, ACTION_SCROLL → MOUSE_WHEEL, dispatched to the client
   component itself, falling back to the canvas from `GameEngine.getCanvas()`
@@ -185,18 +198,47 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   moves before it presses, and the client's own menus (the world list) select
   the **hovered** row (`ar.bf` selects `dr`, set from `tk.af`/`tk.ac`, not from
   the press position), so without that move a tap acts on wherever the previous
-  gesture left the cursor. A **two-finger drag** instead emits a middle-button
-  (`BUTTON2`) press/drag/release at the two-finger centroid, which drives the
-  client's own camera-drag path (`tk.aj() == 4` with its `bn.hc` setting, forced
-  true for the gesture) to rotate yaw+pitch; the single-finger press is held off
-  `TAP_PRESS_DELAY_MS` so a two-finger gesture can never fire a stray
-  walk/attack. Keyboard is wired through a floating `KB` bar (hidden until the
-  client runs): an EditText whose `TextWatcher` diffs the text and emits a
-  `VK_BACK_SPACE` per removed char plus `dispatchKeyText(added)` for the
-  inserted run, with `Enter`/`Hide` buttons; `dispatchKeyText` sends
-  KEY_PRESSED + KEY_TYPED + KEY_RELEASED per char and `deliverKeyEvent` walks
-  `getKeyListeners()` on the client component and the canvas. It is an AWT
-  `KeyEvent` bridge, not an in-game IME.
+  gesture left the cursor. Camera rotation is a middle-button (`BUTTON2`) drag,
+  which drives the client's own camera-drag path (`tk.aj() == 4` with its `bn.hc`
+  setting, forced true for the gesture) to rotate yaw+pitch. Five gestures reach
+  it, all routed by `setupTouchInput`. **The left press is deferred** — `ACTION_DOWN`
+  sends only `MOUSE_MOVED` and arms a `LONG_PRESS_MS` (400 ms) timer, because the
+  client acts on mouse *down* (verified on the device: holding a press on the
+  login screen's `Play Now` started the login while the finger was still down),
+  so an early press would walk/attack before any long-press timer could fire.
+  A single finger then decides by movement alone:
+  **moved > `ROTATE_LOCK_DP` (10 dp), any time** → camera drag (no time window:
+  a 250 ms window used to steal slow rotations, because the first `ACTION_MOVE`
+  of a fast drag can arrive late while the UI thread renders the game);
+  **still for `LONG_PRESS_MS` (400 ms)** → `fireLongPress` → `emitRightClick` at
+  the published cursor + `suppressUntilUp`, i.e. the context menu; **lift** →
+  `beginTapPress` sends the deferred press + release + click. A press is only
+  ever sent on lift, so a drag can never walk or attack — the trade-off is that
+  dragging inside an interface rotates the camera rather than dragging an item.
+  **two-finger rotate vs pinch** — a second finger locks the mode once
+  (`handleTwoFingerMove`) and cancels the long press: centroid moved >
+  `ROTATE_LOCK_DP` → rotate, span changed > `ZOOM_LOCK_DP` (14 dp) and more than
+  the centroid moved → `MOUSE_WHEEL` notches (`ZOOM_DP_PER_NOTCH` 28 dp, ≤ 3 per
+  event, sign negated so fingers-apart zooms **in** — verified on the device),
+  which is the client's own wheel input (camera zoom in the world, list scrolling
+  with an interface open), never a button press; a **two-finger tap** (both
+  fingers down and up within 400 ms with neither lock crossed) is the second
+  route to the **right click**. Every rotation path goes through
+  `startCameraDrag`, which emits a `MOUSE_MOVED` at the centroid **before** the
+  `BUTTON2` press: the client measures its first drag delta against the
+  *published* cursor position, so pressing without that move rotates by
+  (centroid − the finger's start) — the one-time camera jump. Keyboard is wired
+  through the side panel's right-edge column: the `⌨` tile (foot of the column,
+  the only always-present chrome) toggles the keyboard bar, whose EditText
+  `TextWatcher` diffs the text and emits a `VK_BACK_SPACE` per removed char plus
+  `dispatchKeyText(added)` for the inserted run, with `Enter`/`Hide` pills;
+  `dispatchKeyText` sends KEY_PRESSED + KEY_TYPED + KEY_RELEASED per char and
+  `deliverKeyEvent` walks `getKeyListeners()` on the client component and the
+  canvas (the game registers its `KeyListener` on the canvas — `to.sk`, the same
+  object `GameEngine.getCanvas()` returns). The bar is anchored to the **top** of
+  the game area: with Gboard up in landscape a bottom-anchored bar is covered,
+  and so is the game's own chat input line. It is an AWT `KeyEvent` bridge, not
+  an in-game IME.
 - **`ios/`** — RoboVM `IOSLauncher` skeleton only (empty UIWindow, no rendering).
 
 ## RuneLite plugin runtime (the third jar)
@@ -354,8 +396,14 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   *referencing* class, which is what makes a failure actionable.
   `GraphicsSelfTest` runs once per host start and logs `GFX SELFTEST PASS`/`FAIL <case>`
   (shapes, alpha blending, the opaque frame blit, text).
-- **Native side panel** (`org.runelite.mobile.SidePanel`, opened from the `☰` button):
-  Plugins / Config / Host tabs. Plugin enablement goes through
+- **Native side panel** (`org.runelite.mobile.SidePanel`, opened from the `‹`/`›` chevron on the
+  always-present right-edge column):
+  Plugins / Config / Host tabs. The column is 44 dp wide and holds the chevron handle plus the
+  `⌨` keyboard toggle; an open drawer adds `min(42% of the screen width, 380 dp)`. It **takes
+  space** rather than floating: `MainActivity.applyGameInsets` insets the game `SurfaceView` and
+  the keyboard bar by `sidePanel.occupiedWidthPx()`, so a toggle resizes the surface and the game
+  reletterboxes (the column is hidden on the launcher screen by `setAvailable(false)`). The drawer
+  header carries the `⌂` launcher shortcut; there are no floating ⚙/☰/KB buttons any more. Plugin enablement goes through
   `PluginManager.setPluginEnabled` + `startPlugin`/`stopPlugin` on the UI thread; config
   forms are generated from `ConfigManager.getConfigDescriptor` (widgets chosen by the
   item's return type, writes through the config proxy setter so `ConfigChanged` fires).
@@ -431,8 +479,7 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   Verified: enable FPS Control in the panel (`host=65p` → `66p`), `am force-stop`,
   relaunch → `66 plugin(s) active`. The side panel's own UI state (open/closed, tab)
   lives in `SharedPreferences` and persists too. The panel is a `rootLayout` child added
-  *before* the login overlay, so the launcher overlay covers the drawer while it is up
-  (the `☰` handle still toggles it).
+  *before* the login overlay, so the login overlay covers the drawer while it is up.
 - **Diagnostics.** The throttled `callbacks.draw` line prints `host=` (active plugins),
   `ovl=` per overlay layer with a couple of names, `iface=<id>/<overlays>` (the last
   interface the client drew and how many overlays are registered for it),

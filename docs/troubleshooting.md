@@ -11,16 +11,19 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 
 ## Static grey screen (rendering never starts)
 
-- **What you see.** The drawn debug text (`"RuneLite Mobile (AWT Bridge Active)"`,
-  `MainActivity.runRenderLoop`) is visible but the game area is a flat grey; the throttled
-  `callbacks.draw:` log never appears.
+- **What you see.** The themed boot overlay (`"Starting RuneLite…"` + the loader status line) stays
+  up over a flat grey game area instead of disappearing; the throttled `callbacks.draw:` log never
+  appears. The overlay is hidden by the *first presented frame* (`firstFramePresented` in the
+  frame-blit proxy), so an overlay that never goes away and no `callbacks.draw:` line are the same
+  symptom.
 - **Why.** The `Callbacks` proxy bound into the client implements `draw` as a no-op or throws
   before it blits. `callbacks.draw` is the *only* thing that bumps `frameSeq`; with no bump the
   render thread's `while (frameSeq == lastDrawnSeq) renderLock.wait(100)` never wakes, so it keeps
   presenting the initial bitmap. `MainActivity` reports this as a `callbacks.draw failed` warning
   or `Callbacks.draw(Renderable,boolean) -> true` when no `Hooks` is bound. This is the #1 thing to
   check when rendering "stops".
-- **Fix.** Read the first `callbacks.draw` line after boot. If it never prints, the proxy is not in
+- **Fix.** Read the first `callbacks.draw` line after boot (the boot overlay card's status text shows
+  the same `Status Update:` string the log carries). If the line never prints, the proxy is not in
   the path: confirm `findFieldByType(clientClass, "net.runelite.api.hooks.Callbacks")` bound the
   proxy (`Callbacks proxy bound (field …)`), and that no `callbacks.NAME failed` warning precedes
   it. A `NoClassDefFoundError`/`NoSuchMethodError` thrown inside the frame path appears as
@@ -106,19 +109,26 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   member list and the no-arg-ctor/hand-written-supertype rules are in
   [core-stubs.md](core-stubs.md); the event path is in [input.md](input.md).
 
-## `KB` button missing, or typing does nothing
+## `⌨` tile missing, or typing does nothing
 
-- **What you see.** There is no `KB` button on the launcher; or the button exists, the `kbBar`
+- **What you see.** There is no `⌨` tile on the launcher; or the tile exists, the keyboard bar
   appears, but typed characters never reach the game.
-- **Why (button).** The `KB` button is created `GONE` in `buildLauncherUi`
-  (`kbButton.setVisibility(View.GONE)`) and only becomes `VISIBLE` when `launchGame` runs — it stays
-  hidden until the client has been started.
+- **Why (tile).** The tile is the foot of the side panel's right-edge column, and the whole column is
+  hidden (`setAvailable(false)`) until the game runs — so it only exists on the game screen, by
+  design. `launchGame` brings it back with `setAvailable(true)`.
 - **Why (typing).** The `TextWatcher` diff in `kbBar` emits `VK_BACK_SPACE` per removed char and
   `dispatchKeyText(added)` for new text; `deliverKeyEvent` walks `getKeyListeners()` on the target
   and canvas and constructs a `java.awt.event.KeyEvent`. If the `KeyEvent` stubs are incomplete
   (`getKeyText(int)`, `getExtendedKeyCode()`, `setKeyCode`/`setKeyChar`, `paramString`), the event
-  is dropped silently.
-- **Fix.** Start the client before expecting the button; verify the `KeyEvent` stub members against
+  is dropped silently. Two non-bug cases that look identical:
+  - the game's chat input is **not open** — the client ignores chat characters until `Enter` (the
+    bar's `Enter` pill or the IME's action) has opened the chat line, and the chat line is drawn at
+    the bottom of the game frame, which the soft keyboard covers. The bar itself (top-anchored) shows
+    the text you typed, which is the reliable indicator that the bridge is working;
+  - the IME is in Gboard's landscape fullscreen "extract" mode, which takes over the screen. That is
+    what `kbEdit`'s non-password input type plus `IME_FLAG_NO_EXTRACT_UI` are for (see
+    [input.md](input.md) §6).
+- **Fix.** Start the client before expecting the tile; verify the `KeyEvent` stub members against
   the client's key handler. This is an AWT `KeyEvent` bridge, not an in-game IME — see
   [input.md](input.md) and [core-stubs.md](core-stubs.md).
 
@@ -201,14 +211,18 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   dex as `verify` rather than `[status=speed]`; the launcher shows a red `NOT AOT-COMPILED` line and
   the Host tab a red `client AOT` row.
 - **Why.** The target device runs `dalvik.vm.usejit=false`, so interpreted code is ~10x slower. ART
-  keys the odex to the class-loader context (APK path + APK/dex checksums), so **every** APK install
-  and every downloaded client-jar update invalidates it. `ClientUpdater.clientDexAotStatus` detects
-  this with an mtime heuristic over `files/oat/<isa>/runelite-dex.odex` and returns `AOT_STALE`
-  (odex older than the jar/APK) or `AOT_MISSING`; `AOT_UNKNOWN` means `files/oat` was unreadable and
-  nothing can be claimed.
+  keys the odex to the class-loader context (APK path + APK/dex checksums), so an APK install or a
+  downloaded client-jar update can invalidate it. `ClientUpdater.clientDexAotStatus` is a **heuristic**
+  over `files/oat/<isa>/runelite-dex.odex` vs the **client jar's** mtime: `AOT_STALE` (odex older than
+  the jar) or `AOT_MISSING`; `AOT_UNKNOWN` means `files/oat` was unreadable and nothing can be claimed.
+  It logs `AOT check: odex=… jar=… apk=…` on every call, and it can be wrong in both directions (it
+  cannot see an install into a *different* app directory, and it no longer reports stale just because
+  the APK is newer — ART does not rewrite an odex whose dex input is unchanged). `pm art dump` is the
+  ground truth.
 - **Fix.** Re-run the AOT compile after every install and every client-jar update:
-  `cmd package compile -m speed -f --secondary-dex org.runelite.mobile` and the same command without
-  `--secondary-dex`. Verify the result with `pm art dump`. Exact copy-pasteable steps and the
+  `cmd package compile -m speed -f org.runelite.mobile` and then
+  `cmd package compile -m speed -f --secondary-dex org.runelite.mobile` — the `--secondary-dex` pass
+  **last**, because the plain package compile drops the client dex back to `verify`. Verify the result with `pm art dump`. Exact copy-pasteable steps and the
   debuggable-build caveat are in [device-runbook.md](device-runbook.md); the AOT-status semantics and
   the launcher/Host-tab display are in [client-updates.md](client-updates.md).
 

@@ -39,10 +39,11 @@ anything past a build — the Android SDK platform-tools. The target device is e
 optimisation.
 
 **Key runtime constants.** The client's own frame size is 765x503 (`GAME_W`/`GAME_H`), the frame-pacing
-target is 60 fps (`FPS_TARGET`), and a single-finger press is held off for 120 ms
-(`TAP_PRESS_DELAY_MS`) so a two-finger gesture cannot fire a stray walk. All three live in
-`MainActivity` (`MainActivity.java:60-94`); change the frame size only together with `appletPixels`
-and `AWTBridge.activePixels/activeWidth/activeHeight`.
+target is 60 fps (`FPS_TARGET`), a still finger held for `LONG_PRESS_MS` (400 ms) is a right click, and
+movement past `ROTATE_LOCK_DP` (10 dp) is the one-finger camera drag. The left press is *deferred*
+(nothing is pressed at touch-down; the press is sent on lift for a tap), which is what makes the long
+press possible — the client acts on mouse **down**. All of these live in `MainActivity`; change the
+frame size only together with `appletPixels` and `AWTBridge.activePixels/activeWidth/activeHeight`.
 
 ---
 
@@ -54,8 +55,11 @@ State as of this writing. Numbers that move with upstream releases are described
 |---|---|---|
 | Software 3D rendering into a 765x503 frame | works | [rendering.md](docs/rendering.md) |
 | Touch → mouse (press/drag/release/click) | works | [input.md](docs/input.md) |
+| One-finger drag → camera rotate | works | [input.md](docs/input.md) |
 | Two-finger camera drag (middle-button emulation) | works | [input.md](docs/input.md) |
-| On-screen keyboard bridge (`KB` bar → AWT `KeyEvent`s) | works | [input.md](docs/input.md) |
+| Pinch → camera zoom / list scroll (synthesized wheel) | works | [input.md](docs/input.md) |
+| Long press or two-finger tap → right click | works | [input.md](docs/input.md) |
+| On-screen keyboard bridge (`⌨` tile → AWT `KeyEvent`s) | works | [input.md](docs/input.md) |
 | Native side panel (Plugins / Config / Host tabs) | works | [side-panel.md](docs/side-panel.md) |
 | RuneLite plugin runtime (indexed plugins instantiate) | works | [plugin-runtime.md](docs/plugin-runtime.md) |
 | Plugin config persistence | works | [plugin-runtime.md](docs/plugin-runtime.md) |
@@ -64,8 +68,10 @@ State as of this writing. Numbers that move with upstream releases are described
 | Jagex account login (browser OAuth + loopback callback) | works | [login-and-sessions.md](docs/login-and-sessions.md) |
 | iOS | skeleton only (no rendering) | — |
 
-There is no in-game IME: the keyboard is a floating bar that injects AWT `KeyEvent`s through the app's
-own `dispatchKeyText`/`deliverKeyEvent`, and game chat sees them as ordinary key events.
+There is no in-game IME: the keyboard bar (opened from the `⌨` tile at the foot of the right-edge
+chrome column, anchored to the **top** of the game area so the soft keyboard cannot cover it) injects
+AWT `KeyEvent`s through the app's own `dispatchKeyText`/`deliverKeyEvent`, and game chat sees them as
+ordinary key events. Open the game's chat input first (`Enter`), then type.
 
 A `works` row means the subsystem is wired end-to-end and produces a visible result on device, not
 that it is feature-complete. Known intentional limits:
@@ -162,26 +168,49 @@ app's updater consumes them by exact name. See [client-updates.md](docs/client-u
 
 ---
 
-## 5. Install on a device
+## 5. Install on a device, and controls
+
+### Install
 
 1. Build: `./gradlew :android:assembleRelease`.
 2. Install: `adb install -r android/build/outputs/apk/release/android-release.apk` (same debug signing
    key, so app data survives an upgrade).
 3. AOT-compile the shipped client jar (mandatory on a JIT-disabled device):
    ```bash
-   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
    adb shell cmd package compile -m speed -f org.runelite.mobile
+   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
    ```
 4. Verify: `adb shell pm art dump org.runelite.mobile` must show `[status=speed]`, not `verify`.
 5. Launch; sign in with a Jagex account; pick a character; Play.
 
-Re-run step 3 after **every APK install** and after **every client-jar update**. A new install lands
-in a new `/data/app/~~…==/` directory whose path is part of the odex's class-loader context, so ART
-rejects the existing `speed` odex and silently falls back to `verify`. The APK must not be debuggable:
-the ART Service rewrites `-m speed` to `verify` for debuggable packages. The launcher shows a red
-`NOT AOT-COMPILED` line and the Host tab has a `client AOT` row; both come from
-`ClientUpdater.clientDexAotStatus`, an mtime heuristic. Full procedure and semantics in
+Re-run step 3 after **every APK install** and after **every client-jar update**: the odex is keyed to
+the class-loader context (the base APK path), so an install can invalidate it, and ART then silently
+falls back to `verify`. The APK must not be debuggable: the ART Service rewrites `-m speed` to `verify`
+for debuggable packages. `pm art dump` is the ground truth. The launcher shows a red `NOT AOT-COMPILED`
+line and the Host tab has a `client AOT` row; both come from `ClientUpdater.clientDexAotStatus`, a
+heuristic over the **client jar's** mtime (not the APK's — an APK install alone does not move the
+client dex), which also logs `AOT check: odex=… jar=… apk=…`. Full procedure and semantics in
 [device-runbook.md](docs/device-runbook.md) and [client-updates.md](docs/client-updates.md).
+
+### Controls
+
+| Gesture | Effect |
+|---|---|
+| Tap | left click — walk, attack, select, open a menu row |
+| Drag (one finger, past 10 dp) | rotate the camera (middle-button drag at the finger) |
+| Long press (400 ms, still) | right click — the client's context menu |
+| Two-finger tap | right click as well (both fingers down and up within 400 ms, no movement) |
+| Two-finger rotate | rotate the camera at the centroid |
+| Pinch | camera zoom in the world, list scrolling with an interface open (synthesized wheel) |
+| Two-finger wheel/scroll | `ACTION_SCROLL` → `MOUSE_WHEEL` |
+| `⌨` tile (foot of the right-edge column) | show/hide the keyboard bar; `Enter` opens the game's chat input, `Hide` closes the bar |
+| `‹`/`›` chevron (right-edge column) | open/close the side panel; the game area shrinks instead of being overlapped |
+| `⌂` (drawer header) | back to the launcher |
+
+Nothing is pressed at touch-down: the left press is sent on lift (a tap), which is why a drag can
+never walk or attack and why the long press can be a right click at all — the client acts on mouse
+**down**. The one trade-off is that dragging inside an interface rotates the camera rather than
+dragging an item. Full model in [input.md](docs/input.md).
 
 ---
 
@@ -318,11 +347,11 @@ build. If a document and the source disagree, the source wins — line numbers i
 
 | Symptom | First check |
 |---|---|
-| Static grey screen, nothing draws | A no-op `callbacks.draw` proxy; the throttled `callbacks.draw` log shows `world=`/`bridge=` | [troubleshooting.md](docs/troubleshooting.md) |
+| Static grey screen, nothing draws | The boot overlay (`Starting RuneLite…`) never disappears and the throttled `callbacks.draw` log never prints — a no-op `callbacks.draw` proxy | [troubleshooting.md](docs/troubleshooting.md) |
 | Frozen world with a live minimap | The 3D rasterizer was not re-pointed at the display buffer | [troubleshooting.md](docs/troubleshooting.md) |
 | Grey walls, black ground/trees | The palette pointer (`fa.ak`) was retargeted at the frame | [troubleshooting.md](docs/troubleshooting.md) |
 | Taps do nothing but logcat prints `Dispatch mouse id=…` | A missing event-stub member (`NoSuchMethodError` caught as `Throwable` after the log line) | [troubleshooting.md](docs/troubleshooting.md) |
-| The `KB` button is missing or typing does nothing | The button stays `GONE` until the client runs; incomplete `KeyEvent` stubs silently drop chars | [troubleshooting.md](docs/troubleshooting.md) |
+| The `⌨` tile is missing or typing does nothing | The tile (foot of the right-edge column) is hidden until the client runs; the chat input must be open (`Enter` first); incomplete `KeyEvent` stubs silently drop chars | [troubleshooting.md](docs/troubleshooting.md) |
 | Extremely low framerate, `verify` in `pm art dump` | The client jar is not AOT-compiled | [troubleshooting.md](docs/troubleshooting.md) |
 | A plugin is listed as enabled/active but does nothing | Instantiation counts prove nothing; run plugin conformance | [troubleshooting.md](docs/troubleshooting.md) |
 | `Writable dex file … is not allowed` | A hub plugin was left on shared storage instead of imported | [troubleshooting.md](docs/troubleshooting.md) |

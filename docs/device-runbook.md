@@ -12,9 +12,9 @@ conformance metrics are in [diagnostics.md](diagnostics.md).
 Throughout, the two anchor directories are:
 
 - **`<files>`** = `/data/data/org.runelite.mobile/files` (app-private; not adb-writable on a
-  release build because the package is not debuggable — `PluginConformance.java:120-122`).
+  release build because the package is not debuggable — `PluginConformance.java`).
 - **`<external>`** = `/sdcard/Android/data/org.runelite.mobile/files` (app-specific external dir;
-  the only adb-writable drop box, `MobilePluginHub.java:57-59`).
+  the only adb-writable drop box, `MobilePluginHub.java`).
 
 ## 1. Install / upgrade
 
@@ -31,68 +31,81 @@ adb install -r android/build/outputs/apk/release/android-release.apk
 jars and the session preferences) survives. A fresh install or an uninstall wipes it, and any
 download you had installed under `<files>/runelite-dex.jar` is gone — the APK's bundled asset
 (`android/src/main/assets/runelite-dex.jar`) is re-copied on the next `launchGame`
-(`MainActivity.java:1359-1389`).
+(`MainActivity.java`).
 
 ## 2. AOT compile
 
 The target device runs `dalvik.vm.usejit=false` (JIT disabled), so the game client dex must be
-AOT-compiled or it runs interpreted (~10x slower) (`MainActivity.java:275-289`). The app cannot
+AOT-compiled or it runs interpreted (~10x slower) (`MainActivity.java`). The app cannot
 run `pm compile` itself — this is an operator step. Run both commands, because the client dex is a
 secondary dex of the package:
 
 ```bash
-adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
-adb shell cmd package compile -m speed -f org.runelite.mobile
-adb shell pm art dump org.runelite.mobile     # expect [status=speed] on both
+adb shell cmd package compile -m speed -f org.runelite.mobile                  # app dex first
+adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile  # client dex LAST
+adb shell pm art dump org.runelite.mobile     # expect [status=speed] twice
 ```
 
-The exact `--secondary-dex` invocation is the literal `ClientUpdater.AOT_FIX_COMMAND`
-(`ClientUpdater.java:32-34`); the two-command run is the sequence in the boot-block comment
-(`MainActivity.java:284-286`).
+**The `--secondary-dex` pass must be last.** `cmd package compile -m speed -f <pkg>` rewrites the
+package's oat state and leaves the client dex at `verify` again; running the documented
+reverse order therefore ends with the game interpreted (measured on the target device: the
+reversed order gave one `[status=speed]` entry, this order gives two). The exact
+`--secondary-dex` invocation is the literal `ClientUpdater.AOT_FIX_COMMAND`
+(`ClientUpdater.java`). The app's own verdict is a jar-mtime heuristic and logs its inputs
+(`AOT check: odex=<ms> jar=<ms> apk=<ms>`); `pm art dump` is the ground truth — it is also the only
+way to see the install-directory case, where the odex is invalid but no mtime moved.
 
 ### When to re-run
 
 Re-run after **every APK install** and after **every downloaded client-jar update**. ART keys the
-odex to the invoking class-loader context, which embeds the base APK path *plus* the checksums of
-the APK and the dex. An install lands the package in a new `/data/app/~~…==/` directory, so the
-path changes, ART discards the `speed` odex and falls back to the `verify` vdex — interpreted
-(`MainActivity.java:277-283`). A downloaded `<files>/runelite-dex.jar` changes the dex checksum
-for the same reason.
+odex to the invoking class-loader context, which embeds the base APK path plus the APK's and the
+dex's checksums; an install can therefore discard the `speed` odex and fall back to the `verify` vdex
+— interpreted (`MainActivity` boot-block comment). A downloaded `<files>/runelite-dex.jar` changes
+the dex checksum for the same reason. Whether it actually happened is what `pm art dump` answers.
 
-The app's own heuristic mirrors this: `ClientUpdater.clientDexAotStatus` compares the newest
-`<files>/oat/<isa>/runelite-dex.odex` against `max(jar.lastModified, packageCodePath.lastModified)`
-and reports `AOT_OK` / `AOT_STALE` / `AOT_MISSING` / `AOT_UNKNOWN` (`ClientUpdater.java:50-78`).
+The app's own verdict is a heuristic and can be wrong in **both** directions, so treat it as a hint:
+
+| Direction | When |
+|---|---|
+| False `AOT_STALE` | after an install + recompile: `pm art dump` reports `[status=speed]` while the odex file is still older than the freshly installed APK, because ART does not rewrite an odex whose dex input is unchanged. This is why the rule compares the **jar** (the client dex), not the APK. |
+| False `AOT_OK` | an install into a *different* `/data/app/~~…==/` directory (uninstall/reinstall, signing change): the context changed, the odex is invalid, but no mtime moved. Only `pm art dump` sees this. |
+
+`ClientUpdater.clientDexAotStatus` compares the newest `<files>/oat/<isa>/runelite-dex.odex` against
+`runelite-dex.jar.lastModified()` and reports `AOT_OK` / `AOT_STALE` / `AOT_MISSING` / `AOT_UNKNOWN`;
+every call logs `AOT check: odex=<ms> jar=<ms> apk=<ms>` so the verdict can be explained
+(`ClientUpdater`).
 
 ```mermaid
 stateDiagram-v2
     [*] --> "AOT_MISSING"
     "AOT_MISSING" --> "AOT_MISSING": "no runelite-dex.jar"
     "AOT_MISSING" --> "AOT_UNKNOWN": "files/oat unreadable"
-    "AOT_MISSING" --> "AOT_STALE": "odex found, older than jar/APK"
-    "AOT_STALE" --> "AOT_OK": "pm compile after install/jar update"
-    "AOT_OK" --> "AOT_STALE": "new install or jar update"
+    "AOT_MISSING" --> "AOT_STALE": "odex found, older than the client jar"
+    "AOT_STALE" --> "AOT_OK": "pm compile after the jar changed"
+    "AOT_OK" --> "AOT_STALE": "client jar replaced (update)"
 ```
 
 `AOT_UNKNOWN` means the check cannot claim anything (it is not treated as bad by the launcher's red
-highlighting); only `AOT_STALE`/`AOT_MISSING` are bad (`ClientUpdater.java:74-77`, `MainActivity.java:302-306`).
+highlighting); only `AOT_STALE`/`AOT_MISSING` are bad.
 
 ### Verification and the debuggable caveat
 
-`pm art dump` must show `[status=speed]` on both the APK and the secondary dex. `[status=verify]`
+`pm art dump` must show `[status=speed]` for both the APK and `files/runelite-dex.jar` (the dump
+lists the secondary dex by path, so the client dex's line is the one that matters). `[status=verify]`
 or `run-from-apk` means it is still interpreted.
 
 The installed APK **must not be debuggable**: ART Service rewrites `-m speed` to `verify` for
 debuggable packages, and a verify-only odex executes interpreted anyway
-(`MainActivity.java:287-290`). Only the release build AOT-compiles usefully. The release build is
+(`MainActivity.java`). Only the release build AOT-compiles usefully. The release build is
 signed with the debug key but is not marked debuggable, which is why it works and why `-r` keeps
 data. The launcher shows a red `NOT AOT-COMPILED - expect ~5 fps (Host tab)` line when stale or
-missing (`MainActivity.java:700-702`), and the side panel's Host tab repeats it as a red
-`client AOT` row (`SidePanel.java:778-783`); see [side-panel.md](side-panel.md).
+missing (`MainActivity.updateLauncherUi`), and the side panel's Host tab repeats it as a red
+`client AOT` row (`SidePanel.buildHostTab`); see [side-panel.md](side-panel.md).
 
 ## 3. Push a hub plugin
 
 The app scans two directories for `*.jar`: `<files>/plugins` and `<external>/plugins`
-(`MobilePluginHub.java:60-71`). Only `<external>/plugins` is adb-writable on a release build, so it
+(`MobilePluginHub.java`). Only `<external>/plugins` is adb-writable on a release build, so it
 is the sideload drop box:
 
 ```bash
@@ -101,21 +114,21 @@ adb push MyPlugin.jar /sdcard/Android/data/org.runelite.mobile/files/plugins/
 ```
 
 Jars in the external dir are **imported by copy** into `<files>/plugins` and made read-only, and
-already-imported files are replaced only when the length differs (`MobilePluginHub.java:80-104`).
+already-imported files are replaced only when the length differs (`MobilePluginHub.java`).
 The copy exists because ART refuses a writable dex (`Writable dex file … is not allowed`), which a
-jar on shared storage is (`MobilePluginHub.java:84-90`). To force a re-import, delete the copy in
+jar on shared storage is (`MobilePluginHub.java`). To force a re-import, delete the copy in
 `<files>/plugins` (or push a jar of different length) and relaunch.
 
 A jar carrying `.class` bytecode is dexed on-device via the bundled `rl-dexer.jar`; if that is
 unavailable the hub logs `on-device dexer unavailable (<reason>); dex <name> on the host with
--PhubPlugin=<name>` (`MobilePluginHub.java:193-197`). The host-side alternative is
+-PhubPlugin=<name>` (`MobilePluginHub.java`). The host-side alternative is
 `./gradlew :android:dexHubPlugin -PhubPlugin=<internalName>`; both paths and the
 `runelite_plugin.json` descriptor are documented in [third-party-plugins.md](third-party-plugins.md).
 
 ## 4. Trigger and pull a conformance report
 
-The request file is `<external>/conformance.request` (`PluginConformance.java:67-68,124-127`). The
-render loop polls it once per 5 s and consumes it (`MainActivity.java:3270-3278`):
+The request file is `<external>/conformance.request` (`PluginConformance`). The
+render loop polls it once per 5 s and consumes it (`MainActivity.java`):
 
 ```bash
 adb shell "echo 1 > /sdcard/Android/data/org.runelite.mobile/files/conformance.request"
@@ -125,7 +138,7 @@ adb pull /sdcard/Android/data/org.runelite.mobile/files/conformance-report.txt
 ```
 
 The run is single-flight: a second request while one is in progress logs `CONFORMANCE: already
-running, request ignored` and is dropped (`PluginConformance.java:133-158`). When it finishes it
+running, request ignored` and is dropped (`PluginConformance.java`). When it finishes it
 logs one line:
 
 ```text
@@ -134,7 +147,7 @@ CONFORMANCE: <summary> (report: <path>)
 
 If the host is not running the report is headed `# aborted: host not running (<status>)` and the
 summary is `aborted: host not running`. You can also trigger a run from the Host tab of the side
-panel via `PluginConformance.run(activity)` (`SidePanel.java:792`). Every metric in the report and
+panel via `PluginConformance.run(activity)` (`SidePanel.java`). Every metric in the report and
 the summary string are documented in [diagnostics.md](diagnostics.md).
 
 ## 5. Read logcat
@@ -152,8 +165,8 @@ adb logcat -s RuneLiteMobile RuneLiteHost MobilePluginHub
 | `MobilePluginHub` | `MobilePluginHub`, `OnDeviceDexer` |
 
 At boot, look for `Client dex AOT: …` (or the `Client dex is NOT AOT-compiled: …` warning,
-`MainActivity.java:302-306`), `Pre-registered game dex classloader for ART dexopt`
-(`MainActivity.java:296`), and, once the host starts, `GFX SELFTEST PASS` (or the failing case).
+`MainActivity.java`), `Pre-registered game dex classloader for ART dexopt`
+(`MainActivity.java`), and, once the host starts, `GFX SELFTEST PASS` (or the failing case).
 Field-by-field interpretation of `callbacks.draw` and `GameState` lines is in
 [diagnostics.md](diagnostics.md).
 
@@ -182,21 +195,21 @@ the private directories returned by `Context.getDir(name, MODE_PRIVATE)` (Androi
 | `<external>/conformance.request` | operator | render loop | trigger file |
 | `<external>/conformance-report.txt` | `PluginConformance` | operator | plain text report |
 
-Anchors: `MainActivity.java:292-294,755,1362,1391`, `ClientUpdater.java:52-57,136,156,189-212`,
-`MobilePluginHub.java:60-71,145`, `OnDeviceDexer.java:60,80`, `MainActivity.java:224`.
+Anchors: `MainActivity` (boot block, launcher visibility, AOT status), `ClientUpdater`
+(`clientDexAotStatus`), `MobilePluginHub.java:60-71,145`, `OnDeviceDexer.java:60,80`.
 
 ## 7. SharedPreferences key table
 
 The only preferences file is `RuneLiteMobilePrefs`, declared once in `MainActivity`
-(`PREFS_NAME`, `MainActivity.java:69`) and once in `SidePanel` with the same literal
-(`SidePanel.java:65`). Re-derive the key set with:
+(`PREFS_NAME`, `MainActivity.java`) and once in `SidePanel` with the same literal
+(`SidePanel.java`). Re-derive the key set with:
 
 ```bash
 grep -rnE '\.(putBoolean|putString|putLong|putInt|putFloat|putStringSet)\(' android/src/main/java/
 ```
 
-That grep returns writes in `MainActivity.saveSessionState` (`:738-744`), the credentials import at
-`MainActivity.java:798-801`, and `SidePanel` (`:253`, `:289`) — nine distinct keys:
+That grep returns writes in `MainActivity.saveSessionState`, the credentials import at
+`MainActivity.java`, and `SidePanel` (`MainActivity`) — nine distinct keys:
 
 | Key | Type | Written by | Meaning |
 |---|---|---|---|
@@ -207,10 +220,10 @@ That grep returns writes in `MainActivity.saveSessionState` (`:738-744`), the cr
 | `oauth_access_token` | string | `MainActivity.saveSessionState` | OAuth access token |
 | `oauth_refresh_token` | string | `MainActivity.saveSessionState` | OAuth refresh token |
 | `oauth_expires_at` | long | `MainActivity.saveSessionState` | access-token expiry |
-| `sidePanelOpen` | boolean | `SidePanel.toggle` (`:253`) | drawer open state |
-| `sidePanelTab` | int | `SidePanel.selectTab` (`:289`) | selected tab index (0/1/2) |
+| `sidePanelOpen` | boolean | `SidePanel.toggle` | drawer open state |
+| `sidePanelTab` | int | `SidePanel.selectTab` | selected tab index (0/1/2) |
 
 `loadSessionState` reads the seven `jx_*`/`oauth_*` keys with defaults
-(`MainActivity.java:718-732`); if `jx_mode_enabled` is false or `jx_session_id` is empty, the
+(`MainActivity.java`); if `jx_mode_enabled` is false or `jx_session_id` is empty, the
 session is treated as signed out. The session/credentials details are in
 [login-and-sessions.md](login-and-sessions.md).
