@@ -91,11 +91,14 @@ Notes:
 - **Input synthesis**: touch → AWT `MouseEvent`. `setupTouchInput` replays
   `MotionEvent` history and fills segments via `core/src/main/java/org/runelite/mobile/MousePath.java`
   so the client sees a continuous, monotonic motion stream instead of single jumps.
-  A two-finger drag is synthesized as a **middle-button** (`BUTTON2`) press/drag/
-  release at the two-finger centroid — the client's own camera-drag path — and the
-  single-finger press is held off 120 ms so a second finger can never turn into a
-  walk/attack click; the resulting wire shape is an ordinary drag (mouse packets),
-  not an automation signal.
+  A **one-finger drag** and a **two-finger rotate** are both synthesized as a
+  **middle-button** (`BUTTON2`) press/drag/release — the client's own camera-drag
+  path — at the finger (or the two-finger centroid); a pinch is a synthesized
+  **mouse wheel** stream, and a long press or a two-finger tap is a **right click**
+  (`BUTTON3`). The left press is **deferred**: nothing is pressed at touch-down, so
+  no gesture can turn into a stray walk/attack click, and a plain tap sends
+  press + release + click on lift. The resulting wire shape is ordinary mouse
+  input, not an automation signal.
 - **Software 3D presentation** (port-only, no wire effect): the 3D rasterizer's
   per-instance pixel target is re-pointed at the display buffer by
   `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a

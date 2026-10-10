@@ -29,7 +29,7 @@ the child loader and feeds the classes to `PluginManager` (`RuneLiteHost.loadPlu
 therefore take down the whole runtime. The host compensates with a **bulk-then-per-class
 fallback**: it calls `loadPlugins` once with the whole list (which is also what builds RuneLite's
 `@PluginDependency` ordering), and if that throws it retries one candidate at a time, recording
-each failure and continuing (`RuneLiteHost.startPlugins`, comment at `RuneLiteHost.java:266-272`).
+each failure and continuing (`RuneLiteHost.startPlugins`, comment at `RuneLiteHost.java`).
 
 ## 2. Startup sequence
 
@@ -56,47 +56,47 @@ flowchart TD
 Numbered, with the exact calls:
 
 1. `MainActivity` constructs `new DexClassLoader(dexJar, dexOut, null, getClassLoader())`
-   (`MainActivity.java:295`, `:1392`) and starts `RuneLiteHost.start(clientObject, dexClassLoader)`
+   (`MainActivity.java`) and starts `RuneLiteHost.start(clientObject, dexClassLoader)`
    on a daemon `Thread` named `RuneLiteHost`.
 2. `RuneLiteHost.start` builds an `okhttp3.OkHttpClient$Builder` reflectively through the child
-   loader (`RuneLiteHost.java:167-174`): `connectTimeout(20, SECONDS)`, `readTimeout(20, SECONDS)`,
+   loader (`RuneLiteHost.java`): `connectTimeout(20, SECONDS)`, `readTimeout(20, SECONDS)`,
    the same shape as RuneLite's own `buildHttpClient()`.
 3. It publishes that instance to the static field `net.runelite.http.api.RuneLiteAPI.CLIENT`
-   (`RuneLiteHost.java:176`), because the http-api module and every RuneLite HTTP client share the
+   (`RuneLiteHost.java`), because the http-api module and every RuneLite HTTP client share the
    one instance.
 4. `net.runelite.client.RuntimeConfigLoader` is constructed with the OkHttp instance and its `get()`
-   runs the blocking runtime-config fetch **on the host thread** (`RuneLiteHost.java:181-189`). A
+   runs the blocking runtime-config fetch **on the host thread** (`RuneLiteHost.java`). A
    null result is normal offline and only disables feature flags.
 5. `net.runelite.client.RuneLiteModule` is constructed with ten parameters — `okHttpClass`,
    `Supplier`, `runtimeConfigLoaderClass`, `developerMode=false`, `safeMode=false`,
    `disableTelemetry=true`, the session `File`, profile `null`, `insecureWriteCredentials=false`,
-   `noupdate=true` (`RuneLiteHost.java:196-206`). The client `Supplier` is `() -> client`.
+   `noupdate=true` (`RuneLiteHost.java`). The client `Supplier` is `() -> client`.
 6. `com.google.inject.Guice.createInjector` is invoked with a one-element `Module[]` array built by
    `java.lang.reflect.Array`, because `com.google.inject.Module` is an asset-dex type
-   (`RuneLiteHost.java:208-215`). The result is stored and handed to
+   (`RuneLiteHost.java`). The result is stored and handed to
    `net.runelite.client.RuneLite.setInjector`, which `PluginManager.instantiate()` uses to build
-   child injectors (`RuneLiteHost.java:216-217`).
-7. It **deliberately does not call `injector.injectMembers(client)`** (`RuneLiteHost.java:219-225`).
+   child injectors (`RuneLiteHost.java`).
+7. It **deliberately does not call `injector.injectMembers(client)`** (`RuneLiteHost.java`).
    Upstream `RuneLite.start()` injects the client *before* `client.initialize()`; here the client
    is already wired by `MainActivity` (the `Callbacks` proxy, the scheduler, the token requester).
    Injecting now would replace the client's `Callbacks` field with `Hooks` directly, bypassing the
    proxy's frame blit and leaving the render thread waiting on `frameSeq` forever — a black screen
    with a live runtime.
-8. `installNavigationHook` installs the `ClientToolbar.navigationListener` field (`RuneLiteHost.java:218`,
-   `:727-744`), then the components are resolved by name through `get(...)`:
+8. `installNavigationHook` installs the `ClientToolbar.navigationListener` field (`RuneLiteHost.java`,
+   `MainActivity`), then the components are resolved by name through `get(...)`:
    `net.runelite.api.hooks.Callbacks`, `net.runelite.client.plugins.PluginManager`,
    `net.runelite.client.config.ConfigManager`, `net.runelite.client.eventbus.EventBus`,
    `net.runelite.client.ui.overlay.OverlayManager`, and optionally
-   `net.runelite.client.callback.ClientThread` (`RuneLiteHost.java:228-239`).
+   `net.runelite.client.callback.ClientThread` (`RuneLiteHost.java`).
 9. `AWTBridge.post(RuneLiteHost::startPlugins)` hands the lifecycle to the UI thread
-   (`RuneLiteHost.java:249`). `PluginManager` asserts the event-dispatch thread and calls
+   (`RuneLiteHost.java`). `PluginManager` asserts the event-dispatch thread and calls
    `SwingUtilities.invokeAndWait` internally; on this port `AWTBridge.registerUiThread` routes both
    to the Android main thread.
 10. `startPlugins` runs on the EDT: sets `jagex.disableBouncyCastle` and
     `runelite.pluginhub.version`, calls `configManager.load()`, reads the plugin index, loads
     plugins (with the fallback above), calls `loadDefaultPluginConfiguration`, registers the three
     managers on the bus, calls `overlayManager.init()`, and finally `pluginManager.startPlugins()`
-    (`RuneLiteHost.java:252-304`). Then `MobilePluginHub.loadPlugins` sideloads hub jars and
+    (`RuneLiteHost.java`). Then `MobilePluginHub.loadPlugins` sideloads hub jars and
     `GraphicsSelfTest.run()` validates the draw surface.
 
 All the injector's products are typed as `Object` and reached reflectively: `RuneLiteHost` stores
@@ -106,7 +106,7 @@ time.
 ## 3. Plugin index lifecycle
 
 `generatePluginIndex(File jar)` runs inside `downloadAndDexJar` and produces
-`runelite-plugin-index.txt` at the asset root (`android/build.gradle:239-286`, `:596-600`):
+`runelite-plugin-index.txt` at the asset root (`android/build.gradle:239-286`, `MainActivity`):
 
 | Step | Rule |
 |---|---|
@@ -157,7 +157,7 @@ count as a contract; the live value is `RuneLiteHost.indexSize()`, shown in the 
 tab (`SidePanel.buildHostTab`).
 
 **Failure mode.** `pluginManager.startPlugins()` stops at the first plugin whose `startUp()`
-throws and leaves the remainder unstarted (`RuneLiteHost.java:478-482`). That is why "enabled" and
+throws and leaves the remainder unstarted (`RuneLiteHost.java`). That is why "enabled" and
 "active" are distinct: a plugin can be enabled (flag set) yet inactive (never started). The host
 reports both, and a fresh toggle restarts from that plugin's flag rather than from the failing
 one.
@@ -168,9 +168,9 @@ The port does not implement config persistence; the client's own `ConfigManager`
 supplies the directory it writes into:
 
 - `MainActivity` sets `user.home` and `jagex.userhome` to `getFilesDir().getAbsolutePath()`
-  (`MainActivity.java:198-199`, re-applied at `:1308-1309`).
+  (`MainActivity.java`, re-applied at `MainActivity`).
 - `RuneLiteHost.start` reads the static `net.runelite.client.RuneLite.RUNELITE_DIR` and derives the
-  session file from it (`RuneLiteHost.java:191-194`). The port never assigns `RUNELITE_DIR`;
+  session file from it (`RuneLiteHost.java`). The port never assigns `RUNELITE_DIR`;
   upstream derives it under `user.home`, which is why config lands on internal storage.
 - The `profiles2/` profile layout (`profiles.json` plus one `<name>-<id>.properties` per profile)
   is **upstream RuneLite behaviour inside the asset dex**, not verifiable from this tree. The
@@ -181,13 +181,13 @@ supplies the directory it writes into:
 from a `scheduleWithFixedDelay` task (minutes) and on a profile switch; the desktop process exits
 gracefully, so the periodic flush has usually already happened. Android force-stops backgrounded
 apps without warning, so the port calls `sendConfig` explicitly at points that matter
-(`RuneLiteHost.flushConfig`, javadoc at `RuneLiteHost.java:425-432`):
+(`RuneLiteHost.flushConfig`, javadoc at `RuneLiteHost.java`):
 
 | Caller | When |
 |---|---|
 | `SidePanel:732` | after a config item write in the Config tab |
 | `SidePanel:741` | after a plugin enable/disable toggle |
-| `RuneLiteHost.setPluginEnabled` (`:460`) | after a successful start/stop |
+| `RuneLiteHost.setPluginEnabled` | after a successful start/stop |
 | `PluginConformance:216` | once at the end of a conformance run, if it touched config |
 | `MainActivity:3333` | `onStop`, so a backgrounded app is flushed before the OS can kill it |
 
@@ -198,7 +198,7 @@ edit durable immediately.
 ## 5. `pluginConfigClass` resolution
 
 RuneLite does not expose a plugin's config through a method on the plugin. `RuneLiteHost.pluginConfigClass`
-(`RuneLiteHost.java:582-606`) resolves it structurally:
+(`RuneLiteHost.java`) resolves it structurally:
 
 1. Null plugin → `null`.
 2. Load `net.runelite.client.config.ConfigGroup` off the child loader as an `Annotation` subtype; if
@@ -212,7 +212,7 @@ RuneLite does not expose a plugin's config through a method on the plugin. `Rune
 The annotation is `RUNTIME`-retained and `TYPE`-targeted, so the type alone identifies the config
 interface. There is **no `getConfig()` call on the plugin object**. A plugin with no config
 interface, such as `AccountPlugin`, returns `null`; the Config tab renders that as
-`"this plugin has no configuration"` (`SidePanel.showConfigFor`, `:487-488`).
+`"this plugin has no configuration"` (`SidePanel.showConfigFor`).
 
 ## 6. Host shims
 
@@ -283,7 +283,7 @@ and invokes `javac` with `--limit-modules java.base,jdk.unsupported`
 
 One nuance worth stating precisely: `org.runelite.mobile.*` types that live in **`core/`** *are*
 on the shim compile classpath (rule 1 above lists `coreClasses`), and the shim can resolve them at
-runtime because the asset loader's parent is the app loader (`MainActivity.java:295`). `ClientUI`
+runtime because the asset loader's parent is the app loader (`MainActivity.java`). `ClientUI`
 uses that to read `AWTBridge.activeWidth` / `activeHeight`. What a shim must **not** do is
 reference the `android/` host package (`RuneLiteHost`, `PluginPanelRegistry`): those classes are
 not on the shim classpath, and the loader direction is one-way. The `ClientToolbar` shim therefore
@@ -332,7 +332,7 @@ The registration entry point is `OverlayManager.add` / `addIfAbsent`, driven by 
 the client calls `callbacks.draw(MainBufferProvider, Graphics, x, y)`, `MainActivity`'s `Callbacks`
 proxy looks up the matching method on `RuneLiteHost.hooks()` and invokes it inside `renderLock`;
 `Hooks` renders the overlays into `mainBufferProvider.getImage()` and blits that image into the
-`Graphics` over `appletPixels` (`MainActivity.java:1510-1528`). Delegating to `Hooks` is what puts
+`Graphics` over `appletPixels` (`MainActivity.java`). Delegating to `Hooks` is what puts
 plugins on screen; the frame/`frameSeq` handshake stays in the proxy so the render thread still
 presents exactly one client frame per `draw`.
 
@@ -340,7 +340,7 @@ presents exactly one client frame per `draw`.
 and the number of registered `ABOVE_WIDGETS` overlays for it. That layer is rendered from
 `renderAfterInterface`, so an overlay appears only while its interface is drawn. On the login
 screen `iface=-1`, so `ABOVE_WIDGETS` overlays never render even though they are registered
-(`MainActivity.java:1559-1570`). Everything registered on `ALWAYS_ON_TOP` is rendered first and is
+(`MainActivity.java`). Everything registered on `ALWAYS_ON_TOP` is rendered first and is
 not interface-gated.
 
 ## 8. The cross-loader link rule
@@ -355,12 +355,12 @@ standing rules:
   `import okhttp3.*` returns nothing. Everything crosses by name: `RuneLiteHost` loads classes
   with `clientLoader.loadClass(...)`, calls them with reflection, and the `Callbacks`
   implementation is itself a `java.lang.reflect.Proxy` over an interface loaded from the child
-  loader (`MainActivity.java:1465`). Injector products are held as `Object`.
+  loader (`MainActivity.java`). Injector products are held as `Object`.
 - **Shims must not reference the `android/` host package.** They may use `core/` port types (which
   are on their compile classpath and in the app dex), but the host classes in `android/` are not
   visible to them. The one live link back to the host is the `ClientToolbar.navigationListener`
   `BiConsumer` field, installed reflectively by `RuneLiteHost.installNavigationHook`, which
-  dispatches `"add"`/`"remove"`/`"open"` to `PluginPanelRegistry` (`RuneLiteHost.java:727-744`).
+  dispatches `"add"`/`"remove"`/`"open"` to `PluginPanelRegistry` (`RuneLiteHost.java`).
 
 The two remaining categories of cross-loader call — the `Callbacks` proxy delegating to `Hooks`,
 and the `MobilePluginHub` child loaders whose parent is the client loader — are the subject of
