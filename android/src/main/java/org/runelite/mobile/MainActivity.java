@@ -7,7 +7,6 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
-import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
@@ -15,12 +14,14 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
@@ -73,14 +74,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private SurfaceHolder surfaceHolder;
     private volatile boolean isRunning = false;
     private Bitmap renderBitmap;
-    private int surfaceW, surfaceH;
+    /** Surface size in px, read by the render thread. */
+    private volatile int surfaceW, surfaceH;
+    /** Centred 765:503 letterbox geometry inside the surface, written by the UI thread. */
+    private volatile int fitLeft, fitTop, fitW, fitH;
     /** Frame counter bumped by the callbacks.draw blit; the render thread waits on it. */
     private long frameSeq, lastDrawnSeq;
     private final Rect srcRect = new Rect();
-    private final Rect dstRect = new Rect();
+    /** Render-thread only. */
+    private final Rect renderDst = new Rect();
     private final Paint scalePaint = new Paint();
-    private Paint debugPaint;
-    private Paint highlightPaint;
+    /** Render-thread only; paints the letterbox bars. */
+    private final Paint barPaint = new Paint();
     private static java.awt.Component clientInstance;
     private static Object clientObject;
     private static Class<?> clientClass;
@@ -90,17 +95,35 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private int lastMouseX = -1;
     private int lastMouseY = -1;
     private long lastMouseWhen = 0;
-    /** How long a single-finger press is held off so a second finger can start a camera gesture. */
-    private static final long TAP_PRESS_DELAY_MS = 120L;
-    /** The held-off single-finger press, or null when none is scheduled. */
-    private Runnable pendingPress;
+    /** A still finger held this long is a right click (the official mobile client's long press). */
+    private static final long LONG_PRESS_MS = 400L;
+    /** The scheduled long press, or null when none is pending. */
+    private Runnable longPress;
     private int touchDownX = -1;
     private int touchDownY = -1;
     private long touchDownWhen = 0;
-    /** Two-finger camera gesture in progress (a synthesized middle-button drag). */
-    private boolean cameraDrag = false;
     /** A leftover finger after a camera gesture: drop its events until it lifts. */
     private boolean suppressUntilUp = false;
+    /** No two-finger gesture decided yet. */
+    private static final int TWO_NONE = 0, TWO_ROTATE = 1, TWO_ZOOM = 2;
+    /** View-pixel movement that locks the gesture: rotate = centroid moved, zoom = span changed. */
+    private static final float ROTATE_LOCK_DP = 10f, ZOOM_LOCK_DP = 14f;
+    /** Pinch span change (dp) per synthesized mouse-wheel notch, and the per-event step clamp. */
+    private static final float ZOOM_DP_PER_NOTCH = 28f;
+    private static final int ZOOM_MAX_NOTCHES = 3;
+    /** Both fingers down and up within this time, with no rotation/zoom lock: a two-finger tap. */
+    private static final long TWO_TAP_MAX_MS = 400L;
+    /** The decided two-finger mode for the gesture in flight (one of {@code TWO_*}). */
+    private int twoFingerMode = TWO_NONE;
+    /** A single-finger camera drag (the official mobile client's rotate gesture) is in progress. */
+    private boolean oneFingerDrag;
+    /** The finger's down point in view pixels, for the one-finger drag threshold. */
+    private float touchDownViewX, touchDownViewY;
+    private float gestureSpan0, gestureSpanLast, gestureCx0, gestureCy0, zoomRemainder;
+    /** When the second finger went down (the two-finger tap time bound measures from it). */
+    private long gestureStartWhen;
+    /** View density, for the dp gesture thresholds. */
+    private float uiDensity = 1f;
     /** Value of the client's camera-drag setting to restore when the gesture ends; null = untouched. */
     private Boolean forcedCameraSetting;
     private long lastStateLog = 0;
@@ -126,7 +149,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     /** Event-bus {@code post} calls since boot, keyed by the event object's class name. */
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong> eventPosts =
         new java.util.concurrent.ConcurrentHashMap<>();
-    private Button kbButton;
     private LinearLayout kbBar;
     private EditText kbEdit;
     private String kbPrevText = "";
@@ -155,8 +177,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Switch swJxMode;
     private ProgressBar updateProgress;
     private TextView tvUpdateText;
-    private Button btnSettings;
-    private Button btnPanel;
+    /** Shown while the client boots (and after a restart); hidden on the first presented frame. */
+    private FrameLayout bootOverlay;
+    private TextView tvBootStatus;
+    private volatile boolean firstFramePresented;
     private SidePanel sidePanel;
 
     // ── Login (browser-based OAuth) ────────────────────────────────────────
@@ -181,8 +205,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private boolean loginActive = false;
     private boolean updateDialogShown = false;
 
-    // Loader status displayed on the launcher / rendering canvas
-    private String loaderStatus = "Idle";
     private String codebase = "";
     private final Map<String, String> appletParameters = new HashMap<>();
 
@@ -230,13 +252,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceView = new SurfaceView(this);
         surfaceView.getHolder().addCallback(this);
 
-        debugPaint = new Paint();
-        debugPaint.setColor(Color.GREEN);
-        debugPaint.setTextSize(28f);
+        uiDensity = getResources().getDisplayMetrics().density;
 
-        highlightPaint = new Paint();
-        highlightPaint.setColor(Color.YELLOW);
-        highlightPaint.setTextSize(32f);
+        // Letterbox bars behind the game frame (the game keeps its 765:503 aspect).
+        barPaint.setColor(UiTheme.BG_DEEP);
 
         // Nearest-neighbour upscale of the 765x503 frame (today's look: the
         // previous per-pixel loop sampled the same way).
@@ -281,9 +300,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // dir, whose path+checksums are part of the class-loader context the
         // odex is keyed to, so ART discards the `speed` odex and falls back to
         // the `verify` vdex (interpreted, ~10x slower).
-        //   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile
-        //   adb shell cmd package compile -m speed -f org.runelite.mobile
-        //   adb shell pm art dump org.runelite.mobile   # expect [status=speed] on both
+        //   adb shell cmd package compile -m speed -f org.runelite.mobile                  # app dex
+        //   adb shell cmd package compile -m speed -f --secondary-dex org.runelite.mobile  # client dex
+        //   adb shell pm art dump org.runelite.mobile   # expect [status=speed] twice
+        // The `--secondary-dex` pass must be LAST: compiling the package without it
+        // rewrites the app's oat state and drops the client dex back to `verify`, which
+        // is the interpreted case this comment is about.
         // The installed APK must NOT be debuggable: ART Service rewrites `-m
         // speed` to `verify` for debuggable packages, and a verify-only odex
         // still executes interpreted. Use the release build (signed with the
@@ -347,59 +369,74 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         rootLayout.addView(surfaceView);
 
-        final float density = getResources().getDisplayMetrics().density;
+        final DisplayMetrics metrics = getResources().getDisplayMetrics();
+        final float density = metrics.density;
         final int dp = (int) (density * 5);
 
         // ── Launcher panel ──
         launcherScroll = new ScrollView(this);
         launcherScroll.setLayoutParams(new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        // Scrim over the (idle) game surface. fillViewport + a MATCH_PARENT wrapper is
+        // what centres the card on both axes when it fits and scrolls when it does not.
+        launcherScroll.setFillViewport(true);
+        launcherScroll.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+            new int[]{0xEE1C1610, 0xEE0B0906}));
+
+        FrameLayout launcherWrap = new FrameLayout(this);
+        launcherWrap.setLayoutParams(new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
 
         launcherPanel = new LinearLayout(this);
         launcherPanel.setOrientation(LinearLayout.VERTICAL);
+        launcherPanel.setBackground(UiTheme.rounded(0xF71E1A16, UiTheme.GOLD_DIM, 2f, 20f, density));
 
-        GradientDrawable panelBg = new GradientDrawable();
-        panelBg.setColor(0xF01E1E24);
-        panelBg.setCornerRadius(30 * density);
-        panelBg.setStroke(3, 0xFF3F3F4F);
-        launcherPanel.setBackground(panelBg);
-
-        LinearLayout.LayoutParams panelLp = new LinearLayout.LayoutParams(
-            (int) (380 * density), LinearLayout.LayoutParams.WRAP_CONTENT);
-        panelLp.gravity = Gravity.CENTER;
-        panelLp.topMargin = (int) (60 * density);
-        panelLp.bottomMargin = (int) (60 * density);
+        int cardWidth = Math.min((int) (420 * density), (int) (0.92f * metrics.widthPixels));
+        FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(
+            cardWidth, LinearLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
+        int cardMargin = (int) (24 * density);
+        panelLp.setMargins(cardMargin, cardMargin, cardMargin, cardMargin);
         launcherPanel.setLayoutParams(panelLp);
-        launcherPanel.setPadding((int) (30 * density), (int) (35 * density), (int) (30 * density), (int) (30 * density));
+        launcherPanel.setPadding((int) (28 * density), (int) (24 * density), (int) (28 * density), (int) (24 * density));
 
         tvTitle = new TextView(this);
         tvTitle.setText("RuneLite Mobile");
-        tvTitle.setTextColor(0xFFFFFFFF);
-        tvTitle.setTextSize(22f);
+        tvTitle.setTextColor(UiTheme.GOLD);
+        tvTitle.setTextSize(26f);
         tvTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        tvTitle.setLetterSpacing(0.02f);
         tvTitle.setGravity(Gravity.CENTER);
         launcherPanel.addView(tvTitle);
 
         TextView tvSubtitle = new TextView(this);
-        tvSubtitle.setText("RuneLite client for Old School RuneScape");
-        tvSubtitle.setTextColor(0xFF9A9AA8);
+        tvSubtitle.setText("Old School RuneScape");
+        tvSubtitle.setTextColor(UiTheme.TEXT_MUTED);
         tvSubtitle.setTextSize(12f);
         tvSubtitle.setGravity(Gravity.CENTER);
-        tvSubtitle.setPadding(0, dp * 2, 0, dp * 5);
+        tvSubtitle.setPadding(0, dp * 2, 0, dp * 3);
         launcherPanel.addView(tvSubtitle);
 
+        View divider = new View(this);
+        divider.setBackground(UiTheme.rounded(UiTheme.GOLD_DIM, 0, 0, 0, density));
+        LinearLayout.LayoutParams dividerParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, (int) density));
+        dividerParams.bottomMargin = (int) (12 * density);
+        launcherPanel.addView(divider, dividerParams);
+
         tvSignedInAs = new TextView(this);
-        tvSignedInAs.setTextColor(0xFF7CD47C);
+        tvSignedInAs.setTextColor(UiTheme.TEXT);
         tvSignedInAs.setTextSize(15f);
         tvSignedInAs.setGravity(Gravity.CENTER);
-        tvSignedInAs.setPadding(0, 0, 0, dp * 2);
+        tvSignedInAs.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 12f, density));
+        tvSignedInAs.setPadding((int) (14 * density), (int) (14 * density),
+            (int) (14 * density), (int) (14 * density));
         launcherPanel.addView(tvSignedInAs);
 
         tvStatus = new TextView(this);
-        tvStatus.setTextColor(0xFFB8B8C8);
+        tvStatus.setTextColor(UiTheme.TEXT_MUTED);
         tvStatus.setTextSize(12f);
         tvStatus.setGravity(Gravity.CENTER);
-        tvStatus.setPadding(0, 0, 0, dp * 4);
+        tvStatus.setPadding(0, dp * 3, 0, dp * 2);
         launcherPanel.addView(tvStatus);
 
         // Update progress — kept near the top so it's visible without scrolling
@@ -408,17 +445,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         launcherPanel.addView(updateProgress);
 
         tvUpdateText = new TextView(this);
-        tvUpdateText.setTextColor(0xFFB8B8C8);
+        tvUpdateText.setTextColor(UiTheme.TEXT_MUTED);
         tvUpdateText.setTextSize(12f);
         tvUpdateText.setGravity(Gravity.CENTER);
         tvUpdateText.setVisibility(View.GONE);
         launcherPanel.addView(tvUpdateText);
 
-        btnSignIn = styledButton("Sign in with Jagex Account", new int[]{0xFF4F46E5, 0xFF7C3AED}, 16f);
+        btnSignIn = styledButton("Sign in with Jagex Account",
+            new int[]{0xFFFFD75E, 0xFFD6A419}, 0xFF231A05, 16f);
         btnSignIn.setOnClickListener(v -> startJagexLogin());
         launcherPanel.addView(btnSignIn);
 
-        btnPlay = styledButton("Play", new int[]{0xFF16A34A, 0xFF15803D}, 18f);
+        btnPlay = styledButton("Play", new int[]{0xFF4CBB5A, 0xFF2E7D32}, 0xFFFFFFFF, 18f);
         btnPlay.setOnClickListener(v -> onPlayClicked());
         launcherPanel.addView(btnPlay);
 
@@ -427,12 +465,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         launcherPanel.addView(btnSwitchCharacter);
 
         btnSignOut = linkButton("Sign out");
-        btnSignOut.setTextColor(0xFFE07A7A);
+        btnSignOut.setTextColor(UiTheme.RED);
         btnSignOut.setOnClickListener(v -> confirmSignOut());
         launcherPanel.addView(btnSignOut);
 
         tvVersion = new TextView(this);
-        tvVersion.setTextColor(0xFF70707E);
+        tvVersion.setTextColor(UiTheme.TEXT_DIM);
         tvVersion.setTextSize(11f);
         tvVersion.setGravity(Gravity.CENTER);
         tvVersion.setPadding(0, dp * 3, 0, 0);
@@ -443,7 +481,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         launcherPanel.addView(btnCheckUpdates);
 
         btnManual = linkButton("Manual session tokens (advanced)");
-        btnManual.setTextColor(0xFF66667A);
+        btnManual.setTextColor(UiTheme.TEXT_DIM);
         btnManual.setOnClickListener(v ->
             manualPanel.setVisibility(manualPanel.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
         launcherPanel.addView(btnManual);
@@ -455,7 +493,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         swJxMode = new Switch(this);
         swJxMode.setText("Enable Jagex Account Mode");
-        swJxMode.setTextColor(0xFFFFFFFF);
+        swJxMode.setTextColor(UiTheme.TEXT);
+        UiTheme.tintSwitch(swJxMode);
         swJxMode.setChecked(signedIn);
         manualPanel.addView(swJxMode);
 
@@ -468,83 +507,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         etDisplayName = createStyledEditText("JX_DISPLAY_NAME", displayName);
         manualPanel.addView(etDisplayName);
 
-        Button btnSave = styledButton("Save & Apply", new int[]{0xFF4F46E5, 0xFF7C3AED}, 15f);
+        Button btnSave = styledButton("Save & Apply", new int[]{0xFFFFD75E, 0xFFD6A419}, 0xFF231A05, 15f);
         btnSave.setOnClickListener(v -> saveManualCredentials());
         manualPanel.addView(btnSave);
 
-        launcherScroll.addView(launcherPanel);
+        launcherWrap.addView(launcherPanel);
+        launcherScroll.addView(launcherWrap);
         rootLayout.addView(launcherScroll);
 
-        // ── Floating settings button (visible while the game runs) ──
-        btnSettings = new Button(this);
-        btnSettings.setText("⚙");
-        btnSettings.setTextColor(0xFFFFFFFF);
-        btnSettings.setTextSize(16f);
-        GradientDrawable btnBg = new GradientDrawable();
-        btnBg.setColor(0xBB2E2E3E);
-        btnBg.setCornerRadius(15 * density);
-        btnBg.setStroke(2, 0xFF4F4F5F);
-        btnSettings.setBackground(btnBg);
-        FrameLayout.LayoutParams btnParams = new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        btnParams.gravity = Gravity.TOP | Gravity.RIGHT;
-        btnParams.topMargin = (int) (40 * density);
-        btnParams.rightMargin = (int) (40 * density);
-        btnSettings.setLayoutParams(btnParams);
-        btnSettings.setPadding((int) (28 * density), (int) (12 * density), (int) (28 * density), (int) (12 * density));
-        btnSettings.setOnClickListener(v ->
-            launcherScroll.setVisibility(launcherScroll.getVisibility() == View.VISIBLE ? View.GONE : View.VISIBLE));
-        btnSettings.setVisibility(View.GONE);
-        rootLayout.addView(btnSettings);
+        // ── Boot overlay: the client's own progress (the on-canvas debug text is
+        //    gone; its information lives here and in the drawer's Host tab). It is
+        //    added before the side panel so the column and drawer draw over it. ──
+        bootOverlay = new FrameLayout(this);
+        bootOverlay.setLayoutParams(new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        bootOverlay.setBackgroundColor(0xFF0E0C09);
+        bootOverlay.setVisibility(View.GONE);
 
-        // ── Native side panel: plugins, config and host status ──
-        // Built before the login overlay so the overlay stays on top. The drawer
-        // consumes touches only inside its own bounds (the game surface underneath
-        // keeps its size, so game input elsewhere is unaffected).
-        sidePanel = new SidePanel(this, rootLayout, GAME_W);
-        View panelToggle = sidePanel.createToggleButton();
-        btnPanel = panelToggle instanceof Button ? (Button) panelToggle : new Button(this);
-        FrameLayout.LayoutParams panelBtnParams = new FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        panelBtnParams.gravity = Gravity.TOP | Gravity.RIGHT;
-        panelBtnParams.topMargin = (int) (40 * density);
-        panelBtnParams.rightMargin = (int) (150 * density);
-        btnPanel.setLayoutParams(panelBtnParams);
-        btnPanel.setVisibility(View.GONE);
-        btnPanel.setOnClickListener(v -> sidePanel.toggle());
-        rootLayout.addView(btnPanel);
+        LinearLayout bootCard = new LinearLayout(this);
+        bootCard.setOrientation(LinearLayout.VERTICAL);
+        bootCard.setGravity(Gravity.CENTER_HORIZONTAL);
+        bootCard.setBackground(UiTheme.rounded(UiTheme.SURFACE, UiTheme.BORDER, 1f, 16f, density));
+        bootCard.setPadding((int) (24 * density), (int) (24 * density),
+            (int) (24 * density), (int) (24 * density));
+        FrameLayout.LayoutParams bootCardParams = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER);
+        bootCard.setLayoutParams(bootCardParams);
 
-        // ── Soft keyboard bridge: the game has no IME of its own, so a
-        //    floating "KB" button opens an EditText whose keystrokes are
-        //    forwarded into the client as AWT KeyEvents (display-name, chat) ──
-        float density2 = getResources().getDisplayMetrics().density;
-        kbButton = new Button(this);
-        kbButton.setText("KB");
-        kbButton.setTextSize(14f);
-        GradientDrawable kbBg = new GradientDrawable();
-        kbBg.setColor(0xAA2E2E3E);
-        kbBg.setCornerRadius(10 * density2);
-        kbBg.setStroke(2, 0xFF4F4F5F);
-        kbButton.setBackground(kbBg);
-        FrameLayout.LayoutParams kbBtnParams = new FrameLayout.LayoutParams(
-            (int) (52 * density2), (int) (44 * density2));
-        kbBtnParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        kbBtnParams.topMargin = (int) (8 * density2);
-        kbButton.setLayoutParams(kbBtnParams);
-        kbButton.setVisibility(View.GONE);
-        kbButton.setOnClickListener(v -> toggleKeyboardBar());
-        rootLayout.addView(kbButton);
+        ProgressBar bootSpinner = new ProgressBar(this);
+        bootSpinner.setIndeterminate(true);
+        bootSpinner.setIndeterminateTintList(android.content.res.ColorStateList.valueOf(UiTheme.GOLD));
+        bootCard.addView(bootSpinner, new LinearLayout.LayoutParams(
+            (int) (36 * density), (int) (36 * density)));
 
+        TextView tvBootTitle = new TextView(this);
+        tvBootTitle.setText("Starting RuneLite…");
+        tvBootTitle.setTextColor(UiTheme.TEXT);
+        tvBootTitle.setTextSize(15f);
+        tvBootTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        tvBootTitle.setGravity(Gravity.CENTER);
+        tvBootTitle.setPadding(0, (int) (12 * density), 0, (int) (6 * density));
+        bootCard.addView(tvBootTitle);
+
+        tvBootStatus = new TextView(this);
+        tvBootStatus.setTextColor(UiTheme.TEXT_MUTED);
+        tvBootStatus.setTextSize(12f);
+        tvBootStatus.setGravity(Gravity.CENTER);
+        tvBootStatus.setMaxLines(3);
+        bootCard.addView(tvBootStatus);
+
+        bootOverlay.addView(bootCard);
+        rootLayout.addView(bootOverlay);
+
+        // ── Soft keyboard bridge: the game has no IME of its own, so the keyboard
+        //    toggle at the foot of the right-edge column opens an EditText whose
+        //    keystrokes are forwarded into the client as AWT KeyEvents ──
         kbBar = new LinearLayout(this);
         kbBar.setOrientation(LinearLayout.HORIZONTAL);
-        kbBar.setPadding((int) (6 * density2), (int) (6 * density2), (int) (6 * density2), (int) (6 * density2));
+        kbBar.setGravity(Gravity.CENTER_VERTICAL);
+        kbBar.setBackground(UiTheme.rounded(UiTheme.SURFACE, UiTheme.GOLD_DIM, 1f, 0f, density));
+        kbBar.setPadding((int) (8 * density), (int) (8 * density), (int) (8 * density), (int) (8 * density));
         kbBar.setVisibility(View.GONE);
         kbEdit = new EditText(this);
         kbEdit.setSingleLine(true);
         kbEdit.setTextSize(16f);
         kbEdit.setHint("Type here...");
-        kbEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        kbEdit.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_GO);
+        kbEdit.setTextColor(UiTheme.TEXT);
+        kbEdit.setHintTextColor(UiTheme.TEXT_DIM);
+        kbEdit.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
+        kbEdit.setPadding((int) (10 * density), (int) (10 * density),
+            (int) (10 * density), (int) (10 * density));
+        // Not TYPE_TEXT_VARIATION_VISIBLE_PASSWORD: Gboard treats a password field as
+        // "must not be shoulder-surfed" and takes over the whole screen in landscape,
+        // covering this bar's own Enter/Hide buttons. NO_SUGGESTIONS +
+        // NO_PERSONALIZED_LEARNING keep the other half of that variation's behaviour
+        // (no autocorrect, no learned words) without the fullscreen takeover.
+        kbEdit.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+            | android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        kbEdit.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_GO
+            | android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            | android.view.inputmethod.EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING);
         kbEdit.setOnEditorActionListener((v, actionId, event) -> {
             dispatchKeyCode(java.awt.event.KeyEvent.VK_ENTER, '\n');
             return true;
@@ -576,20 +619,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
             }
         });
-        Button kbEnter = new Button(this);
-        kbEnter.setText("Enter");
+        TextView kbEnter = pillAction("Enter");
         kbEnter.setOnClickListener(v -> dispatchKeyCode(java.awt.event.KeyEvent.VK_ENTER, '\n'));
-        Button kbClose = new Button(this);
-        kbClose.setText("Hide");
+        TextView kbClose = pillAction("Hide");
         kbClose.setOnClickListener(v -> toggleKeyboardBar());
         kbBar.addView(kbEdit, new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
-        kbBar.addView(kbEnter, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        kbBar.addView(kbClose, new LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        kbBar.addView(kbEnter);
+        kbBar.addView(kbClose);
+        // Anchored to the TOP: with the soft keyboard up (Gboard takes the bottom
+        // half in landscape) a bottom-anchored bar is covered -- together with the
+        // game's own chat input line -- so neither the typed text nor the Enter/Hide
+        // buttons would be reachable.
         FrameLayout.LayoutParams kbBarParams = new FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT);
-        kbBarParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        kbBarParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         kbBar.setLayoutParams(kbBarParams);
         rootLayout.addView(kbBar);
+
+        // ── Native side panel: plugins, config and host status. Its right-edge
+        //    column is the port's only always-present chrome; the game surface is
+        //    inset by the width it occupies (applyGameInsets) instead of being
+        //    covered. Built before the login overlay so the overlay stays on top. ──
+        sidePanel = new SidePanel(this, rootLayout);
+        sidePanel.setListener(new SidePanel.Listener() {
+            @Override
+            public void onOpenChanged(boolean open) {
+                applyGameInsets();
+            }
+
+            @Override
+            public void onShowLauncherRequested() {
+                showLauncher();
+            }
+
+            @Override
+            public void onKeyboardToggleRequested() {
+                toggleKeyboardBar();
+            }
+        });
 
         // ── Login WebView overlay (WebView created lazily in startJagexLogin —
         //    instantiating it eagerly spawns a background renderer process) ──
@@ -618,33 +685,56 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         rootLayout.addView(loginOverlay);
 
+        // The app starts on the launcher screen: the right-edge chrome (and a drawer
+        // restored open from prefs) must not float over it.
+        sidePanel.setAvailable(false);
         updateLauncherUi();
     }
 
-    private Button styledButton(String text, int[] gradient, float textSize) {
+    private Button styledButton(String text, int[] gradient, int textColour, float textSize) {
         final float density = getResources().getDisplayMetrics().density;
         Button btn = new Button(this);
         btn.setText(text);
-        btn.setTextColor(0xFFFFFFFF);
+        btn.setTextColor(textColour);
         btn.setTextSize(textSize);
         btn.setTypeface(null, android.graphics.Typeface.BOLD);
         btn.setAllCaps(false);
-        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.LEFT_RIGHT, gradient);
-        bg.setCornerRadius(20 * density);
+        GradientDrawable bg = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, gradient);
+        bg.setCornerRadius(14 * density);
         btn.setBackground(bg);
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         lp.topMargin = (int) (10 * density);
         btn.setLayoutParams(lp);
         btn.setPadding(0, (int) (16 * density), 0, (int) (16 * density));
+        UiTheme.ripple(btn);
         return btn;
+    }
+
+    /** A small gold-on-stone pill: the keyboard bar's action buttons. */
+    private TextView pillAction(String text) {
+        final float density = getResources().getDisplayMetrics().density;
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextColor(UiTheme.GOLD);
+        view.setTextSize(12f);
+        view.setGravity(Gravity.CENTER);
+        view.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1f, 10f, density));
+        view.setPadding((int) (10 * density), (int) (10 * density),
+            (int) (10 * density), (int) (10 * density));
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.leftMargin = (int) (6 * density);
+        view.setLayoutParams(lp);
+        UiTheme.ripple(view);
+        return view;
     }
 
     private TextView linkButton(String text) {
         final float density = getResources().getDisplayMetrics().density;
         TextView tv = new TextView(this);
         tv.setText(text);
-        tv.setTextColor(0xFF8F8FBF);
+        tv.setTextColor(UiTheme.TEXT_MUTED);
         tv.setTextSize(13f);
         tv.setGravity(Gravity.CENTER);
         tv.setPadding(0, (int) (12 * density), 0, 0);
@@ -655,27 +745,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         final float density = getResources().getDisplayMetrics().density;
         EditText et = new EditText(this);
         et.setHint(hint);
-        et.setHintTextColor(0xFF666677);
+        et.setHintTextColor(UiTheme.TEXT_DIM);
         et.setText(value);
-        et.setTextColor(0xFFFFFFFF);
+        et.setTextColor(UiTheme.TEXT);
         et.setTextSize(14f);
         et.setSingleLine(true);
-        GradientDrawable etBg = new GradientDrawable();
-        etBg.setColor(0xFF0F0F14);
-        etBg.setCornerRadius(15 * density);
-        etBg.setStroke(2, 0xFF2F2F3F);
-        et.setBackground(etBg);
+        et.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
         params.topMargin = (int) (10 * density);
         et.setLayoutParams(params);
-        et.setPadding((int) (30 * density), (int) (20 * density), (int) (30 * density), (int) (20 * density));
+        et.setPadding((int) (14 * density), (int) (14 * density), (int) (14 * density), (int) (14 * density));
         return et;
     }
 
     private void updateLauncherUi() {
         if (signedIn && !sessionId.isEmpty()) {
-            tvSignedInAs.setText("Signed in as " + (displayName.isEmpty() ? characterId : displayName));
+            tvSignedInAs.setText("●  Signed in as " + (displayName.isEmpty() ? characterId : displayName));
             tvSignedInAs.setVisibility(View.VISIBLE);
             btnSignIn.setVisibility(View.GONE);
             btnPlay.setVisibility(View.VISIBLE);
@@ -700,7 +786,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (aotBad) {
             tvVersion.append("\nNOT AOT-COMPILED - expect ~5 fps (Host tab)");
         }
-        tvVersion.setTextColor(aotBad ? 0xFFE57373 : 0xFF70707E);
+        float density = getResources().getDisplayMetrics().density;
+        tvVersion.setTextColor(aotBad ? UiTheme.RED : UiTheme.TEXT_DIM);
+        tvVersion.setTextSize(aotBad ? 12f : 11f);
+        tvVersion.setBackground(aotBad
+            ? UiTheme.rounded(0x22E57373, UiTheme.RED, 1f, 8f, density)
+            : null);
+        tvVersion.setPadding(0, aotBad ? (int) (8 * density) : 0, 0, aotBad ? (int) (8 * density) : 0);
         swJxMode.setChecked(signedIn);
         etSessionId.setText(sessionId);
         etCharacterId.setText(characterId);
@@ -1110,7 +1202,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             loginActive = false;
             loginStage = LoginStage.IDLE;
             loginOverlay.setVisibility(View.GONE);
-            loaderStatus = "Login failed";
             tvStatus.setText(message);
             Toast.makeText(this, message, Toast.LENGTH_LONG).show();
         });
@@ -1264,11 +1355,56 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void launchGame() {
         launcherScroll.setVisibility(View.GONE);
-        btnSettings.setVisibility(View.VISIBLE);
-        kbButton.setVisibility(View.VISIBLE);
-        btnPanel.setVisibility(View.VISIBLE);
+        // The right-edge column (and with it the keyboard toggle) comes back here.
+        sidePanel.setAvailable(true);
+        firstFramePresented = false;   // a restarted/resumed client hides the overlay again
+        bootOverlay.setVisibility(View.VISIBLE);
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         tvStatus.setText("Starting game...");
         new Thread(this::bootstrapGameClient, "GameClientBootstrapper").start();
+    }
+
+    /**
+     * Returns to the launcher screen: the drawer header's ⌂ button, and the path a
+     * failed boot takes. Hides the right-edge chrome as well -- the drawer must not
+     * float over the launcher.
+     */
+    private void showLauncher() {
+        launcherScroll.setVisibility(View.VISIBLE);
+        kbBar.setVisibility(View.GONE);
+        bootOverlay.setVisibility(View.GONE);
+        sidePanel.setAvailable(false);
+        getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        updateLauncherUi();
+    }
+
+    /** Insets the game surface and the keyboard bar by the right-edge chrome width. */
+    private void applyGameInsets() {
+        int inset = sidePanel != null ? sidePanel.occupiedWidthPx() : 0;
+        insetRight(surfaceView, inset);
+        insetRight(kbBar, inset);
+    }
+
+    private static void insetRight(View view, int px) {
+        if (view == null) {
+            return;
+        }
+        android.view.ViewGroup.LayoutParams lp = view.getLayoutParams();
+        if (!(lp instanceof FrameLayout.LayoutParams)) {
+            return;   // both callers are rootLayout children
+        }
+        FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) lp;
+        if (flp.rightMargin == px) {
+            return;
+        }
+        flp.rightMargin = px;
+        view.setLayoutParams(flp);
+    }
+
+    private void hideBootOverlay() {
+        if (bootOverlay != null) {
+            bootOverlay.setVisibility(View.GONE);
+        }
     }
 
     /**
@@ -1378,6 +1514,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     while ((bytesRead = is.read(buffer)) != -1) {
                         os.write(buffer, 0, bytesRead);
                     }
+                }
+                // Keep the copy's timestamp at the APK's install time. The bytes are identical
+                // to the asset, so ART keeps using the `speed` odex (its class-loader context
+                // is keyed to the dex checksum) -- but ClientUpdater.clientDexAotStatus()
+                // compares mtimes, and a copy stamped "now" would make a perfectly good odex
+                // report as stale on the launcher after every Play.
+                if (apkTime > 0) {
+                    localJarFile.setLastModified(apkTime);
                 }
             }
             Log.i(TAG, "Using dexed client: " + localJarFile.getAbsolutePath() + " (" + localJarFile.length() + " bytes)");
@@ -1528,6 +1672,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                                 // (it waits for frameSeq to change).
                                                 frameSeq++;
                                                 renderLock.notifyAll();
+                                            }
+                                            if (!firstFramePresented) {
+                                                // The client is drawing: the boot overlay's job is done.
+                                                firstFramePresented = true;
+                                                runOnUiThread(MainActivity.this::hideBootOverlay);
                                             }
                                             lastBlitNanos = System.nanoTime() - blitStart;
                                         }
@@ -1694,11 +1843,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             updateStatus("FAILED: " + e.getClass().getSimpleName() + " - " + msg);
             runOnUiThread(() -> {
                 tvStatus.setText("Game failed to start: " + finalMsg);
-                launcherScroll.setVisibility(View.VISIBLE);
-                btnSettings.setVisibility(View.GONE);
-                kbButton.setVisibility(View.GONE);
-                btnPanel.setVisibility(View.GONE);
-                kbBar.setVisibility(View.GONE);
+                showLauncher();
                 Toast.makeText(this, "Loader Error: " + finalMsg, Toast.LENGTH_LONG).show();
             });
         }
@@ -1871,11 +2016,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void updateStatus(String status) {
-        this.loaderStatus = status;
         Log.i(TAG, "Status Update: " + status);
         runOnUiThread(() -> {
             if (tvStatus != null && loginStage == LoginStage.IDLE) {
                 tvStatus.setText(status);
+            }
+            if (tvBootStatus != null) {
+                tvBootStatus.setText(status);
             }
         });
     }
@@ -1897,8 +2044,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     if (suppressUntilUp) {
                         break;
                     }
-                    int x = toGameX(v, event.getX());
-                    int y = toGameY(v, event.getY());
+                    int x = toGameX(event.getX());
+                    int y = toGameY(event.getY());
                     // A mouse always moves before it presses. The client's own
                     // menus (the world list) pick the row from the *hover*
                     // position, so without this move a tap acts on wherever the
@@ -1907,36 +2054,59 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     lastMouseY = y;
                     lastMouseWhen = when;
                     dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_MOVED, x, y, when);
-                    // The press itself is held off: a second finger arriving
-                    // within TAP_PRESS_DELAY_MS makes this a camera gesture, and
-                    // then no left-button event is ever sent for this finger.
+                    // No left-button event is sent yet. The gesture decides which one it
+                    // is: a quick drag rotates the camera, a slow drag becomes a
+                    // left-button drag (interface items), a tap sends press+release+click
+                    // on lift, and a still finger held past LONG_PRESS_MS is a right click.
+                    // Deferring the press is what makes the long press possible at all --
+                    // the client acts on mouse *down*, so an early press would walk or
+                    // attack before any long-press timer could fire.
                     pointerDown = false;
+                    oneFingerDrag = false;
+                    touchDownViewX = event.getX();
+                    touchDownViewY = event.getY();
                     touchDownX = x;
                     touchDownY = y;
                     touchDownWhen = when;
-                    pendingPress = this::beginTapPress;
-                    surfaceView.postDelayed(pendingPress, TAP_PRESS_DELAY_MS);
+                    scheduleLongPress();
                     break;
                 }
                 case MotionEvent.ACTION_MOVE: {
                     if (suppressUntilUp) {
                         break;
                     }
-                    if (cameraDrag) {
-                        // The client's camera drag tracks the cursor; feed it the
-                        // two-finger centroid as a middle-button drag.
+                    if (event.getPointerCount() >= 2) {
+                        handleTwoFingerMove(event, when);
+                        break;
+                    }
+                    if (oneFingerDrag) {
+                        // Camera rotate (the official mobile client's one-finger drag):
+                        // feed the client's own middle-button drag path.
                         for (int i = 0; i < event.getHistorySize(); i++) {
                             emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
-                                centroidX(v, event, i, -1),
-                                centroidY(v, event, i, -1),
+                                toGameX(event.getHistoricalX(i)),
+                                toGameY(event.getHistoricalY(i)),
                                 wallFor(event, event.getHistoricalEventTime(i)),
                                 java.awt.event.MouseEvent.BUTTON2);
                         }
                         emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
-                            centroidX(v, event, -1, -1),
-                            centroidY(v, event, -1, -1),
-                            when,
+                            toGameX(event.getX()), toGameY(event.getY()), when,
                             java.awt.event.MouseEvent.BUTTON2);
+                        break;
+                    }
+                    // Any movement past the rotate threshold is the camera, whenever it
+                    // happens: an earlier version also required it to arrive inside a
+                    // 250 ms window and turned later movement into a left-button drag
+                    // instead, which stole slow rotations (the first MOVE of a fast drag
+                    // can arrive after the window, because the app's UI thread is busy
+                    // rendering the game) and walked the character. A press is therefore
+                    // only ever sent for a tap, on lift.
+                    if (!pointerDown
+                        && Math.hypot(event.getX() - touchDownViewX, event.getY() - touchDownViewY)
+                            > ROTATE_LOCK_DP * uiDensity) {
+                        cancelLongPress();
+                        oneFingerDrag = true;
+                        startCameraDrag(event.getX(), event.getY(), when, "one-finger drag");
                         break;
                     }
                     int motionId = pointerDown
@@ -1944,12 +2114,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                         : java.awt.event.MouseEvent.MOUSE_MOVED;
                     for (int i = 0; i < event.getHistorySize(); i++) {
                         emitSegment(motionId,
-                            toGameX(v, event.getHistoricalX(i)),
-                            toGameY(v, event.getHistoricalY(i)),
+                            toGameX(event.getHistoricalX(i)),
+                            toGameY(event.getHistoricalY(i)),
                             wallFor(event, event.getHistoricalEventTime(i)),
                             java.awt.event.MouseEvent.BUTTON1);
                     }
-                    emitSegment(motionId, toGameX(v, event.getX()), toGameY(v, event.getY()), when,
+                    emitSegment(motionId, toGameX(event.getX()), toGameY(event.getY()), when,
                         java.awt.event.MouseEvent.BUTTON1);
                     break;
                 }
@@ -1959,35 +2129,55 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     }
                     // Second finger: cancel the held-off press (nothing has been
                     // sent, so this gesture can never walk or attack), or release
-                    // a left press that was already in flight.
-                    cancelPendingPress();
+                    // a left press that was already in flight. A one-finger camera
+                    // drag hands over to the two-finger router.
+                    cancelLongPress();
                     if (pointerDown) {
                         dispatchMouseEvent(java.awt.event.MouseEvent.MOUSE_RELEASED, lastMouseX, lastMouseY, when);
                         pointerDown = false;
                     }
-                    int cx = centroidX(v, event, -1, -1);
-                    int cy = centroidY(v, event, -1, -1);
-                    lastMouseX = cx;
-                    lastMouseY = cy;
-                    lastMouseWhen = when;
-                    if (!cameraDrag) {
-                        cameraDrag = true;
-                        forceCameraDragSetting();
-                        emitPoint(java.awt.event.MouseEvent.MOUSE_PRESSED, cx, cy, when,
-                            java.awt.event.MouseEvent.BUTTON2);
+                    if (oneFingerDrag) {
+                        endCameraDrag(event.getX(), event.getY(), when);
+                        oneFingerDrag = false;
+                    }
+                    if (twoFingerMode == TWO_NONE) {
+                        gestureSpan0 = gestureSpanLast = pointerSpan(event);
+                        gestureCx0 = event.getX(0) / 2f + event.getX(1) / 2f;
+                        gestureCy0 = event.getY(0) / 2f + event.getY(1) / 2f;
+                        gestureStartWhen = when;
+                        zoomRemainder = 0;
+                        lastMouseX = lastMouseY = -1;
                     }
                     break;
                 }
                 case MotionEvent.ACTION_POINTER_UP: {
-                    if (cameraDrag) {
+                    if (twoFingerMode == TWO_NONE && event.getPointerCount() == 2
+                        && when - gestureStartWhen <= TWO_TAP_MAX_MS) {
+                        // Both fingers came and went without crossing the rotation/zoom lock:
+                        // a two-finger tap, i.e. the right click (the client's own context
+                        // menu). The held-off left press was cancelled when the second finger
+                        // arrived, so this is the only click the gesture produces. The point is
+                        // the midpoint of both fingers -- where the tap was aimed.
+                        int rx = centroidX(event, -1, -1);
+                        int ry = centroidY(event, -1, -1);
+                        emitRightClick(rx, ry, when);
+                        Log.i(TAG, "two-finger tap -> right click at " + rx + "," + ry);
+                        suppressUntilUp = true;
+                        pointerDown = false;
+                        lastMouseX = -1;
+                        break;
+                    }
+                    if (twoFingerMode != TWO_NONE) {
                         // Release the middle button at the surviving finger and
                         // ignore that finger's remaining events until it lifts.
-                        int sx = centroidX(v, event, -1, event.getActionIndex());
-                        int sy = centroidY(v, event, -1, event.getActionIndex());
-                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED, sx, sy, when,
-                            java.awt.event.MouseEvent.BUTTON2);
+                        if (twoFingerMode == TWO_ROTATE) {
+                            int sx = centroidX(event, -1, event.getActionIndex());
+                            int sy = centroidY(event, -1, event.getActionIndex());
+                            emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED, sx, sy, when,
+                                java.awt.event.MouseEvent.BUTTON2);
+                        }
                         restoreCameraDragSetting();
-                        cameraDrag = false;
+                        twoFingerMode = TWO_NONE;
                         pointerDown = false;
                         lastMouseX = -1;
                         suppressUntilUp = true;
@@ -1995,30 +2185,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     break;
                 }
                 case MotionEvent.ACTION_UP: {
-                    if (cameraDrag) {
-                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
-                            centroidX(v, event, -1, -1), centroidY(v, event, -1, -1), when,
-                            java.awt.event.MouseEvent.BUTTON2);
+                    cancelLongPress();
+                    if (twoFingerMode != TWO_NONE) {
+                        if (twoFingerMode == TWO_ROTATE) {
+                            emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
+                                centroidX(event, -1, -1), centroidY(event, -1, -1), when,
+                                java.awt.event.MouseEvent.BUTTON2);
+                        }
                         restoreCameraDragSetting();
-                        cameraDrag = false;
+                        twoFingerMode = TWO_NONE;
                         pointerDown = false;
                         lastMouseX = -1;
                         suppressUntilUp = false;
+                        break;
+                    }
+                    if (oneFingerDrag) {
+                        // The tap was cancelled when the drag started: end the camera
+                        // drag, send no left-button event at all.
+                        endCameraDrag(event.getX(), event.getY(), when);
+                        oneFingerDrag = false;
+                        pointerDown = false;
+                        lastMouseX = -1;
                         break;
                     }
                     if (suppressUntilUp) {
+                        // The long press already turned this gesture into a right click.
                         suppressUntilUp = false;
-                        cancelPendingPress();
                         pointerDown = false;
                         lastMouseX = -1;
                         break;
                     }
-                    int x = toGameX(v, event.getX());
-                    int y = toGameY(v, event.getY());
-                    if (pendingPress != null) {
-                        // Tap shorter than the hold-off: send the press it was
-                        // waiting for, then the usual release/click sequence.
-                        cancelPendingPress();
+                    int x = toGameX(event.getX());
+                    int y = toGameY(event.getY());
+                    if (!pointerDown) {
+                        // A tap: the press was deferred, so send it (at the down point)
+                        // now, followed by the usual release/click sequence.
                         beginTapPress();
                     }
                     emitSegment(pointerDown
@@ -2032,14 +2233,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     break;
                 }
                 case MotionEvent.ACTION_CANCEL: {
-                    cancelPendingPress();
-                    if (cameraDrag) {
-                        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
-                            centroidX(v, event, -1, -1), centroidY(v, event, -1, -1), when,
-                            java.awt.event.MouseEvent.BUTTON2);
+                    cancelLongPress();
+                    if (twoFingerMode != TWO_NONE) {
+                        if (twoFingerMode == TWO_ROTATE) {
+                            emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED,
+                                centroidX(event, -1, -1), centroidY(event, -1, -1), when,
+                                java.awt.event.MouseEvent.BUTTON2);
+                        }
                         restoreCameraDragSetting();
                     }
-                    cameraDrag = false;
+                    if (oneFingerDrag) {
+                        endCameraDrag(event.getX(), event.getY(), when);
+                    }
+                    oneFingerDrag = false;
+                    twoFingerMode = TWO_NONE;
                     suppressUntilUp = false;
                     pointerDown = false;
                     lastMouseX = -1;
@@ -2048,7 +2255,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 case MotionEvent.ACTION_SCROLL: {
                     int rotation = -(int) Math.round(event.getAxisValue(MotionEvent.AXIS_VSCROLL));
                     if (rotation != 0) {
-                        dispatchMouseWheel(toGameX(v, event.getX()), toGameY(v, event.getY()), rotation, when);
+                        dispatchMouseWheel(toGameX(event.getX()), toGameY(event.getY()), rotation, when);
                     }
                     break;
                 }
@@ -2057,21 +2264,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         });
     }
 
-    /** Drops the held-off single-finger press, if one is still scheduled. */
-    private void cancelPendingPress() {
-        if (pendingPress != null) {
-            surfaceView.removeCallbacks(pendingPress);
-            pendingPress = null;
+    private void scheduleLongPress() {
+        cancelLongPress();
+        longPress = this::fireLongPress;
+        surfaceView.postDelayed(longPress, LONG_PRESS_MS);
+    }
+
+    /** Drops the pending long press, if one is still scheduled. */
+    private void cancelLongPress() {
+        if (longPress != null) {
+            surfaceView.removeCallbacks(longPress);
+            longPress = null;
         }
     }
 
     /**
-     * Sends the held-off single-finger press, unless a camera gesture or a
+     * A finger that has not moved for {@link #LONG_PRESS_MS} is a right click: the
+     * client's context menu for whatever the cursor is over, with no left-button
+     * event ever sent for the gesture. The lift is then swallowed by
+     * {@code suppressUntilUp} so the menu is the only thing that happens.
+     */
+    private void fireLongPress() {
+        longPress = null;
+        if (oneFingerDrag || twoFingerMode != TWO_NONE || suppressUntilUp || pointerDown) {
+            return;
+        }
+        suppressUntilUp = true;
+        int x = lastMouseX < 0 ? touchDownX : lastMouseX;
+        int y = lastMouseY < 0 ? touchDownY : lastMouseY;
+        emitRightClick(x, y, System.currentTimeMillis());
+        Log.i(TAG, "long press -> right click at " + x + "," + y);
+    }
+
+    /**
+     * Sends the held-off single-finger press, unless a two-finger gesture or a
      * leftover finger superseded it.
      */
     private void beginTapPress() {
-        pendingPress = null;
-        if (cameraDrag || suppressUntilUp) {
+        if (oneFingerDrag || twoFingerMode != TWO_NONE || suppressUntilUp) {
             return;
         }
         pointerDown = true;
@@ -2080,12 +2310,129 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
+     * Routes a two-finger move: the gesture is undecided until the centroid
+     * moves (rotate) or the span changes (zoom), and the mode never changes back
+     * within one gesture. Both are fed to the client's own input handlers -- a
+     * middle-button drag for the rotation, a mouse wheel for the pinch (the
+     * client routes a wheel to the camera zoom in the world and to list
+     * scrolling while an interface is open, so one stream covers both).
+     */
+    private void handleTwoFingerMove(MotionEvent event, long when) {
+        float cx = event.getX(0) / 2f + event.getX(1) / 2f;
+        float cy = event.getY(0) / 2f + event.getY(1) / 2f;
+        float span = pointerSpan(event);
+        if (twoFingerMode == TWO_NONE) {
+            float moved = (float) Math.hypot(cx - gestureCx0, cy - gestureCy0);
+            float zoomed = Math.abs(span - gestureSpan0);
+            if (zoomed > ZOOM_LOCK_DP * uiDensity && zoomed > moved) {
+                twoFingerMode = TWO_ZOOM;
+                gestureSpanLast = span;
+            } else if (moved > ROTATE_LOCK_DP * uiDensity) {
+                twoFingerMode = TWO_ROTATE;
+                startCameraDrag(cx, cy, when, "two-finger gesture");
+                return;
+            } else {
+                return;
+            }
+        }
+        if (twoFingerMode == TWO_ROTATE) {
+            // The client's camera drag tracks the cursor; feed it the two-finger
+            // centroid as a middle-button drag.
+            for (int i = 0; i < event.getHistorySize(); i++) {
+                emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
+                    centroidX(event, i, -1),
+                    centroidY(event, i, -1),
+                    wallFor(event, event.getHistoricalEventTime(i)),
+                    java.awt.event.MouseEvent.BUTTON2);
+            }
+            emitSegment(java.awt.event.MouseEvent.MOUSE_DRAGGED,
+                centroidX(event, -1, -1),
+                centroidY(event, -1, -1),
+                when,
+                java.awt.event.MouseEvent.BUTTON2);
+            return;
+        }
+        zoomRemainder += (span - gestureSpanLast) / (ZOOM_DP_PER_NOTCH * uiDensity);
+        gestureSpanLast = span;
+        int steps = (int) zoomRemainder;
+        zoomRemainder -= steps;
+        if (steps > ZOOM_MAX_NOTCHES) {
+            steps = ZOOM_MAX_NOTCHES;
+        } else if (steps < -ZOOM_MAX_NOTCHES) {
+            steps = -ZOOM_MAX_NOTCHES;
+        }
+        if (steps != 0) {
+            // Fingers apart (steps > 0) must zoom IN: the client's wheel rotation sign is
+            // the opposite of the pinch's span change (verified on the device -- dispatching
+            // `steps` unchanged zoomed out on a spread pinch).
+            dispatchMouseWheel(toGameX(cx), toGameY(cy), -steps, when);
+            Log.i(TAG, "pinch zoom " + steps + " notch(es)");
+        }
+    }
+
+    /**
+     * Starts the client's own camera drag with a middle-button press at the
+     * centroid. A mouse always moves before it presses, and the client measures
+     * its first drag delta against the <em>published</em> cursor position --
+     * which still holds the finger's position when the gesture started. Leaving
+     * it there makes the first drag rotate by (centroid - that position): the
+     * one-time camera jump at the start of a rotation.
+     */
+    private void startCameraDrag(float viewX, float viewY, long when, String why) {
+        forceCameraDragSetting();
+        int cx = toGameX(viewX);
+        int cy = toGameY(viewY);
+        lastMouseX = -1;
+        lastMouseY = -1;
+        emitPoint(java.awt.event.MouseEvent.MOUSE_MOVED, cx, cy, when,
+            java.awt.event.MouseEvent.BUTTON1);
+        lastMouseX = cx;
+        lastMouseY = cy;
+        lastMouseWhen = when;
+        emitPoint(java.awt.event.MouseEvent.MOUSE_PRESSED, cx, cy, when,
+            java.awt.event.MouseEvent.BUTTON2);
+        Log.i(TAG, why + " -> rotate");
+    }
+
+    /**
+     * A two-finger tap is the right click: the client's own context menu. The
+     * cursor is moved to the point first for the same reason the left tap moves
+     * it -- the client builds the menu from the <em>hovered</em> target, not from
+     * the position embedded in the press.
+     */
+    private void emitRightClick(int x, int y, long when) {
+        emitPoint(java.awt.event.MouseEvent.MOUSE_MOVED, x, y, when,
+            java.awt.event.MouseEvent.BUTTON1);
+        emitPoint(java.awt.event.MouseEvent.MOUSE_PRESSED, x, y, when,
+            java.awt.event.MouseEvent.BUTTON3);
+        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED, x, y, when,
+            java.awt.event.MouseEvent.BUTTON3);
+        emitPoint(java.awt.event.MouseEvent.MOUSE_CLICKED, x, y, when,
+            java.awt.event.MouseEvent.BUTTON3);
+    }
+
+    /** Ends a camera drag: the middle button goes up and the client setting is restored. */
+    private void endCameraDrag(float viewX, float viewY, long when) {
+        emitPoint(java.awt.event.MouseEvent.MOUSE_RELEASED, toGameX(viewX), toGameY(viewY), when,
+            java.awt.event.MouseEvent.BUTTON2);
+        restoreCameraDragSetting();
+    }
+
+    /** Euclidean distance between the first two pointers in view pixels; 0 with fewer than two. */
+    private float pointerSpan(MotionEvent event) {
+        if (event.getPointerCount() < 2) {
+            return 0f;
+        }
+        return (float) Math.hypot(event.getX(0) - event.getX(1), event.getY(0) - event.getY(1));
+    }
+
+    /**
      * Mean x of the active pointers (at most the first two) in game coordinates,
      * either for historical sample {@code sample} or, with {@code sample < 0},
      * the current position. {@code excludeIndex} skips one pointer (the one
      * lifting, on ACTION_POINTER_UP).
      */
-    private int centroidX(android.view.View v, MotionEvent event, int sample, int excludeIndex) {
+    private int centroidX(MotionEvent event, int sample, int excludeIndex) {
         float sum = 0f;
         int n = 0;
         for (int i = 0; i < event.getPointerCount() && i < 2; i++) {
@@ -2095,10 +2442,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             sum += sample < 0 ? event.getX(i) : event.getHistoricalX(i, sample);
             n++;
         }
-        return n == 0 ? 0 : toGameX(v, sum / n);
+        return n == 0 ? 0 : toGameX(sum / n);
     }
 
-    private int centroidY(android.view.View v, MotionEvent event, int sample, int excludeIndex) {
+    private int centroidY(MotionEvent event, int sample, int excludeIndex) {
         float sum = 0f;
         int n = 0;
         for (int i = 0; i < event.getPointerCount() && i < 2; i++) {
@@ -2108,7 +2455,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             sum += sample < 0 ? event.getY(i) : event.getHistoricalY(i, sample);
             n++;
         }
-        return n == 0 ? 0 : toGameY(v, sum / n);
+        return n == 0 ? 0 : toGameY(sum / n);
     }
 
     /**
@@ -2151,12 +2498,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         forcedCameraSetting = null;
     }
 
-    private int toGameX(android.view.View v, float raw) {
-        return (int) (raw * GAME_W / v.getWidth());
+    /**
+     * Maps a raw view x to a game pixel inside the letterbox fit. A point in a
+     * bar clamps to the nearest game pixel instead of being dropped: a finger
+     * that lands in a bar and drags into the game must keep its gesture stream
+     * (dropping it would break the two-finger camera gesture when a finger
+     * strays into a bar).
+     */
+    private int toGameX(float raw) {
+        int w = fitW;
+        if (w <= 0) {
+            return 0;
+        }
+        int x = (int) ((raw - fitLeft) * GAME_W / w);
+        return x < 0 ? 0 : Math.min(x, GAME_W - 1);
     }
 
-    private int toGameY(android.view.View v, float raw) {
-        return (int) (raw * GAME_H / v.getHeight());
+    private int toGameY(float raw) {
+        int h = fitH;
+        if (h <= 0) {
+            return 0;
+        }
+        int y = (int) ((raw - fitTop) * GAME_H / h);
+        return y < 0 ? 0 : Math.min(y, GAME_H - 1);
     }
 
     /**
@@ -3194,7 +3558,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         surfaceW = width;
         surfaceH = height;
         // The frame buffer is the client's own fixed 765x503 size; Skia scales
-        // it to the surface in drawBitmap (nearest-neighbour, see scalePaint).
+        // it to the letterbox fit in drawBitmap (nearest-neighbour, see scalePaint).
         renderBitmap = Bitmap.createBitmap(GAME_W, GAME_H, Bitmap.Config.ARGB_8888);
         // The rasterizer writes 3D pixels with alpha 0. An alpha bitmap would
         // have its alpha-0 pixels dropped by Skia's SRC_OVER blend, leaving the
@@ -3202,7 +3566,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // symptom); setHasAlpha(false) replaces the old `| 0xFF000000` pass.
         renderBitmap.setHasAlpha(false);
         srcRect.set(0, 0, GAME_W, GAME_H);
-        dstRect.set(0, 0, surfaceW, surfaceH);
+        // Uniform scale, centred: the game keeps its native aspect (a stretch to
+        // fill would distort it) and the leftover strips are painted with barPaint.
+        float scale = Math.min(width / (float) GAME_W, height / (float) GAME_H);
+        fitW = Math.max(1, Math.round(GAME_W * scale));
+        fitH = Math.max(1, Math.round(GAME_H * scale));
+        fitLeft = (width - fitW) / 2;
+        fitTop = (height - fitH) / 2;
+        Log.i(TAG, "surface " + width + "x" + height + " fit " + fitW + "x" + fitH
+            + " at " + fitLeft + "," + fitTop);
     }
 
     @Override
@@ -3254,14 +3626,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             try {
                 canvas = surfaceHolder.lockCanvas();
                 if (canvas != null) {
-                    // One native capped draw: Skia scales the frame buffer to the
-                    // surface (nearest-neighbour, see scalePaint) and composites
-                    // it opaquely (setHasAlpha(false)).
-                    canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint);
+                    // Letterbox: paint the bars, then blit into the centred fit rect.
+                    renderDst.set(fitLeft, fitTop, fitLeft + fitW, fitTop + fitH);
+                    // The surface buffer is not cleared by the system and bar pixels are
+                    // left over from the previous geometry, so repaint the four strips
+                    // (empty rects are cheap/skipped).
+                    int sw = surfaceW, sh = surfaceH;
+                    int l = fitLeft, t = fitTop, r = fitLeft + fitW, b = fitTop + fitH;
+                    if (l > 0) {
+                        canvas.drawRect(0, 0, l, sh, barPaint);
+                        canvas.drawRect(r, 0, sw, sh, barPaint);
+                    }
+                    if (t > 0) {
+                        canvas.drawRect(0, 0, sw, t, barPaint);
+                        canvas.drawRect(0, b, sw, sh, barPaint);
+                    }
+                    // One native capped draw: Skia scales the frame buffer into the fit
+                    // rect (nearest-neighbour, see scalePaint) and composites it opaquely
+                    // (setHasAlpha(false)).
+                    canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint);
                     lastScaleNanos = System.nanoTime() - scaleStart;
-
-                    canvas.drawText("RuneLite Mobile (AWT Bridge Active)", 40, 70, debugPaint);
-                    canvas.drawText(loaderStatus, 40, 130, highlightPaint);
 
                     // Diagnostic: report the game's state machine position periodically
                     long now = System.currentTimeMillis();

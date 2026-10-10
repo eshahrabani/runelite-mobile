@@ -11,24 +11,26 @@ three facts.
 
 ## 1. The contract
 
-The game world is a fixed 765×503 ARGB space (`GAME_W`/`GAME_H`, `MainActivity.java:60-61`). That is
+The game world is a fixed 765×503 ARGB space (`GAME_W`/`GAME_H`, `MainActivity.java`). That is
 the client's own frame size, not a device size; the surface is a separate, larger coordinate space.
 Three buffers must agree or the frame is wrong:
 
 | Buffer | Owner | Role |
 |---|---|---|
-| `appletPixels` `int[GAME_W * GAME_H]` | `MainActivity` (`MainActivity.java:88`) | the display buffer `Graphics.drawImage` writes into; the render thread reads it |
-| `AWTBridge.activePixels` / `activeWidth` / `activeHeight` | `core` static (`AWTBridge.java:11-13`) | the handle core-side code uses to reach that same array |
-| `renderBitmap` | `MainActivity` (`MainActivity.java:75`) | the Android `Bitmap` the array is copied into and blitted from |
+| `appletPixels` `int[GAME_W * GAME_H]` | `MainActivity` (`MainActivity.java`) | the display buffer `Graphics.drawImage` writes into; the render thread reads it |
+| `AWTBridge.activePixels` / `activeWidth` / `activeHeight` | `core` static (`AWTBridge.java`) | the handle core-side code uses to reach that same array |
+| `renderBitmap` | `MainActivity` (`MainActivity.java`) | the Android `Bitmap` the array is copied into and blitted from |
 
 `onCreate` binds the first two together exactly once: `AWTBridge.activePixels = appletPixels;
-AWTBridge.activeWidth = GAME_W; AWTBridge.activeHeight = GAME_H;` (`MainActivity.java:206-208`). Change
+AWTBridge.activeWidth = GAME_W; AWTBridge.activeHeight = GAME_H;` (`MainActivity.java`). Change
 `GAME_W`/`GAME_H` and you must change the client's frame size, the array length, and the bridge
 dimensions together — they are not independently adjustable.
 
 `renderBitmap` is recreated on every surface change as `Bitmap.createBitmap(GAME_W, GAME_H, ARGB_8888)`
-(`MainActivity.java:3198`), with `srcRect` set to the whole frame and `dstRect` to the whole surface
-(`MainActivity.java:3204-3205`).
+with `srcRect` set to the whole frame (`MainActivity.surfaceChanged`). The destination is **not** the
+whole surface: the surface is letterboxed to the frame's 765:503 aspect (uniform scale, centred) and
+`fitLeft/fitTop/fitW/fitH` are that fit rect, recomputed on every `surfaceChanged` and logged as
+`surface <w>x<h> fit <w>x<h> at <l>,<t>`.
 
 ```svg
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 250" role="img" aria-label="Pixel flow from the client frame to the surface">
@@ -75,11 +77,12 @@ dimensions together — they are not independently adjustable.
 
 The client calls the `Callbacks.draw(MainBufferProvider, Graphics, int, int)` overload once per
 completed frame. The proxy's frame-blit branch receives the provider as `args[0]` and the destination
-`Graphics` as `args[1]` (`MainActivity.java:1504-1538`). It binds the rasterizer, grabs the frame
+`Graphics` as `args[1]` (callbacks proxy). It binds the rasterizer, grabs the frame
 `Image` via reflection (`args[0].getClass().getMethod("getImage")`), and inside `synchronized
 (renderLock)` either delegates to `Hooks.draw` (which composites overlays and blits the frame into
 `args[1]`) or does `((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null)` when no host is running.
-Only then does it bump `frameSeq` and `renderLock.notifyAll()` (`MainActivity.java:1529-1530`).
+Only then does it bump `frameSeq` and `renderLock.notifyAll()`, and on the first frame it clears
+`firstFramePresented` so the boot overlay hides.
 
 ```mermaid
 sequenceDiagram
@@ -97,11 +100,11 @@ sequenceDiagram
     R->>P: "wait on renderLock while frameSeq == lastDrawnSeq"
     P-->>R: "frame ready"
     R->>R: "renderBitmap.setPixels(appletPixels, 0, GAME_W, ...)"
-    R->>S: "drawBitmap(renderBitmap, srcRect, dstRect, scalePaint)"
+    R->>S: "drawRect bars + drawBitmap(renderBitmap, srcRect, renderDest, scalePaint)"
 ```
 
 `runRenderLoop` blocks in `while (isRunning && frameSeq == lastDrawnSeq) renderLock.wait(100)` before
-presenting (`MainActivity.java:3242-3247`). The loop is **not** on a timer, and the render thread must
+presenting. The loop is **not** on a timer, and the render thread must
 **never** call `client.paint()`: that would read the game's live frame buffer while the client thread
 is rendering the next frame into it, which is the torn-frame symptom. The only correctness rule is
 that each presented frame is exactly one completed client frame.
@@ -110,14 +113,18 @@ that each presented frame is exactly one completed client frame.
 
 | Callback | Action |
 |---|---|
-| `surfaceCreated` | sets `isRunning = true`, starts the `"AWTBridge-RenderThread"` thread (`MainActivity.java:3185-3189`) |
-| `surfaceChanged` | recreates `renderBitmap`, disables its alpha, and resizes `srcRect`/`dstRect` (`MainActivity.java:3193-3205`) |
-| `surfaceDestroyed` | sets `isRunning = false`, interrupts and joins the render thread (`MainActivity.java:3209-3220`) |
+| `surfaceCreated` | sets `isRunning = true`, starts the `"AWTBridge-RenderThread"` thread |
+| `surfaceChanged` | recreates `renderBitmap`, disables its alpha, sets `srcRect`, and recomputes the letterbox fit (`surfaceW/H`, `fitLeft/Top/W/H`) |
+| `surfaceDestroyed` | sets `isRunning = false`, interrupts and joins the render thread |
+
+The surface is inset by the right-edge chrome whenever the drawer or its column is showing
+(`applyGameInsets`, see [side-panel.md](side-panel.md)), so a drawer toggle fires `surfaceChanged`
+with a smaller width and the game reletterboxes to the reduced area instead of being overlapped.
 
 The render thread runs at `THREAD_PRIORITY_DISPLAY` so it stays scheduled while the client thread
-saturates a core with the software renderer (`MainActivity.java:3227`). While `renderBitmap == null`
+saturates a core with the software renderer (`MainActivity.runRenderLoop`). While `renderBitmap == null`
 (no surface yet) the loop sleeps 50 ms per iteration so background work — updates, dexing — is not
-starved (`MainActivity.java:3228-3238`). It never holds the canvas lock while idle.
+starved. It never holds the canvas lock while idle.
 
 ## 3. The three invariants
 
@@ -131,13 +138,13 @@ starved (`MainActivity.java:3228-3238`). It never holds the canvas lock while id
 - **Fix:** `bindSceneRasterizerToDisplay(bufferProvider)` re-points the target every frame. It reads
   the provider's pixels, width, and height, fetches the static depth array `yw.aw`, and calls the
   static `yw.ef(int[], int, int, float[])` — which sets output, clip, and depth together
-  (`MainActivity.java:2828-2842`). It early-returns when the array reference is unchanged, so it is
+  (`MainActivity.java`). It early-returns when the array reference is unchanged, so it is
   idempotent, and it re-checks per frame because the client can re-point `yw.ah` behind the app's
   back.
 - **Trap:** do **not** retarget `fa.ak`. It is not a pixel target; it is each rasterizer's reference to
   the 65536-entry HSL→RGB palette (`fq.aq`). Re-pointing it at the frame makes shaded fills read
   screen pixels — walls take grey from the upper screen, ground and tree trunks go black
-  (`MainActivity.java:2789-2801`). `paletteInvariant()` checks the palette references are still intact
+  (`MainActivity.java`). `paletteInvariant()` checks the palette references are still intact
   and is surfaced in the frame log (§8).
 - The client-internal names `yw.ef`, `yw.ah`, `yw.aw`, `fq.aq`, `fa.ak` are version-specific and must
   be re-derived after a client bump; see [telemetry-assessment.md](telemetry-assessment.md) §6 for the
@@ -150,56 +157,60 @@ starved (`MainActivity.java:3228-3238`). It never holds the canvas lock while id
   SRC_OVER, so if the bitmap carries alpha, its alpha-0 pixels are dropped and the previous surface
   content stays visible.
 - **Fix:** `renderBitmap.setHasAlpha(false)` right after the bitmap is created
-  (`MainActivity.java:3203`). Skia then treats the bitmap as opaque. This replaces the older
+  (`MainActivity.surfaceChanged`). Skia then treats the bitmap as opaque. This replaces the older
   `pixel | 0xFF000000` pass that forced alpha per pixel on the Java side.
 
 ### 3.3 The two `drawImage` paths and the `hasAlpha` gate
 
 `Graphics.drawImage` writes into a shared non-premultiplied ARGB `int[]`; destination alpha is ignored
-for colour arithmetic and preserved on write (`Graphics.java:7-19`). It branches once on
-`img.hasAlpha` (`Graphics.java:381-385`):
+for colour arithmetic and preserved on write (`Graphics.java`). It branches once on
+`img.hasAlpha` (`Graphics.java`):
 
-- **Opaque, 1:1:** one `System.arraycopy` per row (`Graphics.java:385-396`). This is the game's
+- **Opaque, 1:1:** one `System.arraycopy` per row (`Graphics.java`). This is the game's
   every-frame path — `drawImage(img, 0, 0, null)` with the source already at display size — so it must
   stay branch-free and native.
 - **Opaque, scaled:** a divide-free nearest-neighbour loop stepping source row/column with accumulators
-  (`Graphics.java:397-427`), used by the splash logo.
+  (`Graphics.java`), used by the splash logo.
 - **Blended:** only sources with `hasAlpha` take `drawImageBlend`, the same accumulator walk with a
-  per-pixel source-over (`Graphics.java:436-466`).
+  per-pixel source-over (`Graphics.java`).
 
 `blendPixel` scales source alpha by the composite alpha; when `!destHasAlpha` it blends RGB but keeps
-the destination alpha byte (`Graphics.java:521-536`), which is why overlays drawn over the alpha-0 game
+the destination alpha byte (`Graphics.java`), which is why overlays drawn over the alpha-0 game
 frame blend visually instead of turning opaque. This is the same contract that keeps
 `BufferedImage.getRGB` returning an opaque colour: with an empty alpha mask,
-`DirectColorModel.getRGB` returns `0xFF000000 | (pixel & 0xFFFFFF)` (`BufferedImage.java:46-47`).
+`DirectColorModel.getRGB` returns `0xFF000000 | (pixel & 0xFFFFFF)` (`BufferedImage.java`).
 See [core-stubs.md](core-stubs.md) for the full `Graphics`/`Image` fidelity limits.
 
 ## 4. Presentation cost model
 
 Presentation is two native calls and no Java per-pixel work: `renderBitmap.setPixels(appletPixels, 0,
-GAME_W, 0, 0, GAME_W, GAME_H)` (`MainActivity.java:3251`) and a single
-`canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint)` (`MainActivity.java:3260`). Skia scales
-765×503 to the surface in native code.
+GAME_W, 0, 0, GAME_W, GAME_H)` and a single
+`canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)`. Skia scales
+765×503 to the fit rect in native code. Four `drawRect` calls paint the letterbox bars first (empty
+rects are skipped), because the surface buffer is not cleared by the system and bar pixels are left
+over from the previous geometry.
 
 Do **not** reintroduce the historical per-pixel Java scale loop plus `| 0xFF000000` pass: recorded in
 the port's own recorded measurement at 172-229 ms/frame on a Pixel 8 Pro, versus ~12-15 ms of one core at 2244×1008
 for the current path. `scalePaint` is configured `setFilterBitmap(false)` and `setDither(false)`
-(`MainActivity.java:243-244`) so the upscale is nearest-neighbour — the same sampling the old loop
-used — with no dithering pass.
+so the upscale is nearest-neighbour — the same sampling the old loop
+used — with no dithering pass. `scaleMs=` in the GameState log measures exactly `setPixels` + the blit.
 
-SVG #2 shows the blit geometry: `dstRect` is the whole surface, so scaling is non-uniform when the
-surface aspect differs from 765:503.
+SVG #2 shows the blit geometry: `srcRect` is the whole 765×503 frame and `renderDst` is the centred
+fit rect inside the surface, so the scale is uniform and the leftover strips are painted with
+`barPaint` (`UiTheme.BG_DEEP`).
 
 ```svg
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 330" role="img" aria-label="765 by 503 frame scaled into the surface destination rectangle">
-  <text x="30" y="28" font-size="16" fill="var(--fg)">Blit geometry: srcRect (765&#215;503) &#8594; dstRect (surface size)</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 330" role="img" aria-label="765 by 503 frame scaled into the centred letterbox fit rect">
+  <text x="30" y="28" font-size="16" fill="var(--fg)">Blit geometry: srcRect (765&#215;503) &#8594; renderDst (centred fit rect)</text>
   <rect x="60" y="100" width="230" height="151" fill="var(--surface)" stroke="var(--border)"/>
   <text x="175" y="90" font-size="14" fill="var(--fg)" text-anchor="middle">srcRect (0,0,765,503)</text>
   <text x="175" y="182" font-size="13" fill="var(--muted)" text-anchor="middle">renderBitmap</text>
-  <rect x="520" y="60" width="340" height="153" fill="var(--surface)" stroke="var(--border)"/>
-  <text x="690" y="50" font-size="14" fill="var(--fg)" text-anchor="middle">dstRect (0,0,surfaceW,surfaceH)</text>
-  <text x="690" y="140" font-size="13" fill="var(--muted)" text-anchor="middle">Surface canvas</text>
-  <line x1="292" y1="175" x2="516" y2="140" stroke="var(--accent)" fill="none" marker-end="url(#blit)"/>
+  <rect x="520" y="60" width="340" height="223" fill="var(--surface)" stroke="var(--border)"/>
+  <rect x="520" y="103" width="340" height="137" fill="var(--c1)" fill-opacity="0.25" stroke="var(--accent)"/>
+  <text x="690" y="50" font-size="14" fill="var(--fg)" text-anchor="middle">Surface canvas (surfaceW &#215; surfaceH)</text>
+  <text x="690" y="176" font-size="13" fill="var(--fg)" text-anchor="middle">renderDst = fit rect</text>
+  <line x1="292" y1="175" x2="516" y2="171" stroke="var(--accent)" fill="none" marker-end="url(#blit)"/>
   <defs>
     <marker id="blit" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
       <path d="M0,0 L8,4 L0,8" fill="var(--accent)"/>
@@ -209,8 +220,8 @@ surface aspect differs from 765:503.
   <text x="330" y="222" font-size="12" fill="var(--muted)">Skia nearest-neighbour, setFilterBitmap(false)</text>
   <text x="175" y="272" font-size="12" fill="var(--muted)" text-anchor="middle">765 px wide</text>
   <text x="47" y="180" font-size="12" fill="var(--muted)" text-anchor="middle" transform="rotate(-90 47 180)">503 px high</text>
-  <text x="690" y="232" font-size="12" fill="var(--muted)" text-anchor="middle">surfaceW &#215; surfaceH, the whole window</text>
-  <text x="30" y="310" font-size="12" fill="var(--muted)">The frame is stretched to the full surface, so the horizontal and vertical scales differ whenever the surface aspect is not 765:503.</text>
+  <text x="690" y="299" font-size="12" fill="var(--muted)" text-anchor="middle">barPaint fills the four strips around the fit</text>
+  <text x="30" y="318" font-size="12" fill="var(--muted)">Uniform scale (min of the two ratios), centred: the game keeps its 765:503 aspect and is never stretched.</text>
 </svg>
 ```
 
@@ -218,7 +229,7 @@ surface aspect differs from 765:503.
 
 The client has its own frame clock; the port only unlocks it. After `client.initialize()`, bootstrap
 calls `Client.setUnlockedFps(true)` and then `Client.setUnlockedFpsTarget(FPS_TARGET)` with
-`FPS_TARGET = 60` (`MainActivity.java:68`, `MainActivity.java:1664-1666`).
+`FPS_TARGET = 60` (`MainActivity.java`, `MainActivity.java`).
 
 Order matters: `setUnlockedFps` first, `setUnlockedFpsTarget` second, because turning unlocked fps off
 clears the target. With the default clock the presented rate is decoupled from the rendered rate — the
@@ -232,15 +243,15 @@ this only controls how often a completed frame is handed to the render thread.
 Plugin overlays render into the client's own frame, not into a separate layer. Inside the frame-blit
 proxy, `Hooks.draw` composites overlays into the client frame image (`mainBufferProvider.getImage()`)
 and then blits that image into `args[1]`, which is the `Graphics` over `appletPixels`
-(`MainActivity.java:1514-1529`). The consequence: the presented frame already contains overlays, and
+(`MainActivity.java`). The consequence: the presented frame already contains overlays, and
 the render thread copies frame-plus-overlays in one `setPixels`.
 
 The `ABOVE_WIDGETS` overlay layer needs an interface to exist. It is drawn from `renderAfterInterface`,
 so an overlay only appears when its interface is drawn. `drawInterface` records the interface id and
-counts overlays registered for it (`MainActivity.java:1558-1565`); `lastInterfaceDrawn` starts at `-1`
-(`MainActivity.java:2703`), so on the login screen (no interface) the `ABOVE_WIDGETS` overlays never
+counts overlays registered for it (`MainActivity.java`); `lastInterfaceDrawn` starts at `-1`
+(`MainActivity.java`), so on the login screen (no interface) the `ABOVE_WIDGETS` overlays never
 draw. Entity rendering is a separate path: the `draw(Renderable, boolean)` overload lets plugins veto
-individual actors and is counted by `countEntityDraw` (`MainActivity.java:1483-1499`).
+individual actors and is counted by `countEntityDraw` (`MainActivity.java`).
 
 See [plugin-runtime.md](plugin-runtime.md) for overlay registration and [diagnostics.md](diagnostics.md)
 for the overlay-count probes.
@@ -253,14 +264,14 @@ a bridge:
 
 | Step | Where |
 |---|---|
-| RuneLite asks `Graphics.drawString` | `core/src/main/java/java/awt/Graphics.java:337-354` |
-| `Font` lazily resolves an opaque platform handle | `Font.getTextRendererHandle()` (`Font.java:126-135`) |
+| RuneLite asks `Graphics.drawString` | `core/src/main/java/java/awt/Graphics.java` |
+| `Font` lazily resolves an opaque platform handle | `Font.getTextRendererHandle()` (`Font.java`) |
 | `TextBridge` forwards measure/draw | `core/src/main/java/org/runelite/mobile/bridge/TextBridge.java` |
 | App renders glyphs | `AndroidTextRenderer` |
 
 `MainActivity.onCreate` installs the renderer once: `AndroidTextRenderer.setFontDir(new
 File(getCacheDir(), "fonts")); TextBridge.renderer = new AndroidTextRenderer();`
-(`MainActivity.java:224-225`). `AndroidTextRenderer` turns the TTF bytes into an
+(`MainActivity.java`). `AndroidTextRenderer` turns the TTF bytes into an
 `android.graphics.Typeface` via `Typeface.Builder` (which only reads files, hence the cache font dir),
 caches one `Paint` per (family, style, size), and draws into a single reusable scratch `Bitmap` that
 it then composites source-over into the destination ARGB array (`AndroidTextRenderer.java`). The
@@ -270,11 +281,10 @@ instead of throwing, so overlay code never dies because text is unavailable.
 
 ## 8. Telemetry and debug surface
 
-Two periodic logs and one on-canvas overlay describe the frame.
+Two periodic logs and one overlay describe the frame.
 
-**`callbacks.draw` frame log** — throttled to one line per 2 s (`MainActivity.java:2629-2631`),
-prefixed `callbacks.draw: <w>x<h> fps=<n> (<n> in <ms>ms)` and followed by the fields built in
-`logFrameDiagnostics` (`MainActivity.java:2626-2676`):
+**`callbacks.draw` frame log** — throttled to one line per 2 s, prefixed `callbacks.draw: <w>x<h> fps=<n> (<n> in <ms>ms)` and followed by the fields built in
+`logFrameDiagnostics` (`MainActivity.java`):
 
 | Field | Meaning |
 |---|---|
@@ -295,14 +305,16 @@ redrawing; differing `world=`/`bridge=` values mean the blit is dropping content
 leaves a static grey screen — this is the #1 thing to check if rendering "stops". The detail of every
 field and how to trigger a run is in [diagnostics.md](diagnostics.md).
 
-**GameState log** — every 5 s from `runRenderLoop` (`MainActivity.java:3265-3310`), prefixed
+**GameState log** — every 5 s from `runRenderLoop`, prefixed
 `GameState:` with `state`, `loginIndex`, `scaleMs=` (last `setPixels`+`drawBitmap` time), then probes
 for world, position, camera, local player, map regions, FPS, canvas size, and world list. The same
 block consumes the on-device conformance request file.
 
-**On-canvas overlay** — `runRenderLoop` draws `"RuneLite Mobile (AWT Bridge Active)"` and the current
-loader status on top of every frame (`MainActivity.java:3262-3263`). It is for screenshots, not
-interaction.
+**Boot overlay** — the loader's progress is a themed overlay card (`bootOverlay` + `tvBootStatus`),
+built in `buildLauncherUi` between the launcher and the side panel, shown by `launchGame`/`restartClient`
+and hidden on the first presented frame (`firstFramePresented` is set in the frame-blit proxy, right
+after `frameSeq++`). `updateStatus` feeds it the same string the log prints. Nothing is drawn on the
+canvas: `runRenderLoop` paints the letterbox bars and the frame only.
 
 Related: [device-runbook.md](device-runbook.md) for the adb commands to read these logs, and
 [telemetry-assessment.md](telemetry-assessment.md) for the wire-visible side of the same pipeline.

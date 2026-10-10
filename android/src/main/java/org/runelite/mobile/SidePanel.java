@@ -4,11 +4,11 @@ import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
-import android.graphics.Color;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.Typeface;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
@@ -54,9 +54,13 @@ import java.util.Map;
  * {@link PluginPanelRegistry}).
  *
  * <p>Everything RuneLite-specific goes through reflection into the child class loader
- * ({@link RuneLiteHost}), because the app dex cannot see the asset dex. The drawer
- * consumes touches inside its own bounds only; the game surface underneath keeps its size,
- * so game input elsewhere is unaffected.
+ * ({@link RuneLiteHost}), because the app dex cannot see the asset dex. The right-edge
+ * column (the drawer handle and the keyboard toggle) is always present and consumes
+ * {@code handleWidthPx} of screen width; an open drawer adds {@code drawerWidthPx}. The
+ * game surface is <em>inset</em> by that sum -- the host reads {@link #occupiedWidthPx()}
+ * and resizes the surface (see {@link Listener}) -- instead of the drawer floating over a
+ * full-size game. The column and the drawer swallow touches inside their own bounds, and
+ * the game's own input mapping accounts for the inset, so no tap is lost.
  */
 public final class SidePanel implements PluginPanelRegistry.Listener {
 
@@ -69,16 +73,30 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
     private static final int TAB_CONFIG = 1;
     private static final int TAB_HOST = 2;
 
+    /** Callbacks the host uses to follow the drawer (game-area inset, launcher, keyboard). */
+    public interface Listener {
+        /** Drawer opened or closed: the game-area inset changed. */
+        void onOpenChanged(boolean open);
+
+        /** The drawer header's launcher shortcut was tapped. */
+        void onShowLauncherRequested();
+
+        /** The keyboard toggle at the foot of the right-edge column was tapped. */
+        void onKeyboardToggleRequested();
+    }
+
     private final Activity activity;
     private final FrameLayout root;
     private final int drawerWidthPx;
+    private final int handleWidthPx;
     private final float density;
     private final SharedPreferences prefs;
 
     private final FrameLayout container;
+    private final LinearLayout column;
     private final LinearLayout drawer;
     private final TextView handle;
-    private final Button[] tabButtons = new Button[3];
+    private final TextView[] tabButtons = new TextView[3];
     private final FrameLayout content;
     private final LinearLayout pluginsList;
     private final LinearLayout configList;
@@ -88,16 +106,20 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
 
     private int selectedTab;
     private boolean open;
+    private boolean available = true;
+    private Listener listener;
     private Object configPlugin;      // plugin whose config is currently shown
     private String pendingNavigation; // panel-less plugin the user tapped
     private String hostStatusText = "";
 
-    public SidePanel(Activity activity, FrameLayout rootLayout, int surfaceWidthPx) {
+    public SidePanel(Activity activity, FrameLayout rootLayout) {
         this.activity = activity;
         this.root = rootLayout;
-        this.density = activity.getResources().getDisplayMetrics().density;
+        DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
+        this.density = metrics.density;
         this.prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        this.drawerWidthPx = Math.min((int) (0.42f * surfaceWidthPx), (int) (520 * density));
+        this.drawerWidthPx = Math.min((int) (0.42f * metrics.widthPixels), (int) (380 * density));
+        this.handleWidthPx = (int) (44 * density);
 
         container = new FrameLayout(activity);
         FrameLayout.LayoutParams containerParams = new FrameLayout.LayoutParams(
@@ -105,52 +127,121 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         container.setLayoutParams(containerParams);
         container.setClipChildren(false);
 
-        // Handle strip (always visible, collapsed or not).
+        // Right-edge column: the port's only always-present chrome. It holds the drawer
+        // handle (top, fills the remaining height) and the keyboard toggle (foot); the
+        // host insets the game surface by the column + drawer width, so it takes screen
+        // space instead of covering the game.
+        column = new LinearLayout(activity);
+        column.setOrientation(LinearLayout.VERTICAL);
+        column.setBackground(UiTheme.corners(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1.5f,
+            new float[]{14, 14, 0, 0, 0, 0, 14, 14}, density));
+        FrameLayout.LayoutParams columnParams = new FrameLayout.LayoutParams(
+            handleWidthPx, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
+        column.setLayoutParams(columnParams);
+
         handle = new TextView(activity);
-        handle.setText("☰");
         handle.setTextSize(20f);
-        handle.setTextColor(0xFFE0E0E0);
+        handle.setTextColor(UiTheme.GOLD);
         handle.setGravity(Gravity.CENTER);
-        handle.setBackgroundColor(0xE6141414);
-        FrameLayout.LayoutParams handleParams = new FrameLayout.LayoutParams(
-            (int) (32 * density), ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
-        handle.setLayoutParams(handleParams);
-        handle.setOnClickListener(v -> toggle());
-        container.addView(handle);
+        handle.setLayoutParams(new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+        // A touch listener, not a click listener: a TextView with an OnClickListener
+        // consumes the down event itself, but the column's swallowing listener would
+        // never see it -- and a listener is what keeps the strip out of the game.
+        handle.setOnTouchListener((v, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_UP) {
+                toggle();
+            }
+            return true;
+        });
+        column.addView(handle);
+
+        TextView keyboardToggle = new TextView(activity);
+        keyboardToggle.setText("⌨");
+        keyboardToggle.setTextSize(16f);
+        keyboardToggle.setTextColor(UiTheme.TEXT);
+        keyboardToggle.setGravity(Gravity.CENTER);
+        keyboardToggle.setBackground(UiTheme.rounded(UiTheme.SURFACE, UiTheme.GOLD_DIM, 1f, 10f, density));
+        LinearLayout.LayoutParams keyboardParams = new LinearLayout.LayoutParams(
+            handleWidthPx, (int) (48 * density));
+        keyboardParams.bottomMargin = (int) (8 * density);
+        keyboardToggle.setLayoutParams(keyboardParams);
+        keyboardToggle.setOnClickListener(v -> {
+            if (listener != null) {
+                listener.onKeyboardToggleRequested();
+            }
+        });
+        column.addView(keyboardToggle);
+
+        container.addView(column);
 
         // Drawer.
         drawer = new LinearLayout(activity);
         drawer.setOrientation(LinearLayout.VERTICAL);
-        drawer.setBackgroundColor(0xE6141414);
+        drawer.setBackground(UiTheme.corners(UiTheme.SURFACE, UiTheme.BORDER, 1.5f,
+            new float[]{16, 16, 0, 0, 0, 0, 16, 16}, density));
         FrameLayout.LayoutParams drawerParams = new FrameLayout.LayoutParams(
             drawerWidthPx, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
-        drawerParams.rightMargin = (int) (32 * density);
+        drawerParams.rightMargin = handleWidthPx;
         drawer.setLayoutParams(drawerParams);
-        drawer.setPadding((int) (10 * density), (int) (12 * density), (int) (10 * density), (int) (12 * density));
+        drawer.setPadding((int) (12 * density), (int) (12 * density), (int) (12 * density), (int) (12 * density));
+
+        // Header: the brand and the launcher shortcut (the floating gear button the
+        // host used to draw over the game is gone).
+        LinearLayout header = new LinearLayout(activity);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        TextView brand = new TextView(activity);
+        brand.setText("RuneLite");
+        brand.setTextSize(15f);
+        brand.setTextColor(UiTheme.GOLD);
+        brand.setTypeface(null, Typeface.BOLD);
+        brand.setLayoutParams(new LinearLayout.LayoutParams(0,
+            ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        header.addView(brand);
+        TextView launcherButton = new TextView(activity);
+        launcherButton.setText("⌂");
+        launcherButton.setTextSize(16f);
+        launcherButton.setTextColor(UiTheme.TEXT);
+        launcherButton.setGravity(Gravity.CENTER);
+        launcherButton.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1f, 10f, density));
+        launcherButton.setLayoutParams(new LinearLayout.LayoutParams(
+            (int) (34 * density), (int) (34 * density)));
+        launcherButton.setOnClickListener(v -> {
+            if (listener != null) {
+                listener.onShowLauncherRequested();
+            }
+        });
+        header.addView(launcherButton);
+        drawer.addView(header);
 
         LinearLayout tabRow = new LinearLayout(activity);
         tabRow.setOrientation(LinearLayout.HORIZONTAL);
         String[] titles = {"Plugins", "Config", "Host"};
         for (int i = 0; i < titles.length; i++) {
             final int index = i;
-            Button button = new Button(activity);
-            button.setText(titles[i]);
-            button.setTextSize(12f);
-            button.setTextColor(0xFFFFFFFF);
-            button.setAllCaps(false);
-            button.setPadding(0, 0, 0, 0);
+            TextView tab = new TextView(activity);
+            tab.setText(titles[i]);
+            tab.setTextSize(13f);
+            tab.setGravity(Gravity.CENTER);
+            tab.setPadding(0, (int) (8 * density), 0, (int) (8 * density));
             LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            button.setLayoutParams(p);
-            button.setOnClickListener(v -> selectTab(index));
-            tabButtons[i] = button;
-            tabRow.addView(button);
+            p.leftMargin = (int) (3 * density);
+            p.rightMargin = (int) (3 * density);
+            tab.setLayoutParams(p);
+            tab.setOnClickListener(v -> selectTab(index));
+            tabButtons[i] = tab;
+            tabRow.addView(tab);
         }
-        drawer.addView(tabRow);
+        LinearLayout.LayoutParams tabRowParams = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        tabRowParams.topMargin = (int) (10 * density);
+        drawer.addView(tabRow, tabRowParams);
 
         hostStatus = new TextView(activity);
         hostStatus.setTextSize(11f);
-        hostStatus.setTextColor(0xFFB0B0B0);
+        hostStatus.setTextColor(UiTheme.TEXT_MUTED);
         hostStatus.setPadding(0, (int) (4 * density), 0, (int) (4 * density));
         drawer.addView(hostStatus);
 
@@ -158,8 +249,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         search.setHint("search plugins");
         search.setTextSize(12f);
         search.setSingleLine(true);
-        search.setTextColor(0xFFFFFFFF);
-        search.setHintTextColor(0xFF808080);
+        search.setTextColor(UiTheme.TEXT);
+        search.setHintTextColor(UiTheme.TEXT_DIM);
+        search.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
+        search.setPadding((int) (10 * density), (int) (10 * density),
+            (int) (10 * density), (int) (10 * density));
         search.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {
             }
@@ -187,6 +281,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         configList.setOrientation(LinearLayout.VERTICAL);
         hostList = new LinearLayout(activity);
         hostList.setOrientation(LinearLayout.VERTICAL);
+        // Bottom padding so the last row is not under the navigation bar.
+        int listBottom = (int) (12 * density);
+        pluginsList.setPadding(0, 0, 0, listBottom);
+        configList.setPadding(0, 0, 0, listBottom);
+        hostList.setPadding(0, 0, 0, listBottom);
 
         ScrollView pluginsScroll = wrap(pluginsList);
         ScrollView configScroll = wrap(configList);
@@ -198,7 +297,9 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         configScroll.setTag("config");
         hostScroll.setTag("host");
 
-        // The drawer and the handle swallow touches so a tap never walks the character.
+        // The column and the drawer swallow touches so a tap never walks the
+        // character. Child views get their events first, so the handle and the
+        // keyboard toggle keep working.
         View.OnTouchListener swallow = (v, event) -> {
             if (event.getAction() == MotionEvent.ACTION_OUTSIDE) {
                 return false;
@@ -206,12 +307,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             return true;
         };
         drawer.setOnTouchListener(swallow);
-        handle.setOnTouchListener((v, event) -> {
-            if (event.getAction() == MotionEvent.ACTION_UP) {
-                toggle();
-            }
-            return true;
-        });
+        column.setOnTouchListener(swallow);
 
         container.addView(drawer);
         root.addView(container);
@@ -231,20 +327,29 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         return scroll;
     }
 
-    /** The "☰" toggle the host adds next to its settings button. */
-    public View createToggleButton() {
-        Button button = new Button(activity);
-        button.setText("☰");
-        button.setTextColor(0xFFFFFFFF);
-        button.setTextSize(16f);
-        GradientDrawable background = new GradientDrawable();
-        background.setColor(0xBB2E2E3E);
-        background.setCornerRadius(15 * density);
-        background.setStroke(2, 0xFF4F4F5F);
-        button.setBackground(background);
-        button.setPadding((int) (28 * density), (int) (12 * density),
-            (int) (28 * density), (int) (12 * density));
-        return button;
+    public void setListener(Listener listener) {
+        this.listener = listener;
+    }
+
+    /**
+     * Shows or hides the whole right-edge chrome. Hiding also closes the drawer, and
+     * the trailing notification is what applies the inset when the drawer was restored
+     * <em>open</em> from {@code sidePanelOpen} and becomes available again.
+     */
+    public void setAvailable(boolean available) {
+        this.available = available;
+        container.setVisibility(available ? View.VISIBLE : View.GONE);
+        if (!available) {
+            close();
+        }
+        if (listener != null) {
+            listener.onOpenChanged(open);
+        }
+    }
+
+    /** Screen pixels the chrome hides from the game: the column, plus the drawer when open. */
+    public int occupiedWidthPx() {
+        return handleWidthPx + (open ? drawerWidthPx : 0);
     }
 
     public void toggle() {
@@ -282,13 +387,21 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         if (open) {
             refreshPlugins();
         }
+        handle.setText(open ? "›" : "‹");
+        if (listener != null) {
+            listener.onOpenChanged(open);
+        }
     }
 
     private void selectTab(int index) {
         selectedTab = index;
         prefs.edit().putInt(PREFS_TAB, index).apply();
         for (int i = 0; i < tabButtons.length; i++) {
-            tabButtons[i].setTextColor(i == index ? 0xFFFFC83D : 0xFFFFFFFF);
+            boolean selected = i == index;
+            tabButtons[i].setTextColor(selected ? UiTheme.GOLD : UiTheme.TEXT_MUTED);
+            tabButtons[i].setBackground(selected
+                ? UiTheme.rounded(UiTheme.GOLD_FILL, UiTheme.GOLD, 1f, 10f, density)
+                : UiTheme.rounded(0, UiTheme.BORDER, 1f, 10f, density));
         }
         search.setVisibility(index == TAB_PLUGINS ? View.VISIBLE : View.GONE);
         for (int i = 0; i < content.getChildCount(); i++) {
@@ -342,7 +455,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         if (plugins.isEmpty()) {
             pluginsList.addView(label(RuneLiteHost.isRunning()
                 ? "no plugins loaded"
-                : "RuneLite runtime not running: " + RuneLiteHost.status(), 12f, 0xFFB0B0B0));
+                : "RuneLite runtime not running: " + RuneLiteHost.status(), 12f, UiTheme.TEXT_MUTED));
             return;
         }
         String needle = filter == null ? "" : filter.trim().toLowerCase();
@@ -361,12 +474,12 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             pluginsList.addView(pluginRow(plugin, name, description));
         }
         if (shown == 0) {
-            pluginsList.addView(label("no plugin matches \"" + filter + "\"", 12f, 0xFFB0B0B0));
+            pluginsList.addView(label("no plugin matches \"" + filter + "\"", 12f, UiTheme.TEXT_MUTED));
         }
         if (!PluginPanelRegistry.names().isEmpty()) {
-            pluginsList.addView(label("registered panels (Swing, not available on mobile):", 11f, 0xFF808080));
+            pluginsList.addView(label("registered panels (Swing, not available on mobile):", 11f, UiTheme.TEXT_DIM));
             for (String navigation : PluginPanelRegistry.names()) {
-                TextView row = label("• " + navigation + " — tap to open its config", 12f, 0xFF9E9E9E);
+                TextView row = label("• " + navigation + " — tap to open its config", 12f, UiTheme.TEXT_MUTED);
                 row.setPadding(0, (int) (6 * density), 0, (int) (6 * density));
                 row.setOnClickListener(v -> showConfigFor(navigation));
                 pluginsList.addView(row);
@@ -378,17 +491,19 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setPadding(0, (int) (8 * density), 0, (int) (8 * density));
+        UiTheme.ripple(row);
 
         LinearLayout text = new LinearLayout(activity);
         text.setOrientation(LinearLayout.VERTICAL);
         text.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        text.addView(label(name, 13f, 0xFFFFFFFF));
+        text.addView(label(name, 13f, UiTheme.TEXT));
         if (!description.isEmpty()) {
-            text.addView(label(description, 11f, 0xFF9E9E9E));
+            text.addView(label(description, 11f, UiTheme.TEXT_MUTED));
         }
         row.addView(text);
 
         Switch toggle = new Switch(activity);
+        UiTheme.tintSwitch(toggle);
         toggle.setChecked(RuneLiteHost.isPluginEnabled(plugin));
         toggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
             if (!RuneLiteHost.setPluginEnabled(plugin, isChecked)) {
@@ -423,14 +538,14 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         configPlugin = null;
         List<Object> plugins = RuneLiteHost.plugins();
         if (plugins.isEmpty()) {
-            configList.addView(label("no plugins loaded", 12f, 0xFFB0B0B0));
+            configList.addView(label("no plugins loaded", 12f, UiTheme.TEXT_MUTED));
             return;
         }
         List<Object> sorted = new ArrayList<>(plugins);
         sorted.sort(Comparator.comparing(RuneLiteHost::pluginName, String.CASE_INSENSITIVE_ORDER));
         for (Object plugin : sorted) {
             String name = RuneLiteHost.pluginName(plugin);
-            TextView row = label(name, 13f, 0xFFE0E0E0);
+            TextView row = label(name, 13f, UiTheme.TEXT);
             row.setPadding(0, (int) (10 * density), 0, (int) (10 * density));
             row.setOnClickListener(v -> showConfigFor(plugin));
             configList.addView(row);
@@ -454,7 +569,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         configList.removeAllViews();
         String name = RuneLiteHost.pluginName(plugin);
         boolean enabled = RuneLiteHost.isPluginEnabled(plugin);
-        TextView header = label(enabled ? name : name + " (disabled)", 14f, 0xFFFFC83D);
+        TextView header = label(enabled ? name : name + " (disabled)", 14f, UiTheme.GOLD);
         header.setPadding(0, (int) (6 * density), 0, (int) (10 * density));
         configList.addView(header);
 
@@ -465,7 +580,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             // Entity Hider report was produced), so say it and offer the one tap that
             // fixes it.
             TextView warn = label(name + " is disabled — config changes do nothing. Tap to enable.",
-                12f, 0xFFFF9800);
+                12f, UiTheme.ORANGE);
             warn.setPadding(0, (int) (4 * density), 0, (int) (8 * density));
             warn.setOnClickListener(v -> {
                 if (RuneLiteHost.setPluginEnabled(plugin, true)) {
@@ -480,13 +595,13 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
 
         Object configManager = RuneLiteHost.configManager();
         if (configManager == null) {
-            configList.addView(label("RuneLite runtime not running", 12f, 0xFFB0B0B0));
+            configList.addView(label("RuneLite runtime not running", 12f, UiTheme.TEXT_MUTED));
             return;
         }
         try {
             Class<?> iface = RuneLiteHost.pluginConfigClass(plugin);
             if (iface == null) {
-                configList.addView(label("this plugin has no configuration", 12f, 0xFFB0B0B0));
+                configList.addView(label("this plugin has no configuration", 12f, UiTheme.TEXT_MUTED));
                 return;
             }
             Object proxy = configManager.getClass().getMethod("getConfig", Class.class)
@@ -496,14 +611,14 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             Object descriptor = configManager.getClass()
                 .getMethod("getConfigDescriptor", configIface).invoke(configManager, proxy);
             if (descriptor == null) {
-                configList.addView(label("no config descriptor", 12f, 0xFFB0B0B0));
+                configList.addView(label("no config descriptor", 12f, UiTheme.TEXT_MUTED));
                 return;
             }
             Map<String, Method> items = configItemMethods(iface);
             List<Object> descriptors = new ArrayList<>((Collection<Object>) descriptor.getClass()
                 .getMethod("getItems").invoke(descriptor));
             if (descriptors.isEmpty()) {
-                configList.addView(label("no configuration items", 12f, 0xFFB0B0B0));
+                configList.addView(label("no configuration items", 12f, UiTheme.TEXT_MUTED));
                 return;
             }
             descriptors.sort(Comparator.comparingInt(d -> configItemPosition(d)));
@@ -514,7 +629,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
                     String section = (String) annotation.getClass().getMethod("section").invoke(annotation);
                     if (section != null && !section.isEmpty() && !section.equals(currentSection)) {
                         currentSection = section;
-                        configList.addView(label(section, 12f, 0xFFFFC83D));
+                        configList.addView(label(section, 12f, UiTheme.GOLD));
                     }
                     View widget = buildConfigWidget(iface, proxy, configManager, descriptor,
                         itemDescriptor, annotation, items);
@@ -527,7 +642,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             }
         } catch (Throwable t) {
             Log.w(TAG, "config form failed for " + name, t);
-            configList.addView(label("config unavailable: " + t, 11f, 0xFFE57373));
+            configList.addView(label("config unavailable: " + t, 11f, UiTheme.RED));
         }
     }
 
@@ -576,10 +691,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         LinearLayout row = new LinearLayout(activity);
         row.setOrientation(LinearLayout.VERTICAL);
         row.setPadding(0, (int) (6 * density), 0, (int) (6 * density));
-        row.addView(label(displayName == null || displayName.isEmpty() ? key : displayName, 12f, 0xFFE0E0E0));
+        row.addView(label(displayName == null || displayName.isEmpty() ? key : displayName, 12f, UiTheme.TEXT));
 
         if (type == boolean.class || type == Boolean.class) {
             Switch toggle = new Switch(activity);
+            UiTheme.tintSwitch(toggle);
             toggle.setChecked(Boolean.TRUE.equals(value));
             toggle.setOnCheckedChangeListener((v, checked) ->
                 writeConfig(iface, proxy, configManager, group, key, checked));
@@ -591,7 +707,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             int min = range[0];
             int max = range[1];
             int current = (int) Math.round(((Number) (value == null ? 0 : value)).doubleValue());
-            TextView valueLabel = label(String.valueOf(current), 12f, 0xFFFFC83D);
+            TextView valueLabel = label(String.valueOf(current), 12f, UiTheme.GOLD);
             SeekBar bar = new SeekBar(activity);
             bar.setMax(Math.max(1, max - min));
             bar.setProgress(Math.max(0, Math.min(max - min, current - min)));
@@ -620,6 +736,11 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             EditText field = new EditText(activity);
             field.setText(value == null ? "" : value.toString());
             field.setTextSize(12f);
+            field.setTextColor(UiTheme.TEXT);
+            field.setHintTextColor(UiTheme.TEXT_DIM);
+            field.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
+            field.setPadding((int) (12 * density), (int) (12 * density),
+                (int) (12 * density), (int) (12 * density));
             if (secret) {
                 field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
             }
@@ -642,6 +763,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         }
         if (type.isEnum()) {
             Spinner spinner = new Spinner(activity);
+            spinner.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
             Object[] constants = type.getEnumConstants();
             List<String> names = new ArrayList<>();
             for (Object constant : constants) {
@@ -668,7 +790,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
             return row;
         }
         row.addView(label((value == null ? "null" : value.toString()) + "  (not editable on mobile)",
-            11f, 0xFF9E9E9E));
+            11f, UiTheme.TEXT_MUTED));
         return row;
     }
 
@@ -773,20 +895,18 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         List<String> pluginFailures = RuneLiteHost.pluginFailures();
         hostList.addView(hostLine("plugin load failures", String.valueOf(pluginFailures.size())));
         for (String entry : pluginFailures) {
-            hostList.addView(label("  " + entry, 10f, 0xFFE57373));
+            hostList.addView(label("  " + entry, 10f, UiTheme.RED));
         }
         int aot = ClientUpdater.clientDexAotStatus(activity);
         boolean aotBad = aot == ClientUpdater.AOT_STALE || aot == ClientUpdater.AOT_MISSING;
         String aotText = ClientUpdater.clientDexAotText(activity);
         hostList.addView(aotBad
-            ? label("client AOT: " + aotText, 11f, 0xFFE57373)
+            ? label("client AOT: " + aotText, 11f, UiTheme.RED)
             : hostLine("client AOT", aotText));
         hostList.addView(hostLine("on-device dexer", "unavailable"));
         hostList.addView(hostLine("conformance", PluginConformance.isRunning()
             ? "running…" : PluginConformance.lastSummary()));
-        Button conformance = new Button(activity);
-        conformance.setText("Run plugin conformance");
-        conformance.setTextSize(12f);
+        TextView conformance = pillButton("Run plugin conformance");
         conformance.setEnabled(!PluginConformance.isRunning() && RuneLiteHost.isRunning());
         conformance.setOnClickListener(v -> {
             PluginConformance.run(activity);
@@ -794,9 +914,7 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
                 + PluginConformance.reportFile(activity).getName());
         });
         hostList.addView(conformance);
-        Button refresh = new Button(activity);
-        refresh.setText("Refresh");
-        refresh.setTextSize(12f);
+        TextView refresh = pillButton("Refresh");
         refresh.setOnClickListener(v -> {
             refreshPlugins();
             buildHostTab();
@@ -804,8 +922,22 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         hostList.addView(refresh);
     }
 
+    /** A small gold-on-stone action pill (the drawer's own buttons are no longer Buttons). */
+    private TextView pillButton(String text) {
+        TextView view = label(text, 12f, UiTheme.GOLD);
+        view.setGravity(Gravity.CENTER);
+        view.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1f, 10f, density));
+        view.setPadding(0, (int) (10 * density), 0, (int) (10 * density));
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        params.topMargin = (int) (6 * density);
+        view.setLayoutParams(params);
+        UiTheme.ripple(view);
+        return view;
+    }
+
     private View hostLine(String label, String value) {
-        TextView row = label(label + ": " + value, 11f, 0xFFB0B0B0);
+        TextView row = label(label + ": " + value, 11f, UiTheme.TEXT_MUTED);
         row.setPadding(0, (int) (3 * density), 0, (int) (3 * density));
         return row;
     }

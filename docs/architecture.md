@@ -42,8 +42,8 @@ flowchart TD
 
 The asset loader is constructed in `MainActivity.bootstrapGameClient` as
 `new DexClassLoader(localJarFile, dexOutputDir, null, getClassLoader())`
-(`MainActivity.java:1391-1397`); each hub jar gets its own child loader whose parent is the client
-loader (`MobilePluginHub.java:27-31`, `:146`).
+(`MainActivity.java`); each hub jar gets its own child loader whose parent is the client
+loader (`MobilePluginHub.java`).
 
 Parent-first has three consequences you must design around:
 
@@ -54,22 +54,21 @@ Parent-first has three consequences you must design around:
   `dexClassLoader.loadClass(...)` and reflection.
 - **The only cross-loader links are reflection-only.** The host reaches the client by name
   (`ClientToolbar.navigationListener` is installed reflectively in
-  `RuneLiteHost.installNavigationHook`, `RuneLiteHost.java:727-741`); the client reaches the host
+  `RuneLiteHost.installNavigationHook`, `RuneLiteHost.java`); the client reaches the host
   through app-dex proxies (`ClientConfiguration`, `Callbacks`) whose interface types are resolved
-  from the child loader (`MainActivity.java:1419-1455`, `:1465-1466`).
+  from the child loader (`MainActivity.java`).
 
 | Universe | Loader | Contents | Built / anchored at |
 |---|---|---|---|
 | App dex (`classes.dex`) | the Android application class loader | `core/` stubs, `org.runelite.mobile.**`, the slf4j-simple binding, androidx/material | `android/build.gradle:829-846` |
-| Asset dex `assets/runelite-dex.jar` | asset `DexClassLoader` (`parent = getClassLoader()`) | injected client, game `client`, `runelite-api` (duplicates stripped), the runtime libraries, `hostshims/` output, and the `runelite-plugin-index.txt` resource | `android/build.gradle:489-492`, `:596-600` |
-| Hub jars | one `DexClassLoader` per jar (`parent = client loader`) | third-party plugin classes plus their resources | `MobilePluginHub.java:146` |
+| Asset dex `assets/runelite-dex.jar` | asset `DexClassLoader` (`parent = getClassLoader()`) | injected client, game `client`, `runelite-api` (duplicates stripped), the runtime libraries, `hostshims/` output, and the `runelite-plugin-index.txt` resource | `android/build.gradle:489-492`, `MainActivity` |
+| Hub jars | one `DexClassLoader` per jar (`parent = client loader`) | third-party plugin classes plus their resources | `MobilePluginHub.java` |
 
 The two bridges are **dynamic proxies**, not implementors. The app cannot write
 `class X implements net.runelite.api.hooks.Callbacks` because that interface lives in the child
 loader; instead `Proxy.newProxyInstance(dexClassLoader, {callbacksInterface}, handler)` builds a
 class in the child loader at runtime, and the handler switches on the invoked method's name
-(`MainActivity.java:1465-1539`). The same technique supplies `ClientConfiguration`
-(`:1419-1455`) and the OTL token requester (`:1714-1765`). This is why a missing method in the
+(`MainActivity.java`). The same technique supplies `ClientConfiguration` and the OTL token requester. This is why a missing method in the
 proxy shows up as a silently defaulted return value rather than a compile error — see
 [diagnostics.md](diagnostics.md).
 
@@ -93,7 +92,7 @@ The asset dex is a **build output**, produced by two Gradle tasks in `android/bu
 replaced classes, rewrites each class through an ASM pass, compiles the shims, runs `d8`, repacks
 resources, and writes the plugin index (`android/build.gradle:288-622`). `afterEvaluate` wires
 `preBuild -> downloadAndDexJar` and makes every `JavaCompile`/`dex*` task wait on
-`syncRuneLiteJars` (`:805-815`), so a plain `:android:assembleRelease` regenerates the dex if
+`syncRuneLiteJars`, so a plain `:android:assembleRelease` regenerates the dex if
 needed. `:android` compiles only against `:core`, androidx/material, and `slf4j-api` borrowed from
 `android/build/rl-jars` — never against a RuneLite artifact, which is what keeps app dex free of
 `net.runelite.*` (`android/build.gradle:829-846`). The full pipeline belongs to
@@ -136,76 +135,72 @@ sequenceDiagram
 
 The same steps as code paths, in order:
 
-1. `MainActivity.onCreate` (`MainActivity.java:191`) sets JVM properties, binds `AWTBridge.activePixels`
+1. `MainActivity.onCreate` (`MainActivity.java`) sets JVM properties, binds `AWTBridge.activePixels`
    to `appletPixels`, registers the UI thread, installs the text bridge and host context, builds the
-   launcher UI, and pre-registers the dex for ART dexopt (`:283-300`).
-2. `MainActivity.startJagexLogin` (`:891`) drives the browser-based OAuth flow; the redirect returns
-   through `onNewIntent` (`:912`) and ends in session tokens or a manual/imported session
-   (`:718-809`). Details: [login-and-sessions.md](login-and-sessions.md).
-3. `MainActivity.launchGame` (`:1265`) hides the launcher and starts the `"GameClientBootstrapper"`
-   thread (`:1276`).
-4. `MainActivity.bootstrapGameClient` (`:1293`) fetches `jav_config`, applies `JX_*` env vars,
+   launcher UI, and pre-registers the dex for ART dexopt.
+2. `MainActivity.startJagexLogin` drives the browser-based OAuth flow; the redirect returns
+   through `onNewIntent` and ends in session tokens or a manual/imported session. Details: [login-and-sessions.md](login-and-sessions.md).
+3. `MainActivity.launchGame` hides the launcher and starts the `"GameClientBootstrapper"`
+   thread.
+4. `MainActivity.bootstrapGameClient` fetches `jav_config`, applies `JX_*` env vars,
    chooses the dex source, builds the `DexClassLoader`, loads `client`, installs the
    `ClientConfiguration` and `Callbacks` proxies, calls `initialize()`, and enables unlocked FPS.
 5. `MainActivity` starts the daemon `"RuneLiteHost"` thread calling
-   `RuneLiteHost.start(clientObject, dexClassLoader)` (`:1681-1684`).
-6. `RuneLiteHost.start` (`RuneLiteHost.java:155`) builds the injector and resolves core components
-   (`:208-236`), then posts `RuneLiteHost.startPlugins` to the UI thread via `AWTBridge.post`
-   (`:249`).
-7. `RuneLiteHost.startPlugins` (`:252`) loads the plugin index, calls
+   `RuneLiteHost.start(clientObject, dexClassLoader)`.
+6. `RuneLiteHost.start` (`RuneLiteHost.java`) builds the injector and resolves core components, then posts `RuneLiteHost.startPlugins` to the UI thread via `AWTBridge.post`.
+7. `RuneLiteHost.startPlugins` loads the plugin index, calls
    `PluginManager.loadPlugins`, registers the managers on the `EventBus`, calls
-   `overlayManager.init()` and `pluginManager.startPlugins()` (`:299`), then loads sideloaded hub
+   `overlayManager.init()` and `pluginManager.startPlugins()`, then loads sideloaded hub
    plugins and runs the graphics self-test. Details: [plugin-runtime.md](plugin-runtime.md).
-8. `surfaceCreated` (`:3185`) starts the render thread, which presents client frames until
+8. `surfaceCreated` starts the render thread, which presents client frames until
    `surfaceDestroyed`. Details: [rendering.md](rendering.md).
 
 Two details in step 4 decide what actually runs. The dex source is
 `files/runelite-dex.jar` when it is not older than the APK's bundled asset, otherwise the asset is
-copied out and used (`MainActivity.java:1359-1389`); this is what lets an in-app update replace the
+copied out and used (`MainActivity.java`); this is what lets an in-app update replace the
 client without reinstalling the APK, and it is owned by [client-updates.md](client-updates.md). The
 loader path is then `files/runelite-dex.jar` with `getDir("dex", MODE_PRIVATE)` as the optimized
-output directory (`:1391-1397`). Step 5 loads the obfuscated top-level class literally named
-`client` (`:1399-1406`) — that name and every client-internal symbol the port touches is
+output directory. Step 5 loads the obfuscated top-level class literally named
+`client` — that name and every client-internal symbol the port touches is
 version-specific and must be re-derived when the client version changes
 ([telemetry-assessment.md](telemetry-assessment.md)).
 
 The boot is deliberately **idempotent and guarded**: if `clientInstance != null` the bootstrap
-returns immediately (`:1295-1300`), and any throw on the way through logs
+returns immediately, and any throw on the way through logs
 `"Loader failed to bootstrap client"`, restores the launcher UI, and leaves the app in a
-diagnosable state (`:1687-1707`). Failure is recoverable because the client never partially
-registered itself with the host: the host thread is only started after `initialize()` returns
-(`:1674-1684`). [troubleshooting.md](troubleshooting.md) maps the failure messages back to causes.
+diagnosable state. Failure is recoverable because the client never partially
+registered itself with the host: the host thread is only started after `initialize()` returns. [troubleshooting.md](troubleshooting.md) maps the failure messages back to causes.
 
 ## 5. Threading model
 
 | Thread | Created / named at | Runs | Crosses the boundary via |
 |---|---|---|---|
-| Android main / UI thread | `Looper.getMainLooper()` registered with `AWTBridge.registerUiThread(...)` (`MainActivity.java:217-218`) | view construction, login UI, `startPlugins`, `SwingUtilities.invokeLater`/`invokeAndWait` routing | `handler::post` (`AWTBridge` stores the executor; `RuneLiteHost:249`) |
-| `"GameClientBootstrapper"` | `MainActivity.java:1276` | jav_config fetch, dex selection, loader construction, proxy installation, `client.initialize()` | publishes `clientInstance`/`clientObject`; starts the host thread |
-| `"RuneLiteHost"` (daemon) | `MainActivity.java:1681-1684` | `RuneLiteHost.start`: runtime config fetch, Guice injector, component resolution | `AWTBridge.post(RuneLiteHost::startPlugins)` to the UI thread |
-| client's own thread | started inside `GameEngine.initialize()` (`MainActivity.java:1652-1670`) | game loop; invokes the `Callbacks` proxy | `Callbacks.draw` → `renderLock`/`frameSeq` |
-| `"AWTBridge-RenderThread"` | `surfaceCreated` (`MainActivity.java:3185-3189`) | blits the latest client frame to the `SurfaceView` | `renderLock.wait` on `frameSeq != lastDrawnSeq` (`:3242-3251`) |
+| Android main / UI thread | `Looper.getMainLooper()` registered with `AWTBridge.registerUiThread(...)` (`MainActivity.java`) | view construction, login UI, `startPlugins`, `SwingUtilities.invokeLater`/`invokeAndWait` routing | `handler::post` (`AWTBridge` stores the executor; `RuneLiteHost:249`) |
+| `"GameClientBootstrapper"` | `MainActivity.java` | jav_config fetch, dex selection, loader construction, proxy installation, `client.initialize()` | publishes `clientInstance`/`clientObject`; starts the host thread |
+| `"RuneLiteHost"` (daemon) | `MainActivity.java` | `RuneLiteHost.start`: runtime config fetch, Guice injector, component resolution | `AWTBridge.post(RuneLiteHost::startPlugins)` to the UI thread |
+| client's own thread | started inside `GameEngine.initialize()` (`MainActivity.java`) | game loop; invokes the `Callbacks` proxy | `Callbacks.draw` → `renderLock`/`frameSeq` |
+| `"AWTBridge-RenderThread"` | `surfaceCreated` (`MainActivity.java`) | blits the latest client frame to the `SurfaceView` | `renderLock.wait` on `frameSeq != lastDrawnSeq` |
 
 Two rules follow from the table. First, **the render thread must never call `client.paint()`** —
-the comment at `MainActivity.java:3236-3241` records that doing so tears frames; the loop presents
+the comment at `MainActivity.java` records that doing so tears frames; the loop presents
 exactly the frame the client just produced, never one it drives on a timer. Second,
 **guarding is by monitor, not by polling**: the client thread and the render thread rendezvous on
-`renderLock` with `frameSeq`/`lastDrawnSeq` (`MainActivity.java:78`, `:133`), and anything that must
+`renderLock` with `frameSeq`/`lastDrawnSeq` (`MainActivity.java`), and anything that must
 run on the UI thread is posted with `handler::post` rather than touched from another thread.
 
 Three boundary contracts are worth naming explicitly:
 
 - **Client thread -> render thread.** `Callbacks.draw` runs on the client thread, holds
   `renderLock` while overlay compositing and the buffer draw happen, and only then advances
-  `frameSeq` (`MainActivity.java:1505-1538`). The render thread waits on the same monitor, so the
+  `frameSeq` (`MainActivity.java`). The render thread waits on the same monitor, so the
   client cannot overwrite `appletPixels` mid-copy.
 - **Host thread -> UI thread.** `AWTBridge.registerUiThread(Looper.getMainLooper().getThread(),
-  mainHandler::post)` (`MainActivity.java:217-218`) is what lets `SwingUtilities.invokeLater` and
+  mainHandler::post)` (`MainActivity.java`) is what lets `SwingUtilities.invokeLater` and
   `AWTBridge.post` land on the Android main thread; `RuneLiteHost` relies on it for the
-  `PluginManager` EDT assertion (`RuneLiteHost.java:245-249`).
+  `PluginManager` EDT assertion (`RuneLiteHost.java`).
 - **UI thread -> client components.** Plugin lifecycle calls (`startPlugin`/`stopPlugin`,
   config writes) are made from the UI thread through `RuneLiteHost`, which recomputes its
-  `activePlugins` snapshot after each (`RuneLiteHost.java:519-553`).
+  `activePlugins` snapshot after each (`RuneLiteHost.java`).
 
 ## 6. iOS
 
@@ -222,29 +217,29 @@ stubs compiling for a second target; [device-runbook.md](device-runbook.md) cove
 
 1. The client thread renders the world into its own pixel buffer and invokes
    `callbacks.draw(bufferProvider, Graphics, x, y)` through the `Callbacks` proxy
-   (`MainActivity.java:1465-1466`, `:1477-1539`).
+   (`MainActivity.java`).
 2. The proxy re-points the client's software rasterizer at the live buffer with
-   `bindSceneRasterizerToDisplay(args[0])` (`MainActivity.java:1507`, `:2821-2850`).
+   `bindSceneRasterizerToDisplay(args[0])` (`MainActivity.java`).
 3. If the host's `Hooks` is present, `hooks.draw(...)` composites plugin overlays directly into
-   the client frame before anything is copied (`MainActivity.java:1523`).
+   the client frame before anything is copied (`MainActivity.java`).
 4. `Graphics.drawImage(img, x, y, null)` draws that frame into `AWTBridge.activePixels`, which is
-   `MainActivity.appletPixels` (`MainActivity.java:206-208`).
+   `MainActivity.appletPixels` (`MainActivity.java`).
 5. The proxy advances `frameSeq` under `renderLock`, waking the render thread.
 6. The render thread copies `appletPixels` into `renderBitmap` with `setPixels(...)` and presents
-   it with `canvas.drawBitmap(renderBitmap, srcRect, dstRect, scalePaint)`
-   (`MainActivity.java:3242-3260`).
+   it with `canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)` into the centred
+   765:503 fit rect, after painting the letterbox bars (`MainActivity.runRenderLoop`).
 
 The invariants behind steps 3-6 — buffer agreement, the palette repoint, alpha handling and the
-scale loop — are owned by [rendering.md](rendering.md). For how a tap or key reaches the client,
+blit geometry — are owned by [rendering.md](rendering.md). For how a tap or key reaches the client,
 see [input.md](input.md); for what the runtime prints while it does, see [diagnostics.md](diagnostics.md).
 
 The three pixel stores that must agree are bound once and never reallocated per frame:
 
 | Store | Type | Bound by | Anchor |
 |---|---|---|---|
-| `MainActivity.appletPixels` | `int[GAME_W * GAME_H]` | field initialiser | `MainActivity.java:88` |
-| `AWTBridge.activePixels/activeWidth/activeHeight` | same array + `765`/`503` | `onCreate` | `MainActivity.java:206-208` |
-| `MainActivity.renderBitmap` | `Bitmap` `ARGB_8888`, `setHasAlpha(false)` | `surfaceChanged` | `MainActivity.java:3198-3205` |
+| `MainActivity.appletPixels` | `int[GAME_W * GAME_H]` | field initialiser | `MainActivity.java` |
+| `AWTBridge.activePixels/activeWidth/activeHeight` | same array + `765`/`503` | `onCreate` | `MainActivity.java` |
+| `MainActivity.renderBitmap` | `Bitmap` `ARGB_8888`, `setHasAlpha(false)` | `surfaceChanged` | `MainActivity.java` |
 
 The client frame and the presented frame are therefore the same pixels: overlays composited inside
 `Hooks.draw` (step 3) are already in `appletPixels` before the render thread touches it. Nothing in
