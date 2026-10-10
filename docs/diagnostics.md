@@ -43,7 +43,7 @@ own, so `CONFORMANCE:` lines appear under `RuneLiteHost`.
 ## 2. The throttled `callbacks.draw` line
 
 `MainActivity.logFrameDiagnostics` runs on every client frame but emits at most one
-line per **2 s** (`now - lastDrawLog <= 2000` guard, `MainActivity.java:2632-2635`).
+line per **2 s** (`now - lastDrawLog <= 2000` guard, `MainActivity.java`).
 The `n`/`elapsed` in the prefix are counts accumulated since the previous line, so the
 reported `fps=` is the average over that window, not an instantaneous rate. The
 game-frame fields (`world=`, `px=`, `tr=`, `ovl=`, `iface=`, `entities=`, `yellow=`,
@@ -73,18 +73,18 @@ callbacks.draw: <W>x<H> fps=<n*1000/elapsed> (<n> in <elapsed>ms)
 
 **If rendering "stops", check the `callbacks.draw` proxy first.** The render thread
 only presents when `frameSeq` changes, and `frameSeq` is incremented only inside the
-frame-blit branch of the `Callbacks.draw` proxy (`MainActivity.java:1526-1530`). If
+frame-blit branch of the `Callbacks.draw` proxy (`MainActivity.java`). If
 the proxy was never bound, or never enters that branch, the surface keeps showing the
 last frame — a static, usually grey screen. On boot, look for
 `Callbacks proxy bound (field …)`; the failure string is
-`Could not find a Callbacks field on the client class!` (`MainActivity.java:1627-1629`).
+`Could not find a Callbacks field on the client class!` (`MainActivity.java`).
 A steady stream of `callbacks.draw:` lines in logcat is the positive signal that the
 proxy is live; their absence while the client is running is the thing to investigate.
 
 ## 3. The 5 s GameState log
 
 Separately from the frame line, `runRenderLoop` logs one line every **5000 ms**
-(`now - lastStateLog > 5000`, `MainActivity.java:3265-3310`). It reflects
+(`now - lastStateLog > 5000`, `MainActivity.java`). It reflects
 `net.runelite.api.Client` getters by name; any getter that throws renders `=ERR`
 rather than aborting the line. It also reports the presentation cost of the last blit.
 
@@ -101,7 +101,7 @@ GameState: <state> loginIndex: <idx> scaleMs=<lastScaleNanos/1e6> <probe>=<value
 | `getCurrentLoginField` | focused login field |
 | `getBaseX`, `getBaseY` | scene base tile |
 | `getPlane` | current plane |
-| `getCameraX`, `getCameraY`, `getCameraZ` | camera position; a two-finger drag moves these |
+| `getCameraX`, `getCameraY`, `getCameraZ` | camera position; a camera drag (one or two fingers) moves these |
 | `getLocalPlayer` | local player object (or `null`) |
 | `getMapRegions` | rendered as `N regions` (the array length is substituted, not the array) |
 | `getFPS` | the client's own FPS counter |
@@ -118,7 +118,7 @@ the presentation path rather than the client (see [rendering.md](rendering.md)).
 `host/GraphicsSelfTest.run()` is a one-shot check that the `java.awt` stubs the
 overlays draw through actually work on the device. It runs **once per host start**,
 from `RuneLiteHost.startPlugins` immediately after hub plugins are loaded
-(`RuneLiteHost.java:319-323`); it is not re-run by the side panel. On success it logs
+(`RuneLiteHost.java`); it is not re-run by the side panel. On success it logs
 `GFX SELFTEST PASS`; a failure logs `GFX SELFTEST FAIL <case>` (unexpected throwable:
 `GFX SELFTEST FAIL exception`) and the case name is appended to the host status
 string. Cases run in order, and the first failure short-circuits the rest:
@@ -146,7 +146,7 @@ measures **behaviour**, not just instantiation. It runs single-flight on the UI 
 ### Trigger, paths, and files
 
 Files live in the app-specific external files dir when present, else the internal
-files dir (`dir(ctx)`; `PluginConformance.java:124-127`). **Use
+files dir (`dir(ctx)`; `PluginConformance.java`). **Use
 [device-runbook.md](device-runbook.md) for the exact adb commands** — the request file
 is `conformance.request`, the report is `conformance-report.txt`, written next to it in
 the same dir.
@@ -166,17 +166,17 @@ flowchart LR
 Header, then one line per plugin, then the summary and failure list. The exact header
 lines are `# plugin conformance`, `date: <java.util.Date>`, `client:
 <RuneLiteHost.clientVersion()>`, `gameState: <state>`, `index: <RuneLiteHost.indexSize()>
-classes, loaded: <count>` (`PluginConformance.java:165-183`). If the host is not
+classes, loaded: <count>` (`PluginConformance.java`). If the host is not
 running the report is `# aborted: host not running (<RuneLiteHost.status()>)` and the
-run stops (`:167-175`).
+run stops.
 
-Per-plugin line shape (`Result.line()`, `PluginConformance.java:288-326`):
+Per-plugin line shape (`Result.line()`, `PluginConformance.java`):
 
 ```text
 <fqcn> <PASS|FAIL|SKIP> enabled=<y|n>/active=<y|n> subs=<reg>/<decl> ovl=<ok>/<bad> cfg=<ok>/<bad> rc=<n> probes=entityVeto(<entities=<n> denied=<n> | note>) [menuEntry(<note>)] [eventFlow(<Name>=<posts>/<subs> …)] [FAILURES=[…] [leak] | SKIP=[…]] [cfgNote=…] [ovlNote=…]
 ```
 
-Summary and failures (`:211-220`):
+Summary and failures:
 
 ```text
 # summary: plugins=<N> pass=<P> fail=<F> skip=<S>
@@ -201,20 +201,20 @@ records `no config` / `no config manager` and counts nothing.
 
 ### Probes
 
-- **`entityVeto`** (`:739-777`). Only meaningful when `rc>0`; if the game is not
+- **`entityVeto`**. Only meaningful when `rc>0`; if the game is not
   `LOGGED_IN` it notes `skip(<state>)` and skips, and if the client is not dispatching
   events it notes `skip(no events)`. Otherwise it samples `entityDrawCalls()` /
   `entityDrawDenied()` until **100** calls (`ENTITY_PROBE_FRAMES`) or **2500 ms**
   (`ENTITY_PROBE_TIMEOUT_MS`). Zero calls in the window is a **fail**; `denied>0` means
   the plugin vetoed world-actor rendering.
-- **`menuEntry`** (`:779-876`). Runs only for plugins that subscribe to
+- **`menuEntry`**. Runs only for plugins that subscribe to
   `net.runelite.api.events.MenuEntryAdded`; not logged in ⇒ `skip(<state>)`. On the
   client thread (timeout **1500 ms**, `CLIENT_THREAD_TIMEOUT_MS`) it seeds a synthetic
   entry from the last real menu entry (plugins add options *for a target*), constructs
   `MenuEntryAdded(entry)`, and posts it through the real bus. Outcomes: `modified`,
   `appended N`, or `no-reaction '<option>'`; a genuine error fails, a no-reaction is a
   **skip** (the subscriber is separately proven live by `eventFlow`).
-- **`eventFlow`** (`:878-916`). Per subscribed event class prints
+- **`eventFlow`**. Per subscribed event class prints
   `SimpleName=<posts>/<subscriberCount>`. A class with zero posts: if the client is not
   live ⇒ skip; else if it is in `MUST_FIRE_EVENTS` (`[net.runelite.api.events.ClientTick]`)
   ⇒ **fail**; otherwise skip. `GameTick`/`BeforeRender` are deliberately excluded —
@@ -223,19 +223,18 @@ records `no config` / `no config manager` and counts nothing.
 
 ### PASS / FAIL / SKIP rules
 
-- `verdict()` = FAIL if any failure or a leak; else SKIP if any skip; else PASS
-  (`:280-282`).
+- `verdict()` = FAIL if any failure or a leak; else SKIP if any skip; else PASS.
 - **A link error always fails**, regardless of game state: `isLinkError` matches (any
   cause in the chain) `NoClassDefFoundError`, `NoSuchMethodError`, `NoSuchFieldError`,
   `AbstractMethodError`, `ClassCastException`, `IncompatibleClassChangeError`,
-  `ExceptionInInitializerError` (`:508-524`). A throw that is not a link error fails
+  `ExceptionInInitializerError`. A throw that is not a link error fails
   only when the game is `LOGGED_IN`; otherwise it is a skip.
-- **Leak** (`:387-400`): for a plugin that was active at start, stopping it and then
+- **Leak**: for a plugin that was active at start, stopping it and then
   seeing `subsAfter != subsBefore` or `ovlAfter != ovlBefore` sets `leak` and fails.
 - State-dependent probes skip with `skip(<gameState>)` when not `LOGGED_IN`.
 
 At the end, if any config was written the run calls `RuneLiteHost.flushConfig()` so the
-restored state is on disk even if the process is force-stopped right after (`:203-209`).
+restored state is on disk even if the process is force-stopped right after.
 
 ### What the counters do *not* prove
 
@@ -244,7 +243,7 @@ overlay totals — derive from successful **instantiation**. They say nothing ab
 behaviour: a plugin can be loaded and "active" while throwing, on every event, a
 `NoClassDefFoundError` from a missing transitive dependency, with no counter moving
 (this is exactly the case the conformance `subs`/`ovl`/`cfg`/`rc`/probes were added to
-catch — see the class javadoc, `PluginConformance.java:27-33`). `rc` is likewise a
+catch — see the class javadoc, `PluginConformance.java`). `rc` is likewise a
 registration delta; the behavioural number is `entityVeto`'s `entities`/`denied`.
 Treat a green loader count as "the class was loaded", never as "the plugin works".
 
