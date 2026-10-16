@@ -40,6 +40,31 @@ public final class TextBridge {
          */
         void drawString(Object font, int[] dest, int destW, int destH, String text,
                         int x, int y, int argb, boolean shadow);
+
+        /**
+         * The same draw at a device scale: {@code x}/{@code y} are already device
+         * pixels and the glyphs must be rasterised {@code scale} times larger than the
+         * handle's logical size (the sidebar's UI scale).
+         */
+        default void drawString(Object font, int[] dest, int destW, int destH, String text,
+                                int x, int y, int argb, boolean shadow, float scale) {
+            if (scale == 1f) {
+                drawString(font, dest, destW, destH, text, x, y, argb, shadow);
+            } else {
+                Object scaled = scaledFont(font, scale);
+                drawString(scaled != null ? scaled : font, dest, destW, destH, text, x, y, argb, shadow);
+            }
+        }
+
+        /** A handle whose glyphs are {@code scale} times the logical point size. */
+        default Object scaledFont(Object font, float scale) {
+            return font;
+        }
+
+        /** The logical point size a handle was created for. */
+        default int sizeOf(Object font) {
+            return font instanceof HandleSize ? ((HandleSize) font).logicalSize() : 0;
+        }
     }
 
     /** Installed by the app module; null while the platform renderer is absent. */
@@ -125,15 +150,61 @@ public final class TextBridge {
      */
     public static boolean drawString(Object font, int[] dest, int destW, int destH, String text,
                                      int x, int y, int argb, boolean shadow) {
+        return drawString(font, dest, destW, destH, text, x, y, argb, shadow, 1f);
+    }
+
+    /**
+     * Scale-aware draw: the caller has already mapped {@code x}/{@code y} to device
+     * pixels, and {@code scale} tells the renderer how much larger than its logical
+     * point size the glyphs must be rasterised (the sidebar's integer UI scale).
+     */
+    public static boolean drawString(Object font, int[] dest, int destW, int destH, String text,
+                                     int x, int y, int argb, boolean shadow, float scale) {
         TextRenderer r = renderer;
         if (r == null || font == null || text == null || text.isEmpty() || dest == null) {
             return false;
         }
         try {
-            r.drawString(font, dest, destW, destH, text, x, y, argb, shadow);
+            r.drawString(font, dest, destW, destH, text, x, y, argb, shadow, scale <= 0f ? 1f : scale);
             return true;
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * The device-resolution variant of a logical handle: glyphs are rasterised at
+     * {@code logicalSize * scale} while the caller keeps measuring in logical units.
+     * Returns the input handle when scaling is not possible.
+     */
+    public static Object scaledFont(Object font, float scale) {
+        TextRenderer r = renderer;
+        if (r == null || font == null || scale == 1f) {
+            return font;
+        }
+        try {
+            Object scaled = r.scaledFont(font, scale);
+            return scaled != null ? scaled : font;
+        } catch (Throwable t) {
+            return font;
+        }
+    }
+
+    /** Logical point size of a handle, or 0 when it cannot be queried. */
+    public static int sizeOf(Object font) {
+        TextRenderer r = renderer;
+        if (r == null || font == null || !(font instanceof HandleSize)) {
+            return font instanceof HandleSize ? ((HandleSize) font).logicalSize() : 0;
+        }
+        try {
+            return r.sizeOf(font);
+        } catch (Throwable t) {
+            return 0;
+        }
+    }
+
+    /** Implemented by a renderer's handle so the core can ask its logical size. */
+    public interface HandleSize {
+        int logicalSize();
     }
 }

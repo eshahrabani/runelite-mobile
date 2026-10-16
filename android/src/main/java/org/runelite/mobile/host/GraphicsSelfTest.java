@@ -45,6 +45,9 @@ public final class GraphicsSelfTest {
             if (failure == null) {
                 failure = testText();
             }
+            if (failure == null) {
+                failure = testDrawImageNegative();
+            }
             if (failure != null) {
                 Log.e(TAG, "GFX SELFTEST FAIL " + failure);
                 return failure;
@@ -142,6 +145,31 @@ public final class GraphicsSelfTest {
     }
 
     /** Overlay text needs a real platform font through TextBridge. */
+    /**
+     * {@code drawImage} with a negative width must flip the image about its anchor
+     * ({@code ImageUtil.flipImage}'s contract: it passes a negative size instead of
+     * mirroring pixels itself).
+     */
+    private static String testDrawImageNegative() {
+        BufferedImage src = new BufferedImage(4, 4, BufferedImage.TYPE_INT_ARGB);
+        src.setRGB(0, 0, 0xFFFF0000);
+        BufferedImage dst = new BufferedImage(8, 4, BufferedImage.TYPE_INT_ARGB);
+        Graphics2D g = dst.createGraphics();
+        g.drawImage(src, 4, 0, -4, 4, null);
+        g.dispose();
+        int mirrored = dst.getRGB(3, 0);
+        if ((mirrored & 0xFFFFFF) != 0xFF0000) {
+            return "drawimage_negative: expected the source's (0,0) at (3,0), found 0x"
+                + Integer.toHexString(mirrored);
+        }
+        int untouched = dst.getRGB(0, 0);
+        if ((untouched >>> 24) != 0) {
+            return "drawimage_negative: pixel (0,0) should have stayed transparent, found 0x"
+                + Integer.toHexString(untouched);
+        }
+        return null;
+    }
+
     private static String testText() throws Exception {
         ClassLoader loader = RuneLiteHost.clientLoader();
         if (loader == null) {

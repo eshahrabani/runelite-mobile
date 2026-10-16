@@ -4,7 +4,10 @@ import java.awt.Point;
 import java.awt.color.ColorSpace;
 
 /**
- * AWT DirectColorModel compatibility stub for Android runtime.
+ * The port's {@code java.awt.image.DirectColorModel}.
+ *
+ * <p>Hand-written because the injected client builds its frame buffer with this model
+ * (and hands it to {@code BufferedImage}), so the masks have to be real.
  *
  * <p>The injected client builds its frame buffer with this model over a
  * {@link DataBufferInt}; the masks are recorded so

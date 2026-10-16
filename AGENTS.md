@@ -270,14 +270,18 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   through a child `DexClassLoader` whose parent is the app classloader. Anything the app
   dex defines therefore *wins*, and anything only the asset dex defines is invisible to
   app-dex code. Consequences that shape the code:
-  - `net.runelite.client.ui.*` classes the host replaces are **stripped out of the asset
-    dex** (`HOST_REPLACED_CLASSES`/`HOST_REPLACED_PREFIXES` in `android/build.gradle`,
-    nested classes included — d8 refuses a nest member without its nest host) and the
-    shims take their place *inside that same dex*: their sources live in
-    `hostshims/src/net/runelite/client/ui/**` (deliberately NOT in the app source set)
-    and `compileHostShims()` compiles+packages them as a d8 program input. A stripped
-    class list must stay in sync with those shims (a missing entry is a d8 "defined
-    multiple times" error, which is the intended tripwire).
+  - Only the classes that need a desktop window / macOS / FlatLaf surface are still
+    **stripped out** of the asset dex (`HOST_REPLACED_CLASSES`/`HOST_REPLACED_PREFIXES`
+    in `android/build.gradle`, nested classes included — d8 refuses a nest member without
+    its nest host) and replaced by the five shims in `hostshims/src/net/runelite/client/**`
+    (deliberately NOT in the app source set; `compileHostShims()` compiles+packages them as
+    a d8 program input). A stripped class list must stay in sync with those shims (a
+    missing entry is a d8 "defined multiple times" error, which is the intended tripwire).
+    **RuneLite's real Swing shell ships**: `ClientToolbarPanel`, `ClientToolbar`,
+    `NavigationButton`, `PluginPanel`, `MultiplexingPluginPanel`, the config plugin's
+    panels, every plugin panel and all of `net/runelite/client/ui/components/**` execute
+    against the port's hand-written `javax.swing` — see [docs/swing-runtime.md](docs/swing-runtime.md)
+    and the "Swing runtime" section below.
   - `org.runelite.mobile.host.RuneLiteHost` reaches everything RuneLite-specific —
     including the Guice injector, `OkHttpClient` and `RuneLiteAPI.CLIENT` — by **name
     through the child loader**; the app dex has no compile-time RuneLite/Guice/OkHttp
@@ -301,12 +305,14 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   `PluginManager.instantiate` refuses a plugin whose `@PluginDependency` is missing
   ("Unmet dependency for ClueScrollPlugin: BankTagsPlugin"), which is why `BankTagsPlugin`
   is deliberately *not* excluded even though its Swing bank-tag editor cannot run here.
-  `InfoPlugin` and `KourendLibraryPlugin` are excluded because their `startUp()` builds a
-  Swing panel that cannot exist (`JEditorPane.getEditorKit().getStyleSheet()` and
-  `GroupLayout.createParallelGroup().addComponent(...)` NPE). Verified on the device: the
-  index is 114 classes, 114 instantiate with **0 failures**, 65 are active at boot (the
-  `@PluginDescriptor(enabledByDefault)` set — the side panel toggles the rest), and the
-  plugins register **141** unmodified RuneLite overlays. Note `PluginManager.startPlugins`
+  Panel-only plugins are **no longer excluded**: the drawer hosts RuneLite's real Swing
+  panels, so `ConfigPlugin`, `LootTrackerPlugin`, `NotesPlugin`, `TimeTrackingPlugin`,
+  `SkillCalculatorPlugin`, `ScreenMarkerPlugin`, `WorldHopperPlugin`, `HiscorePlugin`,
+  `GrandExchangePlugin`, `KourendLibraryPlugin` and `InfoPlugin` all instantiate. The five
+  remaining entries need LWJGL/JNA/a desktop-only library set or a native browser
+  (`GpuPlugin`, `DiscordPlugin`, `WorldMapPlugin`, `DevToolsPlugin`, `ScreenshotPlugin`).
+  Verified on the device (before the sidebar landed): the index was 114 classes, 114
+  instantiate with **0 failures**, 65 active at boot, **141** overlays registered. Note `PluginManager.startPlugins`
   stops at the first plugin whose `startUp()` throws, so one aborted plugin leaves the rest
   unstarted until the side panel (or nothing else) starts them.
 - **The Callbacks proxy delegates to `Hooks`.** `MainActivity`'s `Proxy` keeps the
@@ -396,34 +402,66 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   *referencing* class, which is what makes a failure actionable.
   `GraphicsSelfTest` runs once per host start and logs `GFX SELFTEST PASS`/`FAIL <case>`
   (shapes, alpha blending, the opaque frame blit, text).
-- **Native side panel** (`org.runelite.mobile.SidePanel`, opened from the `‹`/`›` chevron on the
-  always-present right-edge column):
-  Plugins / Config / Host tabs. The column is 44 dp wide and holds the chevron handle plus the
-  `⌨` keyboard toggle; an open drawer adds `min(42% of the screen width, 380 dp)`. It **takes
-  space** rather than floating: `MainActivity.applyGameInsets` insets the game `SurfaceView` and
-  the keyboard bar by `sidePanel.occupiedWidthPx()`, so a toggle resizes the surface and the game
-  reletterboxes (the column is hidden on the launcher screen by `setAvailable(false)`). The drawer
-  header carries the `⌂` launcher shortcut; there are no floating ⚙/☰/KB buttons any more. Plugin enablement goes through
-  `PluginManager.setPluginEnabled` + `startPlugin`/`stopPlugin` on the UI thread; config
-  forms are generated from `ConfigManager.getConfigDescriptor` (widgets chosen by the
-  item's return type, writes through the config proxy setter so `ConfigChanged` fires).
-  A plugin's config interface is resolved the way RuneLite declares it — the
-  `@ConfigGroup`-annotated interface that is the type of an injected field, or of a
-  helper method's return type (`RuneLiteHost.pluginConfigClass`); there is no
-  `getConfig()` on a plugin, and one that has no config at all (`AccountPlugin`) gets
-  "this plugin has no configuration" instead of an error.
-  RuneLite's Swing panels are never rendered: `ClientToolbar.addNavigation` records
-  buttons in `PluginPanelRegistry`, and a plugin with a panel gets a "panel not available
-  on mobile" note that opens its config instead.
-  Two things the panel has to say out loud, because both were read as "this plugin is
-  broken": the Config tab renders a plugin's *enabled* state (`"<name> (disabled)"` in the
-  header plus an orange "config changes do nothing — tap to enable" row that flips the
-  flag), and the Host tab has a **Run plugin conformance** button (see the next bullet)
-  showing the last summary and the report path. A `Color` config item must be written as
-  the *decimal ARGB int* (`String.valueOf(color.getRGB())`) — that is what
-  `ConfigManager.objectToString` stores and `ColorUtil.fromString` reads back with
-  `Integer.decode` + `new Color(int, true)`; a hex string is silently lost (`"00FF00"`
-  decodes as *octal* → `NumberFormatException` → null).
+- **The drawer hosts RuneLite's real Swing sidebar** (`org.runelite.mobile.SidePanel` + the
+  always-present right-edge column with the `‹`/`›` chevron and the `⌨` keyboard toggle).
+  The column is 44 dp wide; an open drawer adds `min(42% of the screen width, 380 dp)`. It
+  **takes space** rather than floating: `MainActivity.applyGameInsets` insets the game
+  `SurfaceView` and the keyboard bar by `sidePanel.occupiedWidthPx()`, so a toggle resizes
+  the surface and the game reletterboxes (the column is hidden on the launcher screen by
+  `setAvailable(false)`). The drawer header carries the `⌂` launcher shortcut.
+  The drawer **body** is `SwingSidebarView`: RuneLite's `ClientToolbarPanel` +
+  `JTabbedPane` (RIGHT placement, `JTabbedPane.trailingComponent` = the toolbar strip) +
+  the real plugin panels, built in the asset dex by the `ClientUI` shim
+  (`hostshims/src/net/runelite/client/ui/ClientUI.java`, which mirrors upstream's
+  `addNavigation`/`removeNavigation`/`openPanel` + selection history) and painted by the
+  core through `UiBridge` — see [docs/swing-runtime.md](docs/swing-runtime.md). The old
+  native Plugins/Config/Host tabs, the plugin search, the generated config forms and
+  `PluginPanelRegistry` are **gone**: plugin enablement, config editing, the colour
+  picker and the Notes/LootTracker/… panels are RuneLite's own Swing UI now. A panel whose
+  `onActivate` throws, or whose wrapped panel cannot be built, is replaced by a
+  `PluginErrorPanel` for that tab only (logged as `panel activation failed: <tooltip>`);
+  the rest of the sidebar keeps working.
+  `MainActivity`'s launcher screen carries the **Host** section (client version, runtime
+  status, plugin index/active counts, load failures, client AOT state, on-device dexer,
+  the last conformance summary, and the *Run plugin conformance* / *Refresh* pills).
+- **Swing runtime** (`core/src/main/java/{java,javax}/**` + `core/.../bridge/`). The port
+  ships a hand-written `java.awt`/`javax.swing` because Android has no `java.desktop`;
+  it is what makes the unmodified panels run. Four things to know before touching it:
+  1. **Threading.** `SwingEdt` is the port's event dispatch thread (`Swing-EDT-rlmobile`);
+     `MainActivity.onCreate` registers it through `AWTBridge.registerUiThread`, so
+     `PluginManager`'s EDT assertion, `SwingUtilities.invokeLater/invokeAndWait` and the
+     plugin lifecycle all land there. The Android main thread only presents bitmaps and
+     forwards input. `SwingEdt.pumpUntil` is the nested loop that keeps a modal
+     `JOptionPane` from freezing the app.
+  2. **The stage contract** is `UiBridge` (core ↔ app): the app reports the stage geometry
+     and forwards touches/keys, the core paints into a device-sized ARGB array. Popups
+     (menus, combo drop-downs, colour picker) live in `PopupLayer`, not in native windows;
+     virtual windows are painted with a core-drawn 22 px title bar and block input below
+     them while visible.
+  3. **Paint/repaint.** `JComponent.paint` → `ui.update(g, this)` (or
+     `paintComponent`/`paintBorder`/`paintChildren`); `repaint()` walks to the paint root
+     and no-ops for anything outside the sidebar/window trees — that is what keeps the
+     **game client's** own `repaint()` calls harmless. Never change
+     `Component.getGraphics()` (the game's pixel path) or `Component.createImage`.
+     `Component.paint` and `Component.paintSelf` are split on purpose: a
+     `JComponent.paintComponent` that calls `super.paint(g)` reaches **`Container.paint`**,
+     which paints the children too — every level then painted its subtree twice and the
+     sidebar cost 5 s per frame (195k component paints for ~600 components) instead of 15 ms.
+  4. **UI scale.** The sidebar renders at an integer scale
+     (`clamp(round(drawerWidthPx / 272), 1, 3)`) with device-resolution glyphs: fonts and
+     `FontMetrics` stay *logical*, `Graphics.drawString` passes the scale to
+     `TextBridge`, and `AndroidTextRenderer.scaledFont` rasterises at
+     `logicalSize × scale` (the `SwingSelfTest` `scale` case asserts exactly that — it was
+     a real bug: icons scaled through `drawImage` while glyphs stayed logical). Every new
+     widget must measure logically.
+  `SwingSelfTest` (app dex, 22 cases) runs at boot right after `GraphicsSelfTest` and logs
+  `SWING SELFTEST PASS` / `FAIL <case>: <detail>`; both are also appended to `RuneLiteHost.status`
+  and therefore visible in the launcher's Host section. The `optionpane` case puts a dialog on
+  screen, so the boot run skips it (the conformance pass runs it deliberately).
+  The drawer's touch mapping is documented in `SwingSidebarView`: a one-finger drag inside a
+  scrollable panel **scrolls** it (`UiBridge.isScrollableAt` decides; a swipe never clicks), a
+  two-finger drag is the wheel, a two-finger tap and a long press are right clicks, and the
+  tab strip itself scrolls when a hub install adds more tabs than fit.
 - **Plugin conformance run** (`org.runelite.mobile.host.PluginConformance`). The loader
   counters all derive from successful *instantiation* (`index=114`, `N plugin(s) active`,
   `141 overlays`) and say nothing about behaviour — a plugin can be listed as active and

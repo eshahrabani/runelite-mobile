@@ -27,8 +27,8 @@ import org.runelite.mobile.bridge.TextBridge;
 public final class AndroidTextRenderer implements TextBridge.TextRenderer {
 
     /** Scratch bitmap hard limits; text wider than this is clipped. */
-    private static final int MAX_SCRATCH_WIDTH = 1024;
-    private static final int MAX_SCRATCH_HEIGHT = 64;
+    private static final int MAX_SCRATCH_WIDTH = 4096;
+    private static final int MAX_SCRATCH_HEIGHT = 256;
 
     private final Object lock = new Object();
 
@@ -39,14 +39,35 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
     private Canvas scratchCanvas;
     private int[] scratchPixels;
 
-    /** Opaque font handle: the platform typeface plus its configured paint. */
-    private static final class Handle {
+    /**
+     * Opaque font handle: the platform typeface plus its configured paint. The paint's
+     * text size is {@code logicalSize * scale}, so a handle is either a logical (scale 1)
+     * or a device-resolution (scaled) instance of the same typeface.
+     */
+    private static final class Handle implements TextBridge.HandleSize {
         final Typeface typeface;
         final Paint paint;
+        /** Cached platform metrics: {@code Paint.getFontMetrics()} allocates per call. */
+        volatile Paint.FontMetrics fontMetrics;
+        final String family;
+        final int style;
+        final int logicalSize;
+        final int scaledSize;
+        final float scale;
 
-        Handle(Typeface typeface, Paint paint) {
+        Handle(Typeface typeface, Paint paint, String family, int style, int logicalSize, float scale) {
             this.typeface = typeface;
             this.paint = paint;
+            this.family = family;
+            this.style = style;
+            this.logicalSize = logicalSize;
+            this.scale = scale;
+            this.scaledSize = Math.max(1, Math.round(logicalSize * scale));
+        }
+
+        @Override
+        public int logicalSize() {
+            return logicalSize;
         }
     }
 
@@ -60,14 +81,53 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
                 return existing;
             }
             Typeface typeface = buildTypeface(ttf, style, familyName);
-            Paint paint = new Paint();
-            paint.setAntiAlias(true);
-            paint.setTextSize(size);
-            paint.setTypeface(typeface);
-            Handle handle = new Handle(typeface, paint);
+            Handle handle = new Handle(typeface, newPaint(typeface, size), familyName, style, size, 1f);
             cache.put(key, handle);
             return handle;
         }
+    }
+
+    /**
+     * Builds (or reuses) the device-resolution twin of a handle: glyphs are rasterised
+     * {@code scale} times larger while the core keeps its logical font size and metrics.
+     */
+    @Override
+    public Object scaledFont(Object font, float scale) {
+        Handle handle = asHandle(font);
+        if (handle == null || scale <= 0f || scale == 1f) {
+            return handle != null ? handle : font;
+        }
+        if (handle.scale == scale) {
+            return handle;
+        }
+        String key = handle.family + "\u0000" + handle.style + "\u0000" + handle.logicalSize + "@" + scale;
+        synchronized (lock) {
+            Handle existing = cache.get(key);
+            if (existing != null) {
+                return existing;
+            }
+            // The glyphs must be rasterised logicalSize * scale: the source handle's own
+            // paint is at the logical size (it is the scale-1 instance).
+            int scaledSize = Math.max(1, Math.round(handle.logicalSize * scale));
+            Handle scaled = new Handle(handle.typeface, newPaint(handle.typeface, scaledSize),
+                    handle.family, handle.style, handle.logicalSize, scale);
+            cache.put(key, scaled);
+            return scaled;
+        }
+    }
+
+    @Override
+    public int sizeOf(Object font) {
+        Handle handle = asHandle(font);
+        return handle == null ? 0 : handle.logicalSize;
+    }
+
+    private static Paint newPaint(Typeface typeface, int textSize) {
+        Paint paint = new Paint();
+        paint.setAntiAlias(true);
+        paint.setTextSize(textSize);
+        paint.setTypeface(typeface);
+        return paint;
     }
 
     @Override
@@ -88,7 +148,7 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             return 0;
         }
         synchronized (lock) {
-            Paint.FontMetrics fm = handle.paint.getFontMetrics();
+            Paint.FontMetrics fm = metricsOf(handle);
             return Math.round(fm.bottom - fm.top);
         }
     }
@@ -100,7 +160,7 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             return 0;
         }
         synchronized (lock) {
-            return -Math.round(handle.paint.getFontMetrics().ascent);
+            return -Math.round(metricsOf(handle).ascent);
         }
     }
 
@@ -111,13 +171,29 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             return 0;
         }
         synchronized (lock) {
-            return Math.round(handle.paint.getFontMetrics().descent);
+            return Math.round(metricsOf(handle).descent);
         }
+    }
+
+    /** The handle's platform metrics, computed once per (family, style, size, scale). */
+    private static Paint.FontMetrics metricsOf(Handle handle) {
+        Paint.FontMetrics fm = handle.fontMetrics;
+        if (fm == null) {
+            fm = handle.paint.getFontMetrics();
+            handle.fontMetrics = fm;
+        }
+        return fm;
     }
 
     @Override
     public void drawString(Object font, int[] dest, int destW, int destH, String text,
                            int x, int y, int argb, boolean shadow) {
+        drawString(font, dest, destW, destH, text, x, y, argb, shadow, 1f);
+    }
+
+    @Override
+    public void drawString(Object font, int[] dest, int destW, int destH, String text,
+                           int x, int y, int argb, boolean shadow, float scale) {
         if (dest == null || text == null || text.isEmpty() || destW <= 0 || destH <= 0) {
             return;
         }
@@ -125,8 +201,14 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
         if (handle == null) {
             return;
         }
+        if (scale > 0f && scale != 1f && handle.scale != scale) {
+            Object scaled = scaledFont(handle, scale);
+            if (scaled instanceof Handle) {
+                handle = (Handle) scaled;
+            }
+        }
         synchronized (lock) {
-            Paint.FontMetrics fm = handle.paint.getFontMetrics();
+            Paint.FontMetrics fm = metricsOf(handle);
             int ascent = -Math.round(fm.ascent);
             int descent = Math.round(fm.descent);
             int needW = (int) Math.ceil(handle.paint.measureText(text)) + 2;
@@ -136,8 +218,6 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             if (bitmap == null) {
                 return;
             }
-            int sw = bitmap.getWidth();
-            int sh = bitmap.getHeight();
             Canvas canvas = scratchCanvas;
             bitmap.eraseColor(0);
 
@@ -149,14 +229,16 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             handle.paint.setColor(argb);
             canvas.drawText(text, 0f, baseline, handle.paint);
 
-            if (scratchPixels == null || scratchPixels.length < sw * sh) {
-                scratchPixels = new int[sw * sh];
+            // Copy only the rectangle the glyphs can occupy: reading the whole scratch
+            // bitmap copied tens of kilobytes per string and dominated busy panels.
+            if (scratchPixels == null || scratchPixels.length < needW * needH) {
+                scratchPixels = new int[needW * needH];
             }
-            bitmap.getPixels(scratchPixels, 0, sw, 0, 0, sw, sh);
+            bitmap.getPixels(scratchPixels, 0, needW, 0, 0, needW, needH);
 
             int destX = x;
             int destY = y - ascent;
-            composite(scratchPixels, sw, sh, dest, destW, destH, destX, destY);
+            composite(scratchPixels, needW, needH, dest, destW, destH, destX, destY);
         }
     }
 
@@ -249,7 +331,7 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
         }
         if (typeface == null) {
             try {
-                typeface = Typeface.create(familyName, style);
+                typeface = Typeface.create(mapLogicalFamily(familyName), style);
             } catch (Throwable t) {
                 typeface = null;
             }
@@ -277,6 +359,32 @@ public final class AndroidTextRenderer implements TextBridge.TextRenderer {
             }
         }
         return out;
+    }
+
+    /**
+     * Maps a JDK logical family name onto the Android family of the same shape, so
+     * {@code new Font("Dialog", …)} in RuneLite's code renders with the platform UI font
+     * instead of falling back to the default typeface of whatever family string it used.
+     */
+    private static String mapLogicalFamily(String familyName) {
+        if (familyName == null || familyName.isEmpty()) {
+            return "sans-serif";
+        }
+        switch (familyName) {
+            case "Dialog":
+            case "DialogInput":
+            case "SansSerif":
+            case "sans-serif":
+                return "sans-serif";
+            case "Serif":
+            case "serif":
+                return "serif";
+            case "Monospaced":
+            case "monospaced":
+                return "monospace";
+            default:
+                return familyName;
+        }
     }
 
     private static Handle asHandle(Object font) {

@@ -44,6 +44,57 @@ public class Rectangle implements Shape {
         this(r.x, r.y, r.width, r.height);
     }
 
+    /** The union of this rectangle and {@code r} (the JDK's {@code union}). */
+    public Rectangle union(Rectangle r) {
+        if (r == null) {
+            return new Rectangle(this);
+        }
+        long tx1 = Math.min(x, r.x);
+        long ty1 = Math.min(y, r.y);
+        long tx2 = Math.max((long) x + width, (long) r.x + r.width);
+        long ty2 = Math.max((long) y + height, (long) r.y + r.height);
+        return new Rectangle((int) tx1, (int) ty1, (int) (tx2 - tx1), (int) (ty2 - ty1));
+    }
+
+    /** The largest rectangle contained in both this and {@code r}. */
+    public Rectangle intersection(Rectangle r) {
+        if (r == null) {
+            return new Rectangle(this);
+        }
+        long tx1 = Math.max(x, r.x);
+        long ty1 = Math.max(y, r.y);
+        long tx2 = Math.min((long) x + width, (long) r.x + r.width);
+        long ty2 = Math.min((long) y + height, (long) r.y + r.height);
+        if (tx2 < tx1 || ty2 < ty1) {
+            return new Rectangle((int) tx1, (int) ty1, 0, 0);
+        }
+        return new Rectangle((int) tx1, (int) ty1, (int) (tx2 - tx1), (int) (ty2 - ty1));
+    }
+
+    public Rectangle createIntersection(java.awt.geom.Rectangle2D r) {
+        if (r == null) {
+            return new Rectangle(this);
+        }
+        return intersection(new Rectangle((int) Math.floor(r.getX()), (int) Math.floor(r.getY()),
+                (int) Math.ceil(r.getWidth()), (int) Math.ceil(r.getHeight())));
+    }
+
+    public Rectangle createUnion(java.awt.geom.Rectangle2D r) {
+        if (r == null) {
+            return new Rectangle(this);
+        }
+        return union(new Rectangle((int) Math.floor(r.getX()), (int) Math.floor(r.getY()),
+                (int) Math.ceil(r.getWidth()), (int) Math.ceil(r.getHeight())));
+    }
+
+    /** Grows this rectangle so it contains the given rectangle. */
+    public void add(Rectangle r) {
+        if (r != null) {
+            Rectangle u = union(r);
+            setBounds(u.x, u.y, u.width, u.height);
+        }
+    }
+
     @Override
     public Rectangle getBounds() {
         return new Rectangle(x, y, width, height);

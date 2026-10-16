@@ -16,6 +16,7 @@ public class InputEvent extends java.awt.AWTEvent {
     public static final int CTRL_DOWN_MASK = 128;
     public static final int META_DOWN_MASK = 256;
     public static final int ALT_DOWN_MASK = 512;
+    public static final int ALT_GRAPH_DOWN_MASK = 8192;
 
     protected long when;
     protected int modifiers;

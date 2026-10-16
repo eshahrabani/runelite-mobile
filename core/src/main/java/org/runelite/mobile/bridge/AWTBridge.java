@@ -13,12 +13,18 @@ public class AWTBridge {
     public static volatile int activeHeight;
 
     /**
-     * The thread the host registered as the UI thread (the Android main thread) plus
-     * an executor that posts to it. RuneLite's contract is "plugins run on the event
-     * dispatch thread": {@code PluginManager.startPlugin} asserts it and
-     * {@code javax.swing.SwingUtilities.invokeLater/invokeAndWait} rely on it, so the
-     * host installs the main thread here (MainActivity.onCreate) and everything that
-     * would post to the EDT posts through this executor instead.
+     * The thread the host registered as the event dispatch thread plus an executor that
+     * posts to it. RuneLite's contract is "plugins run on the event dispatch thread":
+     * {@code PluginManager.startPlugin} asserts it and
+     * {@code javax.swing.SwingUtilities.invokeLater/invokeAndWait} rely on it.
+     *
+     * <p>Since the port runs RuneLite's real Swing shell, that thread is
+     * {@link SwingEdt}'s {@code Swing-EDT-rlmobile}, not the Android main thread:
+     * the main thread only presents bitmaps and forwards input, so a modal Swing
+     * dialog or a slow panel cannot freeze the Android UI. {@code MainActivity.onCreate}
+     * calls {@code registerUiThread(SwingEdt.ensureStarted(), r -> SwingEdt.post(r))};
+     * before that (and in core-only contexts such as the self-tests) the default
+     * {@link SwingEdt} queue is used directly.
      */
     private static volatile Thread uiThread;
     private static volatile java.util.concurrent.Executor uiExecutor;
@@ -28,31 +34,41 @@ public class AWTBridge {
         uiExecutor = executor;
     }
 
-    public static boolean isUiThread() {
+    /** The event dispatch thread: the registered one, else the default {@link SwingEdt}. */
+    public static Thread swingThread() {
         Thread t = uiThread;
+        return t != null ? t : SwingEdt.threadOrNull();
+    }
+
+    public static boolean isUiThread() {
+        Thread t = swingThread();
         return t != null && Thread.currentThread() == t;
     }
 
-    /** Runs {@code r} on the UI thread, inline when already there. */
+    /** Enqueues {@code r} on the event dispatch thread. */
     public static void post(Runnable r) {
         if (r == null) {
             return;
         }
         java.util.concurrent.Executor executor = uiExecutor;
-        if (isUiThread() || executor == null) {
-            r.run();
-        } else {
+        if (executor != null) {
             executor.execute(r);
+        } else {
+            SwingEdt.post(r);
         }
     }
 
-    /** Runs {@code r} on the UI thread and waits for it (inline when already there). */
+    /** Runs {@code r} on the event dispatch thread and waits for it (inline when already there). */
     public static void invokeAndWait(Runnable r) {
         if (r == null) {
             return;
         }
-        if (isUiThread() || uiExecutor == null) {
+        if (isUiThread()) {
             r.run();
+            return;
+        }
+        if (uiExecutor == null) {
+            SwingEdt.invokeAndWait(r);
             return;
         }
         final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
@@ -66,9 +82,16 @@ public class AWTBridge {
                 latch.countDown();
             }
         });
-        try {
-            latch.await();
-        } catch (InterruptedException e) {
+        boolean interrupted = false;
+        for (; ; ) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
             Thread.currentThread().interrupt();
         }
         if (failure[0] != null) {

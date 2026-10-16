@@ -57,6 +57,7 @@ public final class RuneLiteHost {
     private static volatile Throwable failure;
     private static volatile String status = "not started";
     private static volatile int indexSize;
+    private static volatile Throwable sidebarFailure;
     private static volatile int activePlugins;
     private static volatile String clientVersion = "?";
     private static volatile android.content.Context appContext;
@@ -222,7 +223,7 @@ public final class RuneLiteHost {
             // with Hooks directly, which bypasses the proxy's frame blit and leaves the
             // render thread waiting on frameSeq forever -- a black screen with a live
             // runtime.
-            installNavigationHook(loader);
+            initSidebar();
             Log.i(TAG, "injector ok");
 
             hooks = get("net.runelite.api.hooks.Callbacks");
@@ -235,7 +236,8 @@ public final class RuneLiteHost {
             } catch (Throwable t) {
                 Log.w(TAG, "ClientThread unavailable: " + t);
             }
-            status = "injector ok; starting plugins";
+            status = sidebarFailure == null ? "sidebar ok; starting plugins"
+                : "sidebar FAILED: " + sidebarFailure + "; starting plugins";
         } catch (Throwable t) {
             failure = unwrap(t);
             status = "FAILED: " + failure;
@@ -319,6 +321,13 @@ public final class RuneLiteHost {
             String gfxFailure = GraphicsSelfTest.run();
             if (gfxFailure != null) {
                 status = status + "; gfx self-test FAIL: " + gfxFailure;
+            }
+
+            // Same idea for the Swing runtime the sidebar and every plugin panel is built
+            // from: layout, painting, widgets, popups, modal dialogs and the UI scale.
+            String swingFailure = SwingSelfTest.run();
+            if (swingFailure != null) {
+                status = status + "; swing self-test FAIL: " + swingFailure;
             }
         } catch (Throwable t) {
             failure = unwrap(t);
@@ -719,29 +728,37 @@ public final class RuneLiteHost {
     }
 
     /**
-     * Wires {@code ClientToolbar}'s static navigation hook to
-     * {@link PluginPanelRegistry}: the toolbar shim lives in the RuneLite dex, the
-     * registry in the app dex, so the connection is a field write plus a lambda.
+     * Builds RuneLite's real Swing sidebar and publishes it as the app's drawer root.
+     *
+     * <p>{@code net.runelite.client.ui.ClientUI} is the asset dex's sidebar host: it owns
+     * the {@code ClientToolbarPanel} + {@code JTabbedPane} tree and mirrors upstream's
+     * navigation logic. {@code init()} runs on the Swing dispatch thread (it touches Swing
+     * state) and ends with {@code UiBridge.setSidebarRoot}, which is what makes the drawer
+     * show the real sidebar instead of the old native tab list.
+     *
+     * <p>A failure here is recorded but never fatal: the game keeps running without a
+     * sidebar (the drawer then reports the failure through its placeholder).
      */
-    @SuppressWarnings("unchecked")
-    private static void installNavigationHook(ClassLoader loader) {
+    private static void initSidebar() {
         try {
-            Class<?> toolbarClass = loader.loadClass("net.runelite.client.ui.ClientToolbar");
-            java.lang.reflect.Field hook = toolbarClass.getField("navigationListener");
-            java.util.function.BiConsumer<String, Object> listener = (action, button) -> {
-                if ("add".equals(action)) {
-                    PluginPanelRegistry.add(button);
-                } else if ("remove".equals(action)) {
-                    PluginPanelRegistry.remove(button);
-                } else {
-                    PluginPanelRegistry.open(button);
+            Object clientUi = get("net.runelite.client.ui.ClientUI");
+            AWTBridge.invokeAndWait(() -> {
+                try {
+                    invoke(clientUi, "init", new Class<?>[0]);
+                } catch (Exception e) {
+                    throw new RuntimeException(e);
                 }
-            };
-            hook.set(null, listener);
-            Log.i(TAG, "toolbar navigation hook installed");
+            });
+            Log.i(TAG, "sidebar initialised");
         } catch (Throwable t) {
-            Log.w(TAG, "toolbar navigation hook not installed", t);
+            sidebarFailure = unwrap(t);
+            Log.e(TAG, "sidebar init failed", sidebarFailure);
         }
+    }
+
+    /** The sidebar bootstrap failure, or null when the sidebar is up. */
+    public static Throwable sidebarFailure() {
+        return sidebarFailure;
     }
 
     private static Method findMethod(Class<?> owner, String name, int paramCount) throws NoSuchMethodException {

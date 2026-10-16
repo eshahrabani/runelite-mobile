@@ -1,77 +1,43 @@
 package org.runelite.mobile;
 
 import android.app.Activity;
-import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
-import android.text.Editable;
-import android.text.InputType;
-import android.text.TextWatcher;
 import android.util.DisplayMetrics;
-import android.util.Log;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.AdapterView;
-import android.widget.ArrayAdapter;
-import android.widget.Button;
-import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
-import android.widget.SeekBar;
-import android.widget.Spinner;
-import android.widget.Switch;
 import android.widget.TextView;
-import android.widget.Toast;
 
-import org.runelite.mobile.host.PluginConformance;
-import org.runelite.mobile.host.PluginPanelRegistry;
+import org.runelite.mobile.bridge.UiBridge;
 import org.runelite.mobile.host.RuneLiteHost;
 
-import java.lang.annotation.Annotation;
-import java.lang.reflect.Method;
-import java.lang.reflect.Type;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-
 /**
- * Native side panel: the mobile replacement for RuneLite's Swing client shell.
+ * Native side panel: the mobile chrome around RuneLite's real Swing sidebar.
  *
- * <p>A collapsible drawer on the right edge with three tabs. <b>Plugins</b> lists every
- * plugin the runtime loaded and toggles it through {@code PluginManager}; <b>Config</b>
- * generates a form from {@code ConfigManager.getConfigDescriptor} and writes through the
- * config proxy (so {@code ConfigChanged} fires and plugins react); <b>Host</b> reports the
- * runtime state. Plugin Swing panels are never rendered -- a plugin that registered a
- * navigation button is listed as "panel not available on mobile" and opens its config
- * instead (RuneLite's {@code ClientToolbar} shim records those buttons in
- * {@link PluginPanelRegistry}).
+ * <p>A collapsible drawer on the right edge. The drawer body is RuneLite's own Swing
+ * sidebar, rendered by a hand-written Swing runtime in {@code core/} into an ARGB bitmap
+ * and presented by {@link SwingSidebarView} -- the app no longer reimplements plugins,
+ * config or the host tab natively. While the runtime is not up, a status line stands in
+ * for the sidebar body.
  *
- * <p>Everything RuneLite-specific goes through reflection into the child class loader
- * ({@link RuneLiteHost}), because the app dex cannot see the asset dex. The right-edge
- * column (the drawer handle and the keyboard toggle) is always present and consumes
- * {@code handleWidthPx} of screen width; an open drawer adds {@code drawerWidthPx}. The
- * game surface is <em>inset</em> by that sum -- the host reads {@link #occupiedWidthPx()}
- * and resizes the surface (see {@link Listener}) -- instead of the drawer floating over a
- * full-size game. The column and the drawer swallow touches inside their own bounds, and
- * the game's own input mapping accounts for the inset, so no tap is lost.
+ * <p>The right-edge column (the drawer handle and the keyboard toggle) is always present
+ * and consumes {@code handleWidthPx} of screen width; an open drawer adds
+ * {@code drawerWidthPx}. The game surface is <em>inset</em> by that sum -- the host reads
+ * {@link #occupiedWidthPx()} and resizes the surface (see {@link Listener}) -- instead of
+ * the drawer floating over a full-size game. The column and the drawer swallow touches
+ * inside their own bounds, and the game's own input mapping accounts for the inset, so no
+ * tap is lost.
  */
-public final class SidePanel implements PluginPanelRegistry.Listener {
+public final class SidePanel {
 
-    private static final String TAG = "RuneLiteMobile";
     /** Same preferences file the launcher uses for its own UI state. */
     private static final String PREFS_NAME = "RuneLiteMobilePrefs";
     private static final String PREFS_OPEN = "sidePanelOpen";
-    private static final String PREFS_TAB = "sidePanelTab";
-    private static final int TAB_PLUGINS = 0;
-    private static final int TAB_CONFIG = 1;
-    private static final int TAB_HOST = 2;
 
     /** Callbacks the host uses to follow the drawer (game-area inset, launcher, keyboard). */
     public interface Listener {
@@ -87,6 +53,12 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
 
     private final Activity activity;
     private final FrameLayout root;
+    /**
+     * The drawer width is the single knob for the Swing UI scale: the drawer is
+     * {@code min(42% of screen, 380 dp)} wide and {@link SwingSidebarView} maps that onto
+     * RuneLite's 272-logical-px sidebar (and thumbnails its bitmaps to a scale that does
+     * not exceed the drawer), so widening or narrowing this rule retunes {@code uiScale}.
+     */
     private final int drawerWidthPx;
     private final int handleWidthPx;
     private final float density;
@@ -96,21 +68,15 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
     private final LinearLayout column;
     private final LinearLayout drawer;
     private final TextView handle;
-    private final TextView[] tabButtons = new TextView[3];
     private final FrameLayout content;
-    private final LinearLayout pluginsList;
-    private final LinearLayout configList;
-    private final LinearLayout hostList;
-    private final EditText search;
-    private final TextView hostStatus;
+    private final TextView statusText;
 
-    private int selectedTab;
+    /** Set by {@link #setSwingSidebarView(View)} once the host has built the runtime. */
+    private SwingSidebarView swingSidebarView;
+
     private boolean open;
     private boolean available = true;
     private Listener listener;
-    private Object configPlugin;      // plugin whose config is currently shown
-    private String pendingNavigation; // panel-less plugin the user tapped
-    private String hostStatusText = "";
 
     public SidePanel(Activity activity, FrameLayout rootLayout) {
         this.activity = activity;
@@ -215,87 +181,20 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         header.addView(launcherButton);
         drawer.addView(header);
 
-        LinearLayout tabRow = new LinearLayout(activity);
-        tabRow.setOrientation(LinearLayout.HORIZONTAL);
-        String[] titles = {"Plugins", "Config", "Host"};
-        for (int i = 0; i < titles.length; i++) {
-            final int index = i;
-            TextView tab = new TextView(activity);
-            tab.setText(titles[i]);
-            tab.setTextSize(13f);
-            tab.setGravity(Gravity.CENTER);
-            tab.setPadding(0, (int) (8 * density), 0, (int) (8 * density));
-            LinearLayout.LayoutParams p = new LinearLayout.LayoutParams(0,
-                ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-            p.leftMargin = (int) (3 * density);
-            p.rightMargin = (int) (3 * density);
-            tab.setLayoutParams(p);
-            tab.setOnClickListener(v -> selectTab(index));
-            tabButtons[i] = tab;
-            tabRow.addView(tab);
-        }
-        LinearLayout.LayoutParams tabRowParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        tabRowParams.topMargin = (int) (10 * density);
-        drawer.addView(tabRow, tabRowParams);
-
-        hostStatus = new TextView(activity);
-        hostStatus.setTextSize(11f);
-        hostStatus.setTextColor(UiTheme.TEXT_MUTED);
-        hostStatus.setPadding(0, (int) (4 * density), 0, (int) (4 * density));
-        drawer.addView(hostStatus);
-
-        search = new EditText(activity);
-        search.setHint("search plugins");
-        search.setTextSize(12f);
-        search.setSingleLine(true);
-        search.setTextColor(UiTheme.TEXT);
-        search.setHintTextColor(UiTheme.TEXT_DIM);
-        search.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
-        search.setPadding((int) (10 * density), (int) (10 * density),
-            (int) (10 * density), (int) (10 * density));
-        search.addTextChangedListener(new TextWatcher() {
-            public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-            }
-
-            public void onTextChanged(CharSequence s, int start, int before, int count) {
-            }
-
-            public void afterTextChanged(Editable s) {
-                if (selectedTab == TAB_PLUGINS) {
-                    buildPluginRows(s.toString());
-                }
-            }
-        });
-        drawer.addView(search);
-
+        // Body: the Swing sidebar (added later by setSwingSidebarView) with a status
+        // line that stands in for it while the runtime is not up.
         content = new FrameLayout(activity);
-        LinearLayout.LayoutParams contentParams = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f);
-        content.setLayoutParams(contentParams);
+        content.setLayoutParams(new LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        statusText = new TextView(activity);
+        statusText.setTextSize(12f);
+        statusText.setTextColor(UiTheme.TEXT_MUTED);
+        statusText.setPadding(0, (int) (8 * density), 0, 0);
+        content.addView(statusText, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
         drawer.addView(content);
-
-        pluginsList = new LinearLayout(activity);
-        pluginsList.setOrientation(LinearLayout.VERTICAL);
-        configList = new LinearLayout(activity);
-        configList.setOrientation(LinearLayout.VERTICAL);
-        hostList = new LinearLayout(activity);
-        hostList.setOrientation(LinearLayout.VERTICAL);
-        // Bottom padding so the last row is not under the navigation bar.
-        int listBottom = (int) (12 * density);
-        pluginsList.setPadding(0, 0, 0, listBottom);
-        configList.setPadding(0, 0, 0, listBottom);
-        hostList.setPadding(0, 0, 0, listBottom);
-
-        ScrollView pluginsScroll = wrap(pluginsList);
-        ScrollView configScroll = wrap(configList);
-        ScrollView hostScroll = wrap(hostList);
-        content.addView(pluginsScroll);
-        content.addView(configScroll);
-        content.addView(hostScroll);
-        pluginsScroll.setTag("plugins");
-        configScroll.setTag("config");
-        hostScroll.setTag("host");
 
         // The column and the drawer swallow touches so a tap never walks the
         // character. Child views get their events first, so the handle and the
@@ -312,23 +211,34 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         container.addView(drawer);
         root.addView(container);
 
-        PluginPanelRegistry.setListener(this);
-        selectedTab = prefs.getInt(PREFS_TAB, TAB_PLUGINS);
         open = prefs.getBoolean(PREFS_OPEN, false);
+        updateStatus();
         applyState();
-        selectTab(selectedTab);
-        refreshPlugins();
-    }
-
-    private ScrollView wrap(View child) {
-        ScrollView scroll = new ScrollView(activity);
-        scroll.addView(child, new FrameLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        return scroll;
     }
 
     public void setListener(Listener listener) {
         this.listener = listener;
+    }
+
+    /**
+     * Hands the drawer its Swing sidebar body. Called by the host once the RuneLite
+     * runtime and its render loop are up; may be called at any time after construction
+     * (it is how the view is added, since the host builds it after the drawer).
+     */
+    public void setSwingSidebarView(View view) {
+        if (view == null) {
+            return;
+        }
+        if (swingSidebarView != null) {
+            content.removeView(swingSidebarView);
+        }
+        swingSidebarView = (SwingSidebarView) view;
+        // Behind the status line: when the runtime is not up the sidebar paints nothing
+        // and the status text must stay visible.
+        content.addView(swingSidebarView, 0, new FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        swingSidebarView.setSuspended(!open);
+        updateStatus();
     }
 
     /**
@@ -374,18 +284,16 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         return open;
     }
 
-    public void setHostStatus(String text) {
-        hostStatusText = text == null ? "" : text;
-        hostStatus.setText(hostStatusText);
-        if (selectedTab == TAB_HOST) {
-            buildHostTab();
-        }
-    }
-
     private void applyState() {
         drawer.setVisibility(open ? View.VISIBLE : View.GONE);
+        // Sync both sides of the bridge on every transition: the Swing sidebar only
+        // renders/publishes while visible, and only needs to composite while open.
+        UiBridge.setSidebarVisible(open);
+        if (swingSidebarView != null) {
+            swingSidebarView.setSuspended(!open);
+        }
         if (open) {
-            refreshPlugins();
+            updateStatus();
         }
         handle.setText(open ? "›" : "‹");
         if (listener != null) {
@@ -393,565 +301,12 @@ public final class SidePanel implements PluginPanelRegistry.Listener {
         }
     }
 
-    private void selectTab(int index) {
-        selectedTab = index;
-        prefs.edit().putInt(PREFS_TAB, index).apply();
-        for (int i = 0; i < tabButtons.length; i++) {
-            boolean selected = i == index;
-            tabButtons[i].setTextColor(selected ? UiTheme.GOLD : UiTheme.TEXT_MUTED);
-            tabButtons[i].setBackground(selected
-                ? UiTheme.rounded(UiTheme.GOLD_FILL, UiTheme.GOLD, 1f, 10f, density)
-                : UiTheme.rounded(0, UiTheme.BORDER, 1f, 10f, density));
+    /** The body is the Swing sidebar; the status line stands in only while it is not up. */
+    private void updateStatus() {
+        boolean ready = UiBridge.hasSidebar();
+        statusText.setVisibility(ready ? View.GONE : View.VISIBLE);
+        if (!ready) {
+            statusText.setText("RuneLite runtime not running: " + RuneLiteHost.status());
         }
-        search.setVisibility(index == TAB_PLUGINS ? View.VISIBLE : View.GONE);
-        for (int i = 0; i < content.getChildCount(); i++) {
-            content.getChildAt(i).setVisibility(i == index ? View.VISIBLE : View.GONE);
-        }
-        if (index == TAB_PLUGINS) {
-            buildPluginRows(search.getText().toString());
-        } else if (index == TAB_CONFIG) {
-            buildConfigPluginList();
-        } else {
-            buildHostTab();
-        }
-    }
-
-    // ------------------------------------------------------------------ plugins tab
-    @Override
-    public void navigationAdded(String name) {
-        pendingNavigation = name;
-        if (selectedTab == TAB_PLUGINS) {
-            buildPluginRows(search.getText().toString());
-        }
-    }
-
-    @Override
-    public void navigationRemoved(String name) {
-        if (selectedTab == TAB_PLUGINS) {
-            buildPluginRows(search.getText().toString());
-        }
-    }
-
-    @Override
-    public void panelOpened(String name) {
-        // A plugin asked for its Swing panel: the port cannot show it, so its config is
-        // the closest useful thing.
-        showConfigFor(name);
-    }
-
-    public void refreshPlugins() {
-        if (!open) {
-            return;
-        }
-        if (selectedTab == TAB_PLUGINS) {
-            buildPluginRows(search.getText().toString());
-        }
-        setHostStatus(RuneLiteHost.status());
-    }
-
-    private void buildPluginRows(String filter) {
-        pluginsList.removeAllViews();
-        List<Object> plugins = RuneLiteHost.plugins();
-        if (plugins.isEmpty()) {
-            pluginsList.addView(label(RuneLiteHost.isRunning()
-                ? "no plugins loaded"
-                : "RuneLite runtime not running: " + RuneLiteHost.status(), 12f, UiTheme.TEXT_MUTED));
-            return;
-        }
-        String needle = filter == null ? "" : filter.trim().toLowerCase();
-        List<Object> sorted = new ArrayList<>(plugins);
-        sorted.sort(Comparator.comparing(RuneLiteHost::pluginName, String.CASE_INSENSITIVE_ORDER));
-        int shown = 0;
-        for (Object plugin : sorted) {
-            String name = RuneLiteHost.pluginName(plugin);
-            String description = pluginDescription(plugin);
-            if (!needle.isEmpty()
-                && !name.toLowerCase().contains(needle)
-                && !description.toLowerCase().contains(needle)) {
-                continue;
-            }
-            shown++;
-            pluginsList.addView(pluginRow(plugin, name, description));
-        }
-        if (shown == 0) {
-            pluginsList.addView(label("no plugin matches \"" + filter + "\"", 12f, UiTheme.TEXT_MUTED));
-        }
-        if (!PluginPanelRegistry.names().isEmpty()) {
-            pluginsList.addView(label("registered panels (Swing, not available on mobile):", 11f, UiTheme.TEXT_DIM));
-            for (String navigation : PluginPanelRegistry.names()) {
-                TextView row = label("• " + navigation + " — tap to open its config", 12f, UiTheme.TEXT_MUTED);
-                row.setPadding(0, (int) (6 * density), 0, (int) (6 * density));
-                row.setOnClickListener(v -> showConfigFor(navigation));
-                pluginsList.addView(row);
-            }
-        }
-    }
-
-    private View pluginRow(Object plugin, String name, String description) {
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setPadding(0, (int) (8 * density), 0, (int) (8 * density));
-        UiTheme.ripple(row);
-
-        LinearLayout text = new LinearLayout(activity);
-        text.setOrientation(LinearLayout.VERTICAL);
-        text.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        text.addView(label(name, 13f, UiTheme.TEXT));
-        if (!description.isEmpty()) {
-            text.addView(label(description, 11f, UiTheme.TEXT_MUTED));
-        }
-        row.addView(text);
-
-        Switch toggle = new Switch(activity);
-        UiTheme.tintSwitch(toggle);
-        toggle.setChecked(RuneLiteHost.isPluginEnabled(plugin));
-        toggle.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            if (!RuneLiteHost.setPluginEnabled(plugin, isChecked)) {
-                toast("could not " + (isChecked ? "enable " : "disable ") + name);
-                buttonView.setChecked(!isChecked);
-                return;
-            }
-            toast(name + (isChecked ? " enabled" : " disabled"));
-        });
-        row.addView(toggle);
-        return row;
-    }
-
-    private String pluginDescription(Object plugin) {
-        try {
-            Class<?> descriptorClass = RuneLiteHost.clientLoader()
-                .loadClass("net.runelite.client.plugins.PluginDescriptor");
-            Annotation descriptor = plugin.getClass().getAnnotation((Class) descriptorClass);
-            if (descriptor != null) {
-                Object value = descriptor.getClass().getMethod("description").invoke(descriptor);
-                return value instanceof String ? (String) value : "";
-            }
-        } catch (Throwable ignored) {
-            // descriptor unavailable: no description line
-        }
-        return "";
-    }
-
-    // ------------------------------------------------------------------- config tab
-    private void buildConfigPluginList() {
-        configList.removeAllViews();
-        configPlugin = null;
-        List<Object> plugins = RuneLiteHost.plugins();
-        if (plugins.isEmpty()) {
-            configList.addView(label("no plugins loaded", 12f, UiTheme.TEXT_MUTED));
-            return;
-        }
-        List<Object> sorted = new ArrayList<>(plugins);
-        sorted.sort(Comparator.comparing(RuneLiteHost::pluginName, String.CASE_INSENSITIVE_ORDER));
-        for (Object plugin : sorted) {
-            String name = RuneLiteHost.pluginName(plugin);
-            TextView row = label(name, 13f, UiTheme.TEXT);
-            row.setPadding(0, (int) (10 * density), 0, (int) (10 * density));
-            row.setOnClickListener(v -> showConfigFor(plugin));
-            configList.addView(row);
-        }
-    }
-
-    /** Shows the config of the plugin named {@code name} (or the list if not found). */
-    private void showConfigFor(String name) {
-        for (Object plugin : RuneLiteHost.plugins()) {
-            if (RuneLiteHost.pluginName(plugin).equalsIgnoreCase(name)) {
-                showConfigFor(plugin);
-                return;
-            }
-        }
-        selectTab(TAB_CONFIG);
-    }
-
-    private void showConfigFor(Object plugin) {
-        selectTab(TAB_CONFIG);
-        configPlugin = plugin;
-        configList.removeAllViews();
-        String name = RuneLiteHost.pluginName(plugin);
-        boolean enabled = RuneLiteHost.isPluginEnabled(plugin);
-        TextView header = label(enabled ? name : name + " (disabled)", 14f, UiTheme.GOLD);
-        header.setPadding(0, (int) (6 * density), 0, (int) (10 * density));
-        configList.addView(header);
-
-        if (!enabled) {
-            // This list shows every plugin and edits config for all of them, but a
-            // disabled plugin does nothing with its config. Without this row that reads
-            // as "the setting has no effect / the plugin is broken" (it is how the
-            // Entity Hider report was produced), so say it and offer the one tap that
-            // fixes it.
-            TextView warn = label(name + " is disabled — config changes do nothing. Tap to enable.",
-                12f, UiTheme.ORANGE);
-            warn.setPadding(0, (int) (4 * density), 0, (int) (8 * density));
-            warn.setOnClickListener(v -> {
-                if (RuneLiteHost.setPluginEnabled(plugin, true)) {
-                    toast(name + " enabled");
-                } else {
-                    toast("could not enable " + name);
-                }
-                showConfigFor(plugin);
-            });
-            configList.addView(warn);
-        }
-
-        Object configManager = RuneLiteHost.configManager();
-        if (configManager == null) {
-            configList.addView(label("RuneLite runtime not running", 12f, UiTheme.TEXT_MUTED));
-            return;
-        }
-        try {
-            Class<?> iface = RuneLiteHost.pluginConfigClass(plugin);
-            if (iface == null) {
-                configList.addView(label("this plugin has no configuration", 12f, UiTheme.TEXT_MUTED));
-                return;
-            }
-            Object proxy = configManager.getClass().getMethod("getConfig", Class.class)
-                .invoke(configManager, iface);
-            Class<?> configIface = RuneLiteHost.clientLoader()
-                .loadClass("net.runelite.client.config.Config");
-            Object descriptor = configManager.getClass()
-                .getMethod("getConfigDescriptor", configIface).invoke(configManager, proxy);
-            if (descriptor == null) {
-                configList.addView(label("no config descriptor", 12f, UiTheme.TEXT_MUTED));
-                return;
-            }
-            Map<String, Method> items = configItemMethods(iface);
-            List<Object> descriptors = new ArrayList<>((Collection<Object>) descriptor.getClass()
-                .getMethod("getItems").invoke(descriptor));
-            if (descriptors.isEmpty()) {
-                configList.addView(label("no configuration items", 12f, UiTheme.TEXT_MUTED));
-                return;
-            }
-            descriptors.sort(Comparator.comparingInt(d -> configItemPosition(d)));
-            String currentSection = null;
-            for (Object itemDescriptor : descriptors) {
-                try {
-                    Object annotation = itemDescriptor.getClass().getMethod("getItem").invoke(itemDescriptor);
-                    String section = (String) annotation.getClass().getMethod("section").invoke(annotation);
-                    if (section != null && !section.isEmpty() && !section.equals(currentSection)) {
-                        currentSection = section;
-                        configList.addView(label(section, 12f, UiTheme.GOLD));
-                    }
-                    View widget = buildConfigWidget(iface, proxy, configManager, descriptor,
-                        itemDescriptor, annotation, items);
-                    if (widget != null) {
-                        configList.addView(widget);
-                    }
-                } catch (Throwable t) {
-                    Log.w(TAG, "config item failed", t);
-                }
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "config form failed for " + name, t);
-            configList.addView(label("config unavailable: " + t, 11f, UiTheme.RED));
-        }
-    }
-
-    private int configItemPosition(Object descriptor) {
-        try {
-            return (Integer) descriptor.getClass().getMethod("position").invoke(descriptor);
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
-    private Map<String, Method> configItemMethods(Class<?> iface) {
-        Map<String, Method> out = new java.util.HashMap<>();
-        for (Method method : iface.getMethods()) {
-            if (method.getParameterCount() != 0 || method.getReturnType() == void.class) {
-                continue;
-            }
-            for (Annotation annotation : method.getAnnotations()) {
-                if ("net.runelite.client.config.ConfigItem".equals(annotation.annotationType().getName())) {
-                    try {
-                        String keyName = (String) annotation.annotationType().getMethod("keyName")
-                            .invoke(annotation);
-                        out.put(keyName == null || keyName.isEmpty() ? method.getName() : keyName, method);
-                    } catch (Throwable t) {
-                        out.put(method.getName(), method);
-                    }
-                }
-            }
-        }
-        return out;
-    }
-
-    private View buildConfigWidget(Class<?> iface, Object proxy, Object configManager, Object groupDescriptor,
-                                   Object itemDescriptor, Object annotation, Map<String, Method> items) throws Exception {
-        String key = (String) itemDescriptor.getClass().getMethod("key").invoke(itemDescriptor);
-        String displayName = (String) annotation.getClass().getMethod("name").invoke(annotation);
-        boolean secret = (Boolean) annotation.getClass().getMethod("secret").invoke(annotation);
-        Method getter = items.get(key);
-        if (getter == null) {
-            return null;
-        }
-        Object value = getter.invoke(proxy);
-        Class<?> type = getter.getReturnType();
-        String group = configGroup(groupDescriptor);
-
-        LinearLayout row = new LinearLayout(activity);
-        row.setOrientation(LinearLayout.VERTICAL);
-        row.setPadding(0, (int) (6 * density), 0, (int) (6 * density));
-        row.addView(label(displayName == null || displayName.isEmpty() ? key : displayName, 12f, UiTheme.TEXT));
-
-        if (type == boolean.class || type == Boolean.class) {
-            Switch toggle = new Switch(activity);
-            UiTheme.tintSwitch(toggle);
-            toggle.setChecked(Boolean.TRUE.equals(value));
-            toggle.setOnCheckedChangeListener((v, checked) ->
-                writeConfig(iface, proxy, configManager, group, key, checked));
-            row.addView(toggle);
-            return row;
-        }
-        if (type == int.class || type == Integer.class || type == double.class || type == Double.class) {
-            int[] range = configRange(itemDescriptor, type == double.class || type == Double.class);
-            int min = range[0];
-            int max = range[1];
-            int current = (int) Math.round(((Number) (value == null ? 0 : value)).doubleValue());
-            TextView valueLabel = label(String.valueOf(current), 12f, UiTheme.GOLD);
-            SeekBar bar = new SeekBar(activity);
-            bar.setMax(Math.max(1, max - min));
-            bar.setProgress(Math.max(0, Math.min(max - min, current - min)));
-            bar.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-                public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
-                    valueLabel.setText(String.valueOf(min + progress));
-                }
-
-                public void onStartTrackingTouch(SeekBar seekBar) {
-                }
-
-                public void onStopTrackingTouch(SeekBar seekBar) {
-                    int newValue = min + seekBar.getProgress();
-                    if (type == double.class || type == Double.class) {
-                        writeConfig(iface, proxy, configManager, group, key, (double) newValue);
-                    } else {
-                        writeConfig(iface, proxy, configManager, group, key, newValue);
-                    }
-                }
-            });
-            row.addView(valueLabel);
-            row.addView(bar);
-            return row;
-        }
-        if (type == String.class) {
-            EditText field = new EditText(activity);
-            field.setText(value == null ? "" : value.toString());
-            field.setTextSize(12f);
-            field.setTextColor(UiTheme.TEXT);
-            field.setHintTextColor(UiTheme.TEXT_DIM);
-            field.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
-            field.setPadding((int) (12 * density), (int) (12 * density),
-                (int) (12 * density), (int) (12 * density));
-            if (secret) {
-                field.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
-            }
-            field.setOnFocusChangeListener((v, hasFocus) -> {
-                if (!hasFocus) {
-                    writeConfig(iface, proxy, configManager, group, key, field.getText().toString());
-                }
-            });
-            row.addView(field);
-            return row;
-        }
-        if (type == java.awt.Color.class) {
-            Button button = new Button(activity);
-            int rgb = value instanceof java.awt.Color ? ((java.awt.Color) value).getRGB() : 0xFFFFFFFF;
-            button.setText(String.format("#%06X", rgb & 0xFFFFFF));
-            button.setBackgroundColor(0xFF000000 | (rgb & 0xFFFFFF));
-            button.setOnClickListener(v -> pickColour(iface, proxy, configManager, group, key, rgb));
-            row.addView(button);
-            return row;
-        }
-        if (type.isEnum()) {
-            Spinner spinner = new Spinner(activity);
-            spinner.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.BORDER, 1f, 10f, density));
-            Object[] constants = type.getEnumConstants();
-            List<String> names = new ArrayList<>();
-            for (Object constant : constants) {
-                names.add(((Enum<?>) constant).name());
-            }
-            ArrayAdapter<String> adapter = new ArrayAdapter<>(activity,
-                android.R.layout.simple_spinner_item, names);
-            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-            spinner.setAdapter(adapter);
-            if (value != null) {
-                spinner.setSelection(java.util.Arrays.asList(constants).indexOf(value));
-            }
-            final Class<?> enumType = type;
-            spinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-                public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                    writeConfig(iface, proxy, configManager, group, key,
-                        enumType.getEnumConstants()[position]);
-                }
-
-                public void onNothingSelected(AdapterView<?> parent) {
-                }
-            });
-            row.addView(spinner);
-            return row;
-        }
-        row.addView(label((value == null ? "null" : value.toString()) + "  (not editable on mobile)",
-            11f, UiTheme.TEXT_MUTED));
-        return row;
-    }
-
-    private int[] configRange(Object itemDescriptor, boolean floating) {
-        try {
-            Object range = itemDescriptor.getClass().getMethod("getRange").invoke(itemDescriptor);
-            if (range != null) {
-                int min = (Integer) range.getClass().getMethod("min").invoke(range);
-                int max = (Integer) range.getClass().getMethod("max").invoke(range);
-                if (max > min) {
-                    return new int[]{min, max};
-                }
-            }
-        } catch (Throwable ignored) {
-            // no @Range: fall through to the default
-        }
-        return floating ? new int[]{0, 100} : new int[]{0, 100};
-    }
-
-    private String configGroup(Object groupDescriptor) {
-        try {
-            Object group = groupDescriptor.getClass().getMethod("getGroup").invoke(groupDescriptor);
-            Object value = group.getClass().getMethod("value").invoke(group);
-            return value instanceof String ? (String) value : "";
-        } catch (Throwable t) {
-            return "";
-        }
-    }
-
-    private void pickColour(Class<?> iface, Object proxy, Object configManager, String group, String key, int current) {
-        final EditText input = new EditText(activity);
-        input.setText(String.format("%06X", current & 0xFFFFFF));
-        new AlertDialog.Builder(activity)
-            .setTitle("Colour (hex RRGGBB)")
-            .setView(input)
-            .setPositiveButton("Apply", (dialog, which) -> {
-                try {
-                    int rgb = (int) Long.parseLong(input.getText().toString().trim(), 16);
-                    writeConfig(iface, proxy, configManager, group, key,
-                        new java.awt.Color(rgb & 0xFFFFFF));
-                } catch (Throwable t) {
-                    toast("invalid colour: " + input.getText());
-                }
-            })
-            .setNegativeButton("Cancel", null)
-            .show();
-    }
-
-    /**
-     * Writes a config value. The setter on the config proxy is preferred (that is what
-     * makes {@code ConfigChanged} fire); otherwise the value is stored as a string
-     * through {@code ConfigManager.setConfiguration(group, key, value)}, which RuneLite
-     * converts back with the item's declared type.
-     */
-    private void writeConfig(Class<?> iface, Object proxy, Object configManager, String group,
-                             String key, Object value) {
-        try {
-            for (Method setter : iface.getMethods()) {
-                if (setter.getName().equals(key) && setter.getParameterCount() == 1) {
-                    setter.invoke(proxy, value);
-                    RuneLiteHost.flushConfig();
-                    toast(key + " updated");
-                    return;
-                }
-            }
-            String stringValue = stringify(value);
-            configManager.getClass()
-                .getMethod("setConfiguration", String.class, String.class, String.class)
-                .invoke(configManager, group, key, stringValue);
-            RuneLiteHost.flushConfig();
-            toast(key + " = " + stringValue);
-        } catch (Throwable t) {
-            Log.w(TAG, "config write failed for " + key, t);
-            toast("could not write " + key + ": " + t.getClass().getSimpleName());
-        }
-    }
-
-    private String stringify(Object value) {
-        if (value instanceof java.awt.Color) {
-            // The decimal ARGB int, not hex: that is what ConfigManager.objectToString()
-            // writes for a Color and what ColorUtil.fromString() reads back
-            // (Integer.decode + new Color(int, true)). A hex string silently loses the
-            // write ("00FF00" decodes as octal -> NumberFormatException -> null).
-            return String.valueOf(((java.awt.Color) value).getRGB());
-        }
-        if (value instanceof Enum) {
-            return ((Enum<?>) value).name();
-        }
-        return String.valueOf(value);
-    }
-
-    // --------------------------------------------------------------------- host tab
-    private void buildHostTab() {
-        hostList.removeAllViews();
-        hostList.addView(hostLine("client version", RuneLiteHost.clientVersion()));
-        hostList.addView(hostLine("runtime", RuneLiteHost.isRunning() ? "running" : "not running"));
-        hostList.addView(hostLine("plugin index", RuneLiteHost.indexSize() + " classes"));
-        hostList.addView(hostLine("active plugins", String.valueOf(RuneLiteHost.activePluginCount())));
-        hostList.addView(hostLine("status", RuneLiteHost.status()));
-        Throwable failure = RuneLiteHost.failure();
-        hostList.addView(hostLine("last error", failure == null ? "none" : String.valueOf(failure)));
-        List<String> pluginFailures = RuneLiteHost.pluginFailures();
-        hostList.addView(hostLine("plugin load failures", String.valueOf(pluginFailures.size())));
-        for (String entry : pluginFailures) {
-            hostList.addView(label("  " + entry, 10f, UiTheme.RED));
-        }
-        int aot = ClientUpdater.clientDexAotStatus(activity);
-        boolean aotBad = aot == ClientUpdater.AOT_STALE || aot == ClientUpdater.AOT_MISSING;
-        String aotText = ClientUpdater.clientDexAotText(activity);
-        hostList.addView(aotBad
-            ? label("client AOT: " + aotText, 11f, UiTheme.RED)
-            : hostLine("client AOT", aotText));
-        hostList.addView(hostLine("on-device dexer", "unavailable"));
-        hostList.addView(hostLine("conformance", PluginConformance.isRunning()
-            ? "running…" : PluginConformance.lastSummary()));
-        TextView conformance = pillButton("Run plugin conformance");
-        conformance.setEnabled(!PluginConformance.isRunning() && RuneLiteHost.isRunning());
-        conformance.setOnClickListener(v -> {
-            PluginConformance.run(activity);
-            toast("conformance running — report: "
-                + PluginConformance.reportFile(activity).getName());
-        });
-        hostList.addView(conformance);
-        TextView refresh = pillButton("Refresh");
-        refresh.setOnClickListener(v -> {
-            refreshPlugins();
-            buildHostTab();
-        });
-        hostList.addView(refresh);
-    }
-
-    /** A small gold-on-stone action pill (the drawer's own buttons are no longer Buttons). */
-    private TextView pillButton(String text) {
-        TextView view = label(text, 12f, UiTheme.GOLD);
-        view.setGravity(Gravity.CENTER);
-        view.setBackground(UiTheme.rounded(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1f, 10f, density));
-        view.setPadding(0, (int) (10 * density), 0, (int) (10 * density));
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        params.topMargin = (int) (6 * density);
-        view.setLayoutParams(params);
-        UiTheme.ripple(view);
-        return view;
-    }
-
-    private View hostLine(String label, String value) {
-        TextView row = label(label + ": " + value, 11f, UiTheme.TEXT_MUTED);
-        row.setPadding(0, (int) (3 * density), 0, (int) (3 * density));
-        return row;
-    }
-
-    // --------------------------------------------------------------------- helpers
-    private TextView label(String text, float size, int colour) {
-        TextView view = new TextView(activity);
-        view.setText(text);
-        view.setTextSize(size);
-        view.setTextColor(colour);
-        return view;
-    }
-
-    private void toast(String message) {
-        Toast.makeText(activity, message, Toast.LENGTH_SHORT).show();
     }
 }

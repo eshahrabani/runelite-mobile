@@ -4,8 +4,20 @@ import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 
+import java.awt.desktop.QuitStrategy;
+
 /**
- * AWT Desktop compatibility stub for Android runtime.
+ * Hand-written {@code java.awt.Desktop} for this port.
+ *
+ * <p>There is no desktop environment: opening a URI or a file is delegated to the app
+ * through {@link #openUrlHandler} (the Android dex sets it to the Android intent
+ * launcher; see {@code MainActivity}). {@code LinkBrowser} asks
+ * {@link #isDesktopSupported()} / {@link #isSupported(Action)} first, so BROWSE and OPEN
+ * are reported as supported (they really work) while EDIT/PRINT/MAIL are not.
+ *
+ * <p>{@link #setQuitStrategy} and {@link #requestForeground} are stored and otherwise
+ * ignored: the host owns the app's lifecycle, and a virtual window cannot be raised in a
+ * window manager because there is none.
  */
 public class Desktop {
     public enum Action { OPEN, EDIT, PRINT, MAIL, BROWSE }
@@ -15,7 +27,11 @@ public class Desktop {
     /** Bridge for opening links in the host app's browser. Set by the Android host. */
     public static java.util.function.Consumer<String> openUrlHandler;
 
-    private Desktop() {}
+    private QuitStrategy quitStrategy;
+    private boolean foregroundRequested;
+
+    private Desktop() {
+    }
 
     public static Desktop getDesktop() {
         return instance;
@@ -26,7 +42,7 @@ public class Desktop {
     }
 
     public boolean isSupported(Action action) {
-        return true;
+        return action == Action.BROWSE || action == Action.OPEN;
     }
 
     public void browse(URI uri) throws IOException {
@@ -44,5 +60,23 @@ public class Desktop {
         if (openUrlHandler != null) {
             openUrlHandler.accept(file.toURI().toString());
         }
+    }
+
+    /** Stored; the host decides how the app quits (there is no window manager to ask). */
+    public void setQuitStrategy(QuitStrategy strategy) {
+        this.quitStrategy = strategy;
+    }
+
+    public QuitStrategy getQuitStrategy() {
+        return quitStrategy;
+    }
+
+    /** Stored; a virtual window has no window manager to foreground it through. */
+    public void requestForeground(boolean allWindows) {
+        this.foregroundRequested = allWindows;
+    }
+
+    public boolean isForegroundRequested() {
+        return foregroundRequested;
     }
 }

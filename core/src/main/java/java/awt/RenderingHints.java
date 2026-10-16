@@ -3,12 +3,17 @@ package java.awt;
 import java.util.HashMap;
 
 /**
- * AWT RenderingHints compatibility stub for Android runtime.
+ * The port's {@code java.awt.RenderingHints}.
+ *
+ * <p>Hand-written because overlay code queries and restores the hints key by key,
+ * and because {@code KEY_INTERPOLATION} decides how a scaled image is sampled.
  *
  * <p>Implemented as a plain key/value map so {@code getRenderingHints()} can be
  * saved and restored by overlays. Anti-aliasing is not implemented for shapes
  * (the mobile rasteriser draws hard-edged geometry); text anti-aliasing is done
- * by the platform text bridge.
+ * by the platform text bridge. {@code KEY_INTERPOLATION} is honoured by
+ * {@code drawImage}: {@code VALUE_INTERPOLATION_BILINEAR} selects bilinear
+ * sampling for scaled image draws, anything else nearest.
  */
 public class RenderingHints extends HashMap<Object, Object> {
     private static final long serialVersionUID = 1L;
