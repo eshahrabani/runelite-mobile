@@ -222,38 +222,36 @@ interface, such as `AccountPlugin`, returns `null`; the Config tab renders that 
 package and name), and `HOST_REPLACED_CLASSES` / `HOST_REPLACED_PREFIXES` strip the originals from
 the cleaned client jar (`android/build.gradle:83-102`).
 
-At the time of writing there are 26 shim files under `hostshims/src`. `kind` below is the shim's
-own contract: **real** = logic the retained client depends on, **no-op** = methods that
-deliberately do nothing, **data-only** = holds fields so call sites link but paints nothing.
+There are **five** shim files under `hostshims/src`. Since the port runs RuneLite's real
+Swing shell (see [swing-runtime.md](swing-runtime.md)), it no longer replaces the toolbar, the
+plugin panels or the `ui/components/**` helpers: those ship upstream and run on the port's
+hand-written Swing runtime. Only the classes that need a desktop window / macOS / FlatLaf
+surface are still replaced.
 
-| Shim file (`hostshims/src/net/runelite/client/ui/…`) | Replaces | Kind | State it holds |
+| Shim file (`hostshims/src/net/runelite/client/…`) | Replaces | Kind | State it holds |
 |---|---|---|---|
-| `Activatable.java` | `Activatable` | no-op interface | none; empty `onActivate`/`onDeactivate` defaults |
-| `ClientToolbar.java` | `ClientToolbar` | real relay | `static volatile BiConsumer<String,Object> navigationListener`, `Injector` |
-| `ClientUI.java` | `ClientUI` | mixed (real queries + no-ops) | `Injector`, cached `GraphicsConfiguration` |
-| `ContainableFrame.java` | `ContainableFrame` | data-only | enum `Mode { ALWAYS, RESIZING, NEVER }` (persisted constants) |
-| `FatalErrorDialog.java` | `FatalErrorDialog` | no-op | none; fluent methods return `this` |
-| `MultiplexingPluginPanel.java` | `MultiplexingPluginPanel` | data-only | `Deque<PluginPanel> stateStack`, `current` |
-| `NavigationButton.java` | Lombok `NavigationButton` | real data class | `icon`, `tooltip`, `onClick`, `panel`, `priority`, `popup` |
-| `PluginPanel.java` | `PluginPanel` | data-only | `JScrollPane`, `JPanel`; constants `225`/`17`/`6` |
-| `SplashScreen.java` | `SplashScreen` | no-op static | none |
-| `UnitFormatterFactory.java` | `UnitFormatterFactory` | no-op | `delegateFactory`, `units`; `getFormatter` → null |
-| `components/ColorJButton.java` | `ColorJButton` | data-only | `Color color` |
-| `components/DimmableJPanel.java` | `DimmableJPanel` | data-only | `boolean dimmed` + fg/bg colours |
-| `components/DragAndDropReorderPane.java` | same | data-only | `List<DragListener>` |
-| `components/FlatTextField.java` | `FlatTextField` | real data + no-op focus | `JTextField`, colours, `blocked` |
-| `components/IconTextField.java` | `IconTextField` | data-only | `FlatTextField`, suggestion model, `Icon` |
-| `components/MouseDragEventForwarder.java` | same | no-op | `Component target` |
-| `components/PluginErrorPanel.java` | `PluginErrorPanel` | no-op | none |
-| `components/ProgressBar.java` | `ProgressBar` | data-only | `maximumValue`, `value`, `positions`, labels |
-| `components/ThinProgressBar.java` | `ThinProgressBar` | data-only | `maximumValue`, `value` |
-| `components/TitleCaseListCellRenderer.java` | same | ctor only | none |
-| `components/VirtualList.java` | `VirtualList` | abstract data-only | erased `model`, `int keepUnused` |
-| `components/colorpicker/ColorPickerManager.java` | same | real factory, no-op UI | `Injector` |
-| `components/colorpicker/RuneliteColorPicker.java` | same | data-only | `Color selectedColor`, change/close consumers |
-| `components/materialtabs/MaterialTab.java` | `MaterialTab` | data-only | `tabName`, `onSelectEvent`, `selected` |
-| `components/materialtabs/MaterialTabGroup.java` | same | data-only | `List<MaterialTab> tabs` |
-| `components/shadowlabel/JShadowedLabel.java` | `JShadowedLabel` | data-only | `shadow`, `shadowSize` |
+| `ui/ClientUI.java` | `ClientUI` | **real sidebar host** | the `ClientToolbarPanel` + `JTabbedPane` tree, `TreeSet<NavigationButton> sidebarEntries`, the selection history, the `GraphicsConfiguration`; publishes the tree through `UiBridge.setSidebarRoot` |
+| `ui/ContainableFrame.java` | `ContainableFrame` | data-only | enum `Mode { ALWAYS, RESIZING, NEVER }` (persisted config constants; `RuneLiteConfig.containInScreen` is typed with it) |
+| `ui/FatalErrorDialog.java` | `FatalErrorDialog` | no-op | none; fluent methods return `this` |
+| `ui/SplashScreen.java` | `SplashScreen` | no-op static | none |
+| `plugins/config/PluginHubPanel.java` | `PluginHubPanel` | real, informational | a `PluginPanel` listing the sideloaded hub jars; no installer, no network |
+
+The package-private nested classes of those five (if any) are stripped with them
+(`isHostReplaced` matches `outer + '$'`).
+
+### 6.1 What deliberately ships upstream instead
+
+`Activatable`, `ClientToolbar`, `NavigationButton`, `PluginPanel`, `MultiplexingPluginPanel`,
+`UnitFormatter(Factory)`, `DynamicGridLayout`, `ClientPanel`, `ClientToolbarPanel`,
+`ColorScheme`, `FontManager`, all of `net/runelite/client/ui/components/**` and the config
+plugin's panels are **not** replaced: they are ordinary Swing/Java code and the port's
+`javax.swing` implementation runs them. `Net.runelite.client.util.SwingUtil` ships for the same
+reason (its only FlatLaf reference is an inlined `String` constant).
+
+Stripped and *not* replaced, because nothing that ships references them:
+`net/runelite/client/ui/laf/**` (FlatLaf-based look and feel, prefix-stripped) and
+`net/runelite/client/ui/OSXFullScreenAdapter` (its superclass `com.apple.eawt.FullScreenAdapter`
+does not exist on Android; only the replaced `ClientUI` referenced it).
 
 ### 6.1 Compiler rules for shims
 
@@ -284,13 +282,15 @@ and invokes `javac` with `--limit-modules java.base,jdk.unsupported`
 One nuance worth stating precisely: `org.runelite.mobile.*` types that live in **`core/`** *are*
 on the shim compile classpath (rule 1 above lists `coreClasses`), and the shim can resolve them at
 runtime because the asset loader's parent is the app loader (`MainActivity.java`). `ClientUI`
-uses that to read `AWTBridge.activeWidth` / `activeHeight`. What a shim must **not** do is
-reference the `android/` host package (`RuneLiteHost`, `PluginPanelRegistry`): those classes are
-not on the shim classpath, and the loader direction is one-way. The `ClientToolbar` shim therefore
-exposes a plain `BiConsumer` field that `RuneLiteHost.installNavigationHook` fills in
-reflectively, rather than calling the registry directly (`ClientToolbar.java` javadoc).
+uses that for `AWTBridge.activeWidth` / `activeHeight` (the game surface size the retained client
+queries) and for `UiBridge` / `SwingEdt` (publishing the sidebar tree and thread hops). What a shim
+must **not** do is reference the `android/` host package (`RuneLiteHost`, `MobilePluginHub`, …):
+those classes are not on the shim classpath, and the loader direction is one-way. The sidebar
+therefore talks to the app through `UiBridge` — a `core/` class both sides see — and the app
+reaches the sidebar reflectively (`ClientUI.instance()` / `navigationButtons()`, used by the
+conformance pass).
 
-### 6.2 Nested-class stripping and the four no-shim entries
+### 6.2 Nested-class stripping
 
 `HOST_REPLACED_CLASSES` controls **stripping**, `hostshims/` controls **replacement**; they are
 different sets. `isHostReplaced` treats a class as host-replaced if the entry name equals
@@ -298,20 +298,17 @@ different sets. `isHostReplaced` treats a class as host-replaced if the entry na
 are dropped with their outer because d8 refuses an orphan nest member
 (`"Class X$Y requires its nest host"`).
 
-Four entries in `HOST_REPLACED_CLASSES` deliberately have **no** shim and are simply absent after
-stripping (their referrers are stripped too):
+The current list is (`android/build.gradle`):
 
-| Entry | Why no shim |
+| Entry | Why |
 |---|---|
-| `ClientPanel` | desktop under the `ui/` package prefix only; nothing retained references it |
-| `ClientToolbarPanel` | same |
-| `OSXFullScreenAdapter` | macOS-only desktop class |
-| `UnitFormatter` | referenced only by the desktop shell path |
+| `ui/ClientUI` | builds a desktop frame, FlatLaf chrome and a system tray — replaced by the sidebar host |
+| `ui/ContainableFrame` | FlatLaf native window library; only its `Mode` enum is referenced by `RuneLiteConfig` |
+| `ui/FatalErrorDialog` | desktop error dialog with a log-file folder button; must still link |
+| `ui/SplashScreen` | desktop splash window; must still link |
+| `plugins/config/PluginHubPanel` | in-app hub installer (`IconTextField` + live HTTP + device install); replaced by the informational panel |
 
-`HOST_REPLACED_PREFIXES` is `net/runelite/client/ui/laf/` and `net/runelite/client/ui/components/`
-(`android/build.gradle:99-102`). No `laf/` shim exists (the whole prefix is dropped); `components/`
-strips all upstream component classes but only the 16 listed above are re-provided — the rest are
-absent.
+`HOST_REPLACED_PREFIXES` is just `net/runelite/client/ui/laf/`.
 
 ## 7. Overlay rendering path
 
@@ -358,9 +355,9 @@ standing rules:
   loader (`MainActivity.java`). Injector products are held as `Object`.
 - **Shims must not reference the `android/` host package.** They may use `core/` port types (which
   are on their compile classpath and in the app dex), but the host classes in `android/` are not
-  visible to them. The one live link back to the host is the `ClientToolbar.navigationListener`
-  `BiConsumer` field, installed reflectively by `RuneLiteHost.installNavigationHook`, which
-  dispatches `"add"`/`"remove"`/`"open"` to `PluginPanelRegistry` (`RuneLiteHost.java`).
+  visible to them. The links that do exist are `UiBridge` (the sidebar publishes its tree and
+  receives visibility changes) and `UiBridge.Host` (implemented by the app's `SwingSidebarView`),
+  plus the reflective `ClientUI.instance()` accessor the conformance pass uses.
 
 The two remaining categories of cross-loader call — the `Callbacks` proxy delegating to `Hooks`,
 and the `MobilePluginHub` child loaders whose parent is the client loader — are the subject of

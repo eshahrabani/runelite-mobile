@@ -171,14 +171,25 @@ public final class PluginConformance {
             return;
         }
 
+        // The boot self-test skips the cases that put a dialog on screen; a conformance run
+        // is operator-triggered, so this is where they get exercised (and they are
+        // fail-safe: the dialog's own watchdog closes it if the click does not land).
+        for (String onScreen : SwingSelfTest.onScreenCaseNames()) {
+            String swingFailure = SwingSelfTest.runCase(onScreen);
+            out.append("swing self-test ").append(onScreen).append(": ")
+                .append(swingFailure == null ? "PASS" : "FAIL " + swingFailure).append('\n');
+        }
+
         String state = gameState();
         List<Object> plugins = new ArrayList<>(RuneLiteHost.plugins());
         plugins.sort(Comparator.comparing(p -> p.getClass().getName()));
         out.append("gameState: ").append(state).append('\n');
         out.append("index: ").append(RuneLiteHost.indexSize()).append(" classes, loaded: ")
             .append(plugins.size()).append('\n');
+        List<Object> navigation = navigationButtons();
+        out.append("nav: ").append(navigation.size()).append(" sidebar navigation button(s)\n");
         out.append("# <plugin> <PASS|FAIL|SKIP> enabled=<y|n>/active=<y|n> subs=<reg>/<decl> "
-            + "ovl=<ok>/<bad> cfg=<ok>/<bad> rc=<n> probes=...\n");
+            + "ovl=<ok>/<bad> cfg=<ok>/<bad> rc=<n> panel=<ok>/<bad> probes=...\n");
 
         int pass = 0;
         int fail = 0;
@@ -196,6 +207,7 @@ public final class PluginConformance {
                 result.fail("harness: " + t);
             }
             configTouched |= result.configTouched;
+            measurePanels(plugin, navButtonsFor(plugin, navigation), result);
             out.append(result.line()).append('\n');
             if (result.isFail()) {
                 fail++;
@@ -228,6 +240,142 @@ public final class PluginConformance {
         Log.i(TAG, "CONFORMANCE: " + summary + " (report: " + report.getAbsolutePath() + ")");
     }
 
+    // ------------------------------------------------------------- sidebar panels
+
+    /**
+     * The sidebar's navigation buttons, reached reflectively: {@code ClientUI} lives in
+     * the asset dex (the app dex cannot reference it at compile time), and on this port it
+     * is RuneLite's real sidebar host — the same object the drawer paints.
+     */
+    private static List<Object> navigationButtons() {
+        try {
+            Class<?> clientUiClass = RuneLiteHost.clientLoader().loadClass("net.runelite.client.ui.ClientUI");
+            Object instance = clientUiClass.getMethod("instance").invoke(null);
+            if (instance == null) {
+                return new ArrayList<>();
+            }
+            Object list = clientUiClass.getMethod("navigationButtons").invoke(instance);
+            if (list instanceof List) {
+                List<Object> copy = new ArrayList<>();
+                for (Object entry : (List<?>) list) {
+                    if (entry != null) {
+                        copy.add(entry);
+                    }
+                }
+                return copy;
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "CONFORMANCE: sidebar navigation unavailable: " + t);
+        }
+        return new ArrayList<>();
+    }
+
+    /** The navigation buttons whose panel belongs to {@code plugin}. */
+    private static List<Object> navButtonsFor(Object plugin, List<Object> navigation) {
+        List<Object> matches = new ArrayList<>();
+        Class<?> pluginPanelType;
+        try {
+            pluginPanelType = RuneLiteHost.clientLoader().loadClass("net.runelite.client.ui.PluginPanel");
+        } catch (Throwable t) {
+            return matches;
+        }
+        for (Object nav : navigation) {
+            Object panel = invokeOrNull(nav, "getPanel");
+            if (panel == null) {
+                continue;
+            }
+            // A plugin owns its panel through a field of the panel type; the field walk is
+            // exact, so plugins that share a package still map to the right panel.
+            if (pluginFieldHolds(plugin, panel, pluginPanelType)) {
+                matches.add(nav);
+            }
+        }
+        return matches;
+    }
+
+    private static boolean pluginFieldHolds(Object plugin, Object value, Class<?> fieldType) {
+        for (Class<?> c = plugin.getClass(); c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (!fieldType.isAssignableFrom(f.getType())) {
+                    continue;
+                }
+                try {
+                    f.setAccessible(true);
+                    if (f.get(plugin) == value) {
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                    // An inaccessible field cannot be the owner we are looking for.
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Renders every panel the plugin registered into a scratch image on this thread (the
+     * Swing dispatch thread — {@code Overlay.render} and component painting both assert
+     * it) and counts the pixels the panel actually painted. A panel that throws is a
+     * failure with its message; a panel that paints nothing is a failure too, because an
+     * empty panel is what a broken Swing runtime looks like.
+     */
+    private static void measurePanels(Object plugin, List<Object> navButtons, Result result) {
+        for (Object nav : navButtons) {
+            Object panel = invokeOrNull(nav, "getPanel");
+            Object component = invokeOrNull(panel, "getWrappedPanel");
+            if (!(component instanceof java.awt.Component)) {
+                continue;
+            }
+            java.awt.Component comp = (java.awt.Component) component;
+            result.panelChecked++;
+            String tooltip = String.valueOf(invokeOrNull(nav, "getTooltip"));
+            try {
+                BufferedImage scratch = new BufferedImage(PANEL_WIDTH, PANEL_HEIGHT, BufferedImage.TYPE_INT_ARGB);
+                Graphics2D g = scratch.createGraphics();
+                comp.setSize(PANEL_WIDTH, PANEL_HEIGHT);
+                if (comp instanceof java.awt.Container) {
+                    ((java.awt.Container) comp).validate();
+                }
+                comp.paint(g);
+                g.dispose();
+                int[] pixels = scratch.getRGB(0, 0, PANEL_WIDTH, PANEL_HEIGHT, null, 0, PANEL_WIDTH);
+                int painted = 0;
+                for (int pixel : pixels) {
+                    if ((pixel >>> 24) != 0) {
+                        painted++;
+                    }
+                }
+                if (painted == 0) {
+                    result.panelBad++;
+                    result.fail("panel painted nothing: " + tooltip + " (" + comp.getClass().getName() + ")");
+                } else {
+                    result.panelOk++;
+                }
+            } catch (Throwable t) {
+                result.panelBad++;
+                result.fail("panel " + tooltip + ": " + t);
+            }
+        }
+        if (result.panelChecked == 0) {
+            result.panelNote = "none";
+        }
+    }
+
+    private static Object invokeOrNull(Object target, String name) {
+        if (target == null) {
+            return null;
+        }
+        try {
+            return target.getClass().getMethod(name).invoke(target);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** The scratch size panel rendering uses: PluginPanel.PANEL_WIDTH and a tall viewport. */
+    private static final int PANEL_WIDTH = 242;
+    private static final int PANEL_HEIGHT = 600;
+
     private static void write(File file, String content) {
         try (FileOutputStream stream = new FileOutputStream(file)) {
             stream.write(content.getBytes(StandardCharsets.UTF_8));
@@ -255,6 +403,10 @@ public final class PluginConformance {
         long entityCalls = -1;
         long entityDenied = -1;
         String entityNote;
+        int panelOk;
+        int panelBad;
+        int panelChecked;
+        String panelNote;
         int menuEntryChecked;
         String menuEntryNote;
         String eventFlow;
@@ -295,6 +447,10 @@ public final class PluginConformance {
             sb.append(" ovl=").append(overlayOk).append('/').append(overlayBad);
             sb.append(" cfg=").append(cfgOk).append('/').append(cfgBad);
             sb.append(" rc=").append(renderCallbacks);
+            sb.append(" panel=").append(panelOk).append('/').append(panelBad);
+            if (panelNote != null) {
+                sb.append(" panelNote=").append(panelNote.replace(' ', '_'));
+            }
             sb.append(" probes=entityVeto(");
             if (entityCalls < 0) {
                 sb.append(entityNote == null ? "n/a" : entityNote);

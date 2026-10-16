@@ -83,22 +83,13 @@ project.ext.RL_JAR_PREFIXES = ['client-', 'injected-client-'] + project.ext.RL_R
 project.ext.HOST_REPLACED_CLASSES = [
     'net/runelite/client/ui/ClientUI.class',
     'net/runelite/client/ui/SplashScreen.class',
-    'net/runelite/client/ui/ContainableFrame.class',
-    'net/runelite/client/ui/ClientPanel.class',
-    'net/runelite/client/ui/ClientToolbarPanel.class',
     'net/runelite/client/ui/FatalErrorDialog.class',
+    'net/runelite/client/ui/ContainableFrame.class',
     'net/runelite/client/ui/OSXFullScreenAdapter.class',
-    'net/runelite/client/ui/MultiplexingPluginPanel.class',
-    'net/runelite/client/ui/ClientToolbar.class',
-    'net/runelite/client/ui/PluginPanel.class',
-    'net/runelite/client/ui/NavigationButton.class',
-    'net/runelite/client/ui/UnitFormatter.class',
-    'net/runelite/client/ui/UnitFormatterFactory.class',
-    'net/runelite/client/ui/Activatable.class',
+    'net/runelite/client/plugins/config/PluginHubPanel.class',
 ]
 project.ext.HOST_REPLACED_PREFIXES = [
     'net/runelite/client/ui/laf/',
-    'net/runelite/client/ui/components/',
 ]
 
 boolean isHostReplaced(String entryName) {

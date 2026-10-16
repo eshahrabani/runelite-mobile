@@ -15,3 +15,4 @@ com/formdev/flatlaf/                          # host replaces the Swing laf; laf
 net/runelite/jshell/                          # DevToolsPlugin is excluded
 net/runelite/client/plugins/worldhopper/ping/ # JNA ping helper of an excluded plugin
 net/runelite/client/Updater                    # desktop self-updater; ClientUpdater.java replaces it (never executed)
+java/beans/                                   # libcore supplies java.beans (probe-verified on device); core/'s copies exist only because javac --limit-modules hides java.desktop, and they are shadowed by the boot classpath at runtime

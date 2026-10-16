@@ -6,7 +6,11 @@ import java.awt.Image;
 import java.awt.Point;
 
 /**
- * AWT BufferedImage compatibility stub for Android runtime.
+ * The port's {@code java.awt.image.BufferedImage}.
+ *
+ * <p>Hand-written, because creating one, painting into it with {@code createGraphics}
+ * and reading pixels back is how the whole overlay and icon path works, and none of
+ * that exists without this class.
  *
  * <p>Backed by a non-premultiplied ARGB {@code int[]} shared with its
  * {@link WritableRaster} and {@code DataBufferInt}. {@link #getGraphics()}
@@ -170,39 +174,41 @@ public class BufferedImage extends Image implements java.awt.image.RenderedImage
         return out;
     }
 
+    /**
+     * Copies the requested region into a fresh image of the same type.
+     *
+     * <p>Deviation: the JDK returns a view sharing the parent's raster (the
+     * translation being carried in the sub-raster's offsets); this runtime has a
+     * single flat pixel array per image, so the region is copied instead.
+     * Callers that write through the sub-image do not see the change in the
+     * parent.
+     */
     public BufferedImage getSubimage(int x, int y, int w, int h) {
         BufferedImage out = new BufferedImage(w, h, imageType);
-        if (pixels == null) {
+        if (pixels == null || w <= 0 || h <= 0) {
             return out;
         }
-        for (int yy = 0; yy < h; yy++) {
-            int srcY = y + yy;
-            if (srcY < 0 || srcY >= height) {
-                continue;
-            }
-            for (int xx = 0; xx < w; xx++) {
-                int srcX = x + xx;
-                if (srcX < 0 || srcX >= width) {
-                    continue;
-                }
-                out.setRGB(xx, yy, pixels[srcY * width + srcX]);
-            }
+        int copyX0 = Math.max(0, -x);
+        int copyY0 = Math.max(0, -y);
+        int copyX1 = Math.min(w, this.width - x);
+        int copyY1 = Math.min(h, this.height - y);
+        if (copyX1 <= copyX0 || copyY1 <= copyY0 || out.pixels == null) {
+            return out;
+        }
+        int run = copyX1 - copyX0;
+        for (int yy = copyY0; yy < copyY1; yy++) {
+            System.arraycopy(pixels, (y + yy) * this.width + (x + copyX0),
+                    out.pixels, yy * w + copyX0, run);
         }
         return out;
     }
 
+    /**
+     * Delegates to {@link Image#getScaledInstance(int, int, int)}: the scaling
+     * filter belongs with the source pixels, not with the image type.
+     */
+    @Override
     public Image getScaledInstance(int width, int height, int hints) {
-        BufferedImage out = new BufferedImage(Math.max(1, width), Math.max(1, height), TYPE_INT_ARGB);
-        if (pixels == null || this.width <= 0 || this.height <= 0) {
-            return out;
-        }
-        for (int dy = 0; dy < height; dy++) {
-            int sy = dy * this.height / height;
-            for (int dx = 0; dx < width; dx++) {
-                int sx = dx * this.width / width;
-                out.setRGB(dx, dy, pixels[sy * this.width + sx]);
-            }
-        }
-        return out;
+        return super.getScaledInstance(width, height, hints);
     }
 }

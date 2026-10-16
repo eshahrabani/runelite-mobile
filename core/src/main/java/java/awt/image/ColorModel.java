@@ -1,7 +1,10 @@
 package java.awt.image;
 
 /**
- * AWT ColorModel compatibility stub for Android runtime.
+ * The port's {@code java.awt.image.ColorModel}.
+ *
+ * <p>Hand-written because the client asks a BufferedImage's model for its component
+ * count and alpha, and because {@code BufferedImage} reports pixel bits through it.
  *
  * <p>Only the number of components and whether an alpha component is present
  * matter here: {@link BufferedImage} uses the latter to decide whether
@@ -24,6 +27,14 @@ public abstract class ColorModel {
         this.hasAlpha = hasAlpha;
         this.isAlphaPremultiplied = isAlphaPremultiplied;
     }
+
+    /** The JDK's shared 32-bit ARGB model. */
+    public static java.awt.image.ColorModel getRGBdefault() {
+        return RGB_DEFAULT;
+    }
+
+    private static final java.awt.image.ColorModel RGB_DEFAULT =
+            new java.awt.image.DirectColorModel(32, 0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000);
 
     public int getPixelSize() {
         return pixel_bits;

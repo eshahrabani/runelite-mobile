@@ -11,17 +11,30 @@ import java.awt.geom.RoundRectangle2D;
 import java.util.Map;
 
 /**
- * AWT Graphics2D compatibility stub for Android runtime.
+ * The port's {@code java.awt.Graphics2D}.
+ *
+ * <p>Hand-written, because the Swing base classes and the overlay renderer save and
+ * restore a Graphics2D's whole state (transform, clip, stroke, composite, paint,
+ * hints) around every component and every overlay, and every {@link Shape} draw has
+ * to end in the primitives of {@link Graphics}.
  *
  * <p>Extends {@link Graphics} with the state the RuneLite overlay renderer
  * saves and restores (transform, stroke, composite, paint, rendering hints,
  * background) and converts {@link Shape} draws into the primitive raster calls
- * of the base class.
+ * of the base class, which maps them through the transform.
+ *
+ * <p><b>Stroke.</b> An integer line width is honoured by tracing that many
+ * parallel lines (offset on the dominant axis), round caps and round joins add
+ * a filled disc at the ends/vertices, square caps extend the segment by half the
+ * width, and a dash array is ignored — dashes render solid (documented
+ * deviation; nothing in the client sets one).
+ *
+ * <p><b>Paint.</b> A {@link GradientPaint} is rasterised by the base class;
+ * any other {@link Paint} falls back to the last solid colour.
  *
  * <p>Anti-aliasing is not implemented for shapes: {@code KEY_ANTIALIASING} is
  * accepted and stored but geometry is rasterised with hard edges. Text is
- * anti-aliased by the platform text bridge. Gradients are accepted but not
- * rasterised (the last solid colour stays in effect).
+ * anti-aliased by the platform text bridge.
  */
 public class Graphics2D extends Graphics {
     private Stroke stroke = new BasicStroke(1.0f);
@@ -55,12 +68,21 @@ public class Graphics2D extends Graphics {
         return paint;
     }
 
+    /**
+     * Sets the fill source. A {@link Color} becomes the solid colour, a
+     * {@link GradientPaint} is rasterised along its two points; any other
+     * {@code Paint} keeps the last solid colour in effect (documented deviation:
+     * no texture or radial paints exist in this runtime).
+     */
     public void setPaint(Paint paint) {
         this.paint = paint;
         if (paint instanceof Color) {
             super.setColor((Color) paint);
+        } else if (paint instanceof GradientPaint) {
+            this.gradientPaint = (GradientPaint) paint;
+        } else {
+            this.gradientPaint = null;
         }
-        // GradientPaint: recorded but not rasterised.
     }
 
     public Composite getComposite() {
@@ -70,13 +92,12 @@ public class Graphics2D extends Graphics {
     public void setComposite(Composite comp) {
         this.composite = comp;
         if (comp instanceof AlphaComposite) {
-            this.compositeAlpha = (int) Math.round(((AlphaComposite) comp).getAlpha() * 255.0f);
-            if (this.compositeAlpha < 0) {
-                this.compositeAlpha = 0;
-            } else if (this.compositeAlpha > 255) {
-                this.compositeAlpha = 255;
-            }
+            AlphaComposite ac = (AlphaComposite) comp;
+            this.compositeRule = ac.getRule();
+            int a = (int) Math.round(ac.getAlpha() * 255.0f);
+            this.compositeAlpha = a < 0 ? 0 : (a > 255 ? 255 : a);
         } else {
+            this.compositeRule = AlphaComposite.SRC_OVER;
             this.compositeAlpha = 255;
         }
     }
@@ -89,6 +110,12 @@ public class Graphics2D extends Graphics {
         this.stroke = s == null ? new BasicStroke(1.0f) : s;
     }
 
+    /** The active stroke, or null when it carries no width information. */
+    @Override
+    protected BasicStroke strokeOrNull() {
+        return stroke instanceof BasicStroke ? (BasicStroke) stroke : null;
+    }
+
     public RenderingHints getRenderingHints() {
         return hints;
     }
@@ -96,6 +123,9 @@ public class Graphics2D extends Graphics {
     public void setRenderingHint(RenderingHints.Key hintKey, Object hintValue) {
         if (hintKey != null) {
             hints.put(hintKey, hintValue);
+            if (hintKey == RenderingHints.KEY_INTERPOLATION) {
+                interpolationHint = hintValue;
+            }
         }
     }
 
@@ -115,6 +145,7 @@ public class Graphics2D extends Graphics {
         for (Map.Entry<?, ?> e : hints.entrySet()) {
             this.hints.put(e.getKey(), e.getValue());
         }
+        this.interpolationHint = this.hints.get(RenderingHints.KEY_INTERPOLATION);
     }
 
     // --------------------------------------------------------- transform
@@ -136,6 +167,7 @@ public class Graphics2D extends Graphics {
     }
 
     /** Returns a copy of this context sharing the same destination pixels. */
+    @Override
     public Graphics2D create() {
         Graphics2D g = new Graphics2D(destPixels, destWidth, destHeight);
         g.colorARGB = colorARGB;
@@ -145,7 +177,10 @@ public class Graphics2D extends Graphics {
         g.clipShape = clipShape;
         g.clipBounds = clipBounds == null ? null : new Rectangle(clipBounds);
         g.compositeAlpha = compositeAlpha;
+        g.compositeRule = compositeRule;
         g.destHasAlpha = destHasAlpha;
+        g.gradientPaint = gradientPaint;
+        g.interpolationHint = interpolationHint;
         g.stroke = stroke;
         g.composite = composite;
         g.paint = paint;
@@ -180,33 +215,38 @@ public class Graphics2D extends Graphics {
             drawLineD(l.getX1(), l.getY1(), l.getX2(), l.getY2());
             return;
         }
-        if (s instanceof Ellipse2D) {
-            Rectangle2D r = (Rectangle2D) s;
-            int[] b = deviceBounds((int) Math.floor(r.getX()), (int) Math.floor(r.getY()),
-                    (int) Math.ceil(r.getWidth()), (int) Math.ceil(r.getHeight()));
+        // The round/arc/ellipse shapes all extend Rectangle2D, so they must be
+        // tested before it.
+        if (s instanceof RoundRectangle2D) {
+            RoundRectangle2D r = (RoundRectangle2D) s;
             if (fill) {
-                fillEllipseDevice(b[0], b[1], b[2] - b[0], b[3] - b[1], colorARGB);
+                fillRoundRectD(r.getX(), r.getY(), r.getWidth(), r.getHeight(),
+                        r.getArcWidth(), r.getArcHeight());
             } else {
-                drawEllipseDevice(b[0], b[1], b[2] - b[0], b[3] - b[1], colorARGB);
+                drawRoundRectD(r.getX(), r.getY(), r.getWidth(), r.getHeight(),
+                        r.getArcWidth(), r.getArcHeight());
             }
             return;
         }
         if (s instanceof Arc2D) {
             Arc2D a = (Arc2D) s;
-            int[] b = deviceBounds((int) Math.floor(a.getX()), (int) Math.floor(a.getY()),
-                    (int) Math.ceil(a.getWidth()), (int) Math.ceil(a.getHeight()));
-            drawArcDevice(b[0], b[1], b[2] - b[0], b[3] - b[1],
-                    a.getAngleStart(), a.getAngleExtent(), fill, colorARGB);
+            if (fill) {
+                // PIE closes the arc through the centre, OPEN and CHORD with the
+                // chord between its endpoints.
+                fillArcD(a.getX(), a.getY(), a.getWidth(), a.getHeight(),
+                        a.getAngleStart(), a.getAngleExtent(), a.getArcType() == Arc2D.PIE);
+            } else {
+                drawArcD(a.getX(), a.getY(), a.getWidth(), a.getHeight(),
+                        a.getAngleStart(), a.getAngleExtent());
+            }
             return;
         }
-        if (s instanceof RoundRectangle2D) {
+        if (s instanceof Ellipse2D) {
             Rectangle2D r = (Rectangle2D) s;
-            int[] b = deviceBounds((int) Math.floor(r.getX()), (int) Math.floor(r.getY()),
-                    (int) Math.ceil(r.getWidth()), (int) Math.ceil(r.getHeight()));
             if (fill) {
-                fillRectDevice(b[0], b[1], b[2] - b[0], b[3] - b[1], colorARGB);
+                fillOvalD(r.getX(), r.getY(), r.getWidth(), r.getHeight());
             } else {
-                drawRectD(b[0], b[1], b[2] - b[0] - 1, b[3] - b[1] - 1);
+                drawOvalD(r.getX(), r.getY(), r.getWidth(), r.getHeight());
             }
             return;
         }
@@ -237,30 +277,11 @@ public class Graphics2D extends Graphics {
             return;
         }
         if (s instanceof GeneralPath) {
-            GeneralPath p = (GeneralPath) s;
-            int n = p.getPointCount();
-            if (n == 0) {
-                return;
-            }
-            int[] xs = new int[n];
-            int[] ys = new int[n];
-            for (int i = 0; i < n; i++) {
-                int[] d = devicePoint((int) p.getX(i), (int) p.getY(i));
-                xs[i] = d[0];
-                ys[i] = d[1];
-            }
-            if (fill) {
-                fillPolygonDevice(xs, ys, n, colorARGB);
-            } else {
-                drawPolygonDevice(xs, ys, n, colorARGB);
-            }
+            pathOrFill((GeneralPath) s, fill);
             return;
         }
         if (s instanceof Area) {
-            java.util.List<Shape> shapes = ((Area) s).getShapes();
-            for (int i = 0; i < shapes.size(); i++) {
-                drawOrFill(shapes.get(i), fill);
-            }
+            areaOrFill((Area) s, fill);
             return;
         }
         Rectangle b = s.getBounds();
@@ -273,4 +294,64 @@ public class Graphics2D extends Graphics {
             drawRect(b.x, b.y, b.width, b.height);
         }
     }
+
+    /**
+     * Draws or fills a {@link GeneralPath}'s sub-paths. The path stores only
+     * move/line segments (no curve elements exist in this runtime), so each
+     * sub-path is an exact polygon: filled separately, or stroked as a polyline.
+     */
+    private void pathOrFill(GeneralPath path, boolean fill) {
+        int n = path.getPointCount();
+        if (n == 0) {
+            return;
+        }
+        int start = 0;
+        for (int i = 1; i <= n; i++) {
+            if (i == n || path.isMoveTo(i)) {
+                int count = i - start;
+                if (count >= (fill ? 3 : 2)) {
+                    int[] xs = new int[count];
+                    int[] ys = new int[count];
+                    for (int k = 0; k < count; k++) {
+                        xs[k] = deviceX(path.getX(start + k), path.getY(start + k));
+                        ys[k] = deviceY(path.getX(start + k), path.getY(start + k));
+                    }
+                    if (fill) {
+                        fillPolygonDevice(xs, ys, count, colorARGB);
+                    } else {
+                        strokePolylineDevice(xs, ys, count, true, colorARGB);
+                    }
+                }
+                start = i;
+            }
+        }
+    }
+
+    /**
+     * Fills or strokes an {@link Area}. The added outlines are drawn; for a fill
+     * the subtracted outlines are cleared with the {@code CLEAR} rule, which is
+     * the boolean difference the area models (an approximation: overlapping
+     * added outlines are filled once each, and on a surface without alpha the
+     * cleared pixels are transparent black).
+     */
+    private void areaOrFill(Area area, boolean fill) {
+        java.util.List<Shape> shapes = area.getShapes();
+        for (int i = 0; i < shapes.size(); i++) {
+            drawOrFill(shapes.get(i), fill);
+        }
+        if (!fill) {
+            return;
+        }
+        java.util.List<Shape> holes = area.getSubtractedShapes();
+        if (holes.isEmpty()) {
+            return;
+        }
+        int savedRule = compositeRule;
+        compositeRule = AlphaComposite.CLEAR;
+        for (int i = 0; i < holes.size(); i++) {
+            drawOrFill(holes.get(i), true);
+        }
+        compositeRule = savedRule;
+    }
+
 }

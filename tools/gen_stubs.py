@@ -122,15 +122,12 @@ def compile_helpers():
 
 # Classes the build strips out of the asset dex and replaces with host shims: their
 # members must never be attributed to a stub ancestor (they are not shipped).
-REPLACED_PREFIXES = ("net/runelite/client/ui/laf/", "net/runelite/client/ui/components/")
+REPLACED_PREFIXES = ("net/runelite/client/ui/laf/",)
 REPLACED_EXACT = {
     "net/runelite/client/ui/ClientUI", "net/runelite/client/ui/SplashScreen",
-    "net/runelite/client/ui/ContainableFrame", "net/runelite/client/ui/ClientPanel",
-    "net/runelite/client/ui/ClientToolbarPanel", "net/runelite/client/ui/FatalErrorDialog",
-    "net/runelite/client/ui/OSXFullScreenAdapter", "net/runelite/client/ui/MultiplexingPluginPanel",
-    "net/runelite/client/ui/ClientToolbar", "net/runelite/client/ui/PluginPanel",
-    "net/runelite/client/ui/NavigationButton", "net/runelite/client/ui/UnitFormatter",
-    "net/runelite/client/ui/UnitFormatterFactory", "net/runelite/client/ui/Activatable",
+    "net/runelite/client/ui/FatalErrorDialog", "net/runelite/client/ui/ContainableFrame",
+    "net/runelite/client/ui/OSXFullScreenAdapter",
+    "net/runelite/client/plugins/config/PluginHubPanel",
 }
 
 

@@ -1,12 +1,17 @@
 package java.awt;
 
 /**
- * AWT GradientPaint compatibility stub for Android runtime.
+ * The port's {@code java.awt.GradientPaint}.
  *
- * <p>Stores the two colours and endpoints. The mobile surface does not rasterise
- * gradients (there is no linear-gradient compositor in {@code Graphics2D}); a
- * gradient paint is accepted by {@link Graphics2D#setPaint} but the last solid
- * colour remains in effect.
+ * <p>Hand-written because RuneLite paints panels, bars and infobox backgrounds with
+ * it and the rasteriser has to produce the ramp itself.
+ *
+ * <p>Stores the two colours, the two endpoints and the cyclic flag; the fill
+ * paths rasterise the gradient along the transformed endpoints exactly as the
+ * JDK describes (linear, cyclic when {@link #isCyclic()}). Documented deviation:
+ * the stop fractions of the eight-argument constructor are ignored — this port
+ * only implements the two-stop ramp, so a caller passing explicit fractions gets
+ * the {0, 1} ramp and {@link #getFractions()} reports that.
  */
 public class GradientPaint implements Paint {
     private final float x1;

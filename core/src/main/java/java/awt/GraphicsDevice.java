@@ -22,6 +22,24 @@ public abstract class GraphicsDevice {
         return "mobile";
     }
 
+    /** The port has a single configuration per device. */
+    public GraphicsConfiguration[] getConfigurations() {
+        return new GraphicsConfiguration[] {getDefaultConfiguration()};
+    }
+
+    /** No native full-screen mode; the app owns the surface. */
+    public boolean isFullScreenSupported() {
+        return false;
+    }
+
+    public void setFullScreenWindow(Window w) {
+        throw new UnsupportedOperationException("no full-screen mode on this port");
+    }
+
+    public void setFullScreenWindow(Window w, java.awt.image.BufferStrategy strategy) {
+        throw new UnsupportedOperationException("no full-screen mode on this port");
+    }
+
     public int getType() {
         return TYPE_RASTER_SCREEN;
     }

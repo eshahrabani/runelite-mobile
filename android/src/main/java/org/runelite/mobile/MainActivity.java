@@ -11,8 +11,6 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Bundle;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.Process;
 import android.util.DisplayMetrics;
 import android.util.Log;
@@ -33,7 +31,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import org.runelite.mobile.bridge.AWTBridge;
+import org.runelite.mobile.bridge.SwingEdt;
 import org.runelite.mobile.bridge.TextBridge;
+import org.runelite.mobile.bridge.UiBridge;
 import org.runelite.mobile.host.PluginConformance;
 import org.runelite.mobile.host.RuneLiteHost;
 
@@ -169,6 +169,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView btnSwitchCharacter;
     private TextView btnSignOut;
     private TextView btnCheckUpdates;
+    /** The launcher's Host section: its rows and its two action pills. */
+    private LinearLayout hostRows;
+    private TextView btnHostConformance;
+    private TextView btnHostRefresh;
     private TextView btnManual;
     private LinearLayout manualPanel;
     private EditText etSessionId;
@@ -182,6 +186,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private TextView tvBootStatus;
     private volatile boolean firstFramePresented;
     private SidePanel sidePanel;
+    /** The drawer body: the core's Swing sidebar, presented as a bitmap. */
+    private SwingSidebarView swingSidebarView;
 
     // ── Login (browser-based OAuth) ────────────────────────────────────────
     private LocalCallbackServer callbackServer;
@@ -233,11 +239,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // logcat as System.err, which is where RuneLite's own log.info/warn end up.
         System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "info");
 
-        // The UI thread for the RuneLite runtime: PluginManager asserts the event
-        // dispatch thread and SwingUtilities.invokeAndWait must not deadlock, so both
-        // route here (the Android main thread) instead of a real EDT.
-        Handler mainHandler = new Handler(Looper.getMainLooper());
-        AWTBridge.registerUiThread(Looper.getMainLooper().getThread(), mainHandler::post);
+        // The UI thread for the RuneLite runtime is the Swing event dispatch thread:
+        // the port runs RuneLite's real Swing shell (the drawer's sidebar and the
+        // core's virtual windows), so PluginManager's "must be the EDT" assertion and
+        // SwingUtilities.invokeAndWait route there. The Android main thread only
+        // presents the core's bitmaps and forwards input -- which is what keeps a
+        // blocking plugin (or a modal Swing dialog) from freezing the Android UI.
+        AWTBridge.registerUiThread(SwingEdt.ensureStarted(), SwingEdt::post);
+
+        // The core's stage: how big the screen is (the window layer centres its
+        // dialogs on it), and that the drawer -- and with it RuneLite's sidebar --
+        // starts closed.
+        DisplayMetrics displayMetrics = getResources().getDisplayMetrics();
+        UiBridge.setScreenSize(displayMetrics.widthPixels, displayMetrics.heightPixels, displayMetrics.density);
+        UiBridge.setSidebarVisible(false);
 
         // Text: overlay text is rasterised by the platform (Typeface/Paint) behind the
         // core-side TextBridge, because core cannot reference android.* and cannot ship a
@@ -480,6 +495,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         btnCheckUpdates.setOnClickListener(v -> checkForUpdates(true));
         launcherPanel.addView(btnCheckUpdates);
 
+        // ── Host diagnostics: what the old drawer's Host tab reported. The drawer is
+        //    RuneLite's own Swing sidebar now, so this lives where a failed boot and
+        //    the "Check for updates" button already are -- the launcher screen. ──
+        LinearLayout hostCard = new LinearLayout(this);
+        hostCard.setOrientation(LinearLayout.VERTICAL);
+        hostCard.setBackground(UiTheme.rounded(UiTheme.SURFACE, UiTheme.BORDER, 1f, 12f, density));
+        hostCard.setPadding((int) (14 * density), (int) (12 * density),
+            (int) (14 * density), (int) (12 * density));
+        LinearLayout.LayoutParams hostCardParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        hostCardParams.topMargin = (int) (12 * density);
+        launcherPanel.addView(hostCard, hostCardParams);
+
+        TextView tvHostTitle = new TextView(this);
+        tvHostTitle.setText("Host");
+        tvHostTitle.setTextColor(UiTheme.GOLD);
+        tvHostTitle.setTextSize(14f);
+        tvHostTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        hostCard.addView(tvHostTitle);
+
+        hostRows = new LinearLayout(this);
+        hostRows.setOrientation(LinearLayout.VERTICAL);
+        hostCard.addView(hostRows);
+
+        btnHostConformance = pillAction("Run plugin conformance");
+        btnHostConformance.setLayoutParams(fullWidthParams((int) (6 * density)));
+        btnHostConformance.setOnClickListener(v -> requestPluginConformance());
+        hostCard.addView(btnHostConformance);
+
+        btnHostRefresh = pillAction("Refresh");
+        btnHostRefresh.setLayoutParams(fullWidthParams((int) (6 * density)));
+        btnHostRefresh.setOnClickListener(v -> refreshHostCard());
+        hostCard.addView(btnHostRefresh);
+
+        refreshHostCard();
+
         btnManual = linkButton("Manual session tokens (advanced)");
         btnManual.setTextColor(UiTheme.TEXT_DIM);
         btnManual.setOnClickListener(v ->
@@ -658,6 +709,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         });
 
+        // ── The Swing stage: RuneLite's real sidebar (hosted by the drawer, which
+        //    reports its own open/closed state) and the core's virtual windows (the
+        //    colour picker, plugin dialogs), both presented as bitmaps the core
+        //    paints. The host is installed before the client boots, so no dirty mark
+        //    or focus change can be lost, and the keyboard bar it asks for is the
+        //    same one the game's input uses. ──
+        swingSidebarView = new SwingSidebarView(this, new SwingSidebarView.Callback() {
+            @Override
+            public void onTextInputRequested(boolean show) {
+                showKeyboardBar(show);
+            }
+
+            @Override
+            public void onCloseSidebarRequested() {
+                sidePanel.close();
+            }
+        });
+        SwingWindowLayer windowLayer = new SwingWindowLayer(this);
+        windowLayer.setLayoutParams(new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT));
+        swingSidebarView.setWindowLayer(windowLayer);
+        UiBridge.setHost(swingSidebarView);
+        sidePanel.setSwingSidebarView(swingSidebarView);
+        // Above the drawer and the game surface (the side panel was added before it),
+        // below the login overlay (added after it). It shows itself only while the
+        // core has a visible window up.
+        rootLayout.addView(windowLayer);
+
         // ── Login WebView overlay (WebView created lazily in startJagexLogin —
         //    instantiating it eagerly spawns a background renderer process) ──
         loginOverlay = new FrameLayout(this);
@@ -784,7 +863,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             ? "Client v" + current
             : "Client v" + installed + " (APK ships v" + current + ")");
         if (aotBad) {
-            tvVersion.append("\nNOT AOT-COMPILED - expect ~5 fps (Host tab)");
+            tvVersion.append("\nNOT AOT-COMPILED - expect ~5 fps (Host section on this screen)");
         }
         float density = getResources().getDisplayMetrics().density;
         tvVersion.setTextColor(aotBad ? UiTheme.RED : UiTheme.TEXT_DIM);
@@ -797,6 +876,82 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         etSessionId.setText(sessionId);
         etCharacterId.setText(characterId);
         etDisplayName.setText(displayName);
+        refreshHostCard();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Launcher Host section
+
+    /**
+     * Fills the Host card with the live runtime state. Called from
+     * {@link #updateLauncherUi()}, i.e. whenever the launcher becomes visible.
+     */
+    private void refreshHostCard() {
+        if (hostRows == null) {
+            return;
+        }
+        hostRows.removeAllViews();
+        hostRows.addView(hostRow("client version", RuneLiteHost.clientVersion()));
+        hostRows.addView(hostRow("runtime", RuneLiteHost.isRunning() ? "running" : "not running"));
+        hostRows.addView(hostRow("plugin index", RuneLiteHost.indexSize() + " classes"));
+        hostRows.addView(hostRow("active plugins", String.valueOf(RuneLiteHost.activePluginCount())));
+        hostRows.addView(hostRow("status", RuneLiteHost.status()));
+        Throwable failure = RuneLiteHost.failure();
+        hostRows.addView(hostRow("last error", failure == null ? "none" : String.valueOf(failure)));
+        // The sidebar bootstrap is separate from the injector's (it is RuneLite's own
+        // ClientUI, not the port's shim), so it gets its own row.
+        Throwable sidebarFailure = RuneLiteHost.sidebarFailure();
+        hostRows.addView(sidebarFailure == null
+            ? hostRow("sidebar", "ok")
+            : hostText("sidebar: " + sidebarFailure, 11f, UiTheme.RED));
+        List<String> pluginFailures = RuneLiteHost.pluginFailures();
+        hostRows.addView(hostRow("plugin load failures", String.valueOf(pluginFailures.size())));
+        for (String entry : pluginFailures) {
+            hostRows.addView(hostText("  " + entry, 10f, UiTheme.RED));
+        }
+        int aot = ClientUpdater.clientDexAotStatus(this);
+        boolean aotBad = aot == ClientUpdater.AOT_STALE || aot == ClientUpdater.AOT_MISSING;
+        String aotText = ClientUpdater.clientDexAotText(this);
+        hostRows.addView(aotBad
+            ? hostText("client AOT: " + aotText, 11f, UiTheme.RED)
+            : hostRow("client AOT", aotText));
+        hostRows.addView(hostRow("on-device dexer", "unavailable"));
+        hostRows.addView(hostRow("conformance", PluginConformance.isRunning()
+            ? "running…" : PluginConformance.lastSummary()));
+        if (btnHostConformance != null) {
+            btnHostConformance.setEnabled(!PluginConformance.isRunning() && RuneLiteHost.isRunning());
+        }
+    }
+
+    /** Starts a plugin conformance pass (single-flight inside {@link PluginConformance}). */
+    private void requestPluginConformance() {
+        PluginConformance.run(this);
+        Toast.makeText(this, "conformance running — report: "
+            + PluginConformance.reportFile(this).getName(), Toast.LENGTH_LONG).show();
+        refreshHostCard();
+    }
+
+    /** One {@code label: value} row of the Host card. */
+    private View hostRow(String label, String value) {
+        return hostText(label + ": " + value, 11f, UiTheme.TEXT_MUTED);
+    }
+
+    private TextView hostText(String text, float size, int colour) {
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(size);
+        view.setTextColor(colour);
+        final float density = getResources().getDisplayMetrics().density;
+        view.setPadding(0, (int) (3 * density), 0, (int) (3 * density));
+        return view;
+    }
+
+    /** Full-width action-pill params (the launcher card is a column, not a bar). */
+    private static LinearLayout.LayoutParams fullWidthParams(int topMarginPx) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        params.topMargin = topMarginPx;
+        return params;
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -3476,12 +3631,53 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
+     * Shows or hides the keyboard bar for the core: a Swing text component took or lost
+     * the focus ({@code UiBridge.Host.textInputRequested}), so the sidebar's text fields
+     * are typed into through the very same bar as the game's chat line. Idempotent --
+     * the core may ask for the state it is already in.
+     */
+    private void showKeyboardBar(boolean show) {
+        if (kbBar == null) {
+            return;
+        }
+        kbBar.setVisibility(show ? View.VISIBLE : View.GONE);
+        android.view.inputmethod.InputMethodManager imm =
+            (android.view.inputmethod.InputMethodManager) getSystemService(android.content.Context.INPUT_METHOD_SERVICE);
+        if (imm == null) {
+            return;
+        }
+        if (show) {
+            kbEdit.requestFocus();
+            imm.showSoftInput(kbEdit, android.view.inputmethod.InputMethodManager.SHOW_IMPLICIT);
+        } else {
+            imm.hideSoftInputFromWindow(kbEdit.getWindowToken(), 0);
+        }
+    }
+
+    /**
      * Delivers AWT KeyEvents (KEY_PRESSED + KEY_TYPED + KEY_RELEASED) for the
      * given text into every key listener registered on the client component or
      * its canvas. Mirrors desktop AWT: printable chars go through KEY_TYPED
      * with the char; the code is the upper-case VK for letters, else the char.
      */
     private void dispatchKeyText(String text) {
+        if (UiBridge.focusOwnerIsTextInput()) {
+            // A Swing text component owns the focus: the run is its input, not the
+            // game's. One press/typed/release per character, as a desktop EDT sends it.
+            SwingSidebarView view = swingSidebarView;
+            if (view == null) {
+                return;
+            }
+            for (int i = 0; i < text.length(); i++) {
+                char c = text.charAt(i);
+                int keyCode = charKeyCode(c);
+                view.dispatchKey(java.awt.event.KeyEvent.KEY_PRESSED, keyCode, c);
+                view.dispatchKey(java.awt.event.KeyEvent.KEY_TYPED,
+                    java.awt.event.KeyEvent.VK_UNDEFINED, c);
+                view.dispatchKey(java.awt.event.KeyEvent.KEY_RELEASED, keyCode, c);
+            }
+            return;
+        }
         if (clientInstance == null || clientClass == null) return;
         java.awt.Component target = resolveInputTarget();
         if (target == null) return;
@@ -3501,8 +3697,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
     }
 
+    /** AWT's key code for a printable character: the upper-case VK for letters. */
+    private static int charKeyCode(char c) {
+        return (c >= 'a' && c <= 'z') ? c - ('a' - 'A') : c;
+    }
+
     /** Delivers a special-key event (ENTER, BACK_SPACE, ESCAPE, ...). */
     private void dispatchKeyCode(int keyCode, char keyChar) {
+        if (UiBridge.focusOwnerIsTextInput()) {
+            SwingSidebarView view = swingSidebarView;
+            if (view == null) {
+                return;
+            }
+            view.dispatchKey(java.awt.event.KeyEvent.KEY_PRESSED, keyCode, keyChar);
+            view.dispatchKey(java.awt.event.KeyEvent.KEY_TYPED,
+                java.awt.event.KeyEvent.VK_UNDEFINED, keyChar);
+            view.dispatchKey(java.awt.event.KeyEvent.KEY_RELEASED, keyCode, keyChar);
+            return;
+        }
         if (clientInstance == null || clientClass == null) return;
         java.awt.Component target = resolveInputTarget();
         if (target == null) return;

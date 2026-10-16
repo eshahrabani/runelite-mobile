@@ -1,22 +1,38 @@
 package java.awt;
 
 /**
- * AWT AlphaComposite compatibility stub for Android runtime.
+ * The port's {@code java.awt.AlphaComposite}.
  *
- * <p>Carries the source-over rule and an extra alpha multiplier. The overlay
- * renderer only ever sets SRC_OVER, so the numeric rules are exposed for
- * link-time compatibility while drawing always performs source-over.
+ * <p>Hand-written, because {@code Graphics2D.setComposite} has to change what is
+ * drawn: {@code ImageUtil.recolorImage} tints a sprite through
+ * {@code AlphaComposite.SrcAtop} and the client alpha-fades icons through
+ * {@code getInstance(SRC_OVER, alpha)}, so the rules are applied by the rasteriser
+ * rather than ignored.
+ *
+ * <p>Carries the Porter-Duff rule and the extra alpha multiplier that
+ * {@link Graphics2D#setComposite} installs. {@link Graphics#blendPixel} applies
+ * every declared rule, which is what {@code ImageUtil.recolorImage} needs from
+ * {@code SrcAtop}: colour only where the destination is already opaque, its
+ * alpha preserved.
  */
 public final class AlphaComposite implements Composite {
+    /*
+     * The numeric rule values are the ones the desktop JDK uses (verified against
+     * java.awt.AlphaComposite on JDK 17), NOT the values this stub previously
+     * carried: getInstance(int, float) is called with the constant inlined at the
+     * call site, so the pre-compiled client's
+     * {@code AlphaComposite.getInstance(3, alpha)} must mean SRC_OVER. The old
+     * 4/SRC_OVER numbering silently selected DST and drew nothing.
+     */
     public static final int CLEAR = 1;
     public static final int SRC = 2;
-    public static final int DST = 3;
-    public static final int SRC_OVER = 4;
-    public static final int DST_OVER = 5;
-    public static final int SRC_IN = 6;
-    public static final int DST_IN = 7;
-    public static final int SRC_OUT = 8;
-    public static final int DST_OUT = 9;
+    public static final int DST = 9;
+    public static final int SRC_OVER = 3;
+    public static final int DST_OVER = 4;
+    public static final int SRC_IN = 5;
+    public static final int DST_IN = 6;
+    public static final int SRC_OUT = 7;
+    public static final int DST_OUT = 8;
     public static final int SRC_ATOP = 10;
     public static final int DST_ATOP = 11;
     public static final int XOR = 12;
@@ -37,10 +53,6 @@ public final class AlphaComposite implements Composite {
     private final int rule;
     private final float alpha;
 
-    private AlphaComposite() {
-        this(SRC_OVER, 1.0f);
-    }
-
     private AlphaComposite(int rule, float alpha) {
         if (alpha < 0.0f || alpha > 1.0f) {
             throw new IllegalArgumentException("alpha must be in [0,1]");
@@ -54,6 +66,10 @@ public final class AlphaComposite implements Composite {
     }
 
     public static AlphaComposite getInstance(int rule, float alpha) {
+        // Every value of CLEAR..XOR is a rule, so the range check is exact.
+        if (rule < CLEAR || rule > XOR) {
+            throw new IllegalArgumentException("unknown rule");
+        }
         return new AlphaComposite(rule, alpha);
     }
 
