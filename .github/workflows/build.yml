@@ -119,12 +119,19 @@ jobs:
       - name: Download Artifacts
         uses: actions/download-artifact@v4
 
+      # Immutable releases are on for this repo: a *published* release rejects asset
+      # uploads (run #9: 422 "Cannot upload assets to an immutable release" on the
+      # first of the four), so this step creates the release as a draft, attaches the
+      # assets to it, and the step below publishes the draft — GitHub's documented
+      # order ("create the release as a draft, attach all associated assets, then
+      # publish the draft").
       - name: Create GitHub Release (AltStore / OTA Sideload Source)
+        id: release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: weekly-release-${{ github.run_number }}
           name: Weekly Release - ${{ github.run_number }}
-          draft: false
+          draft: true
           prerelease: false
           # `**`, not literal paths: upload-artifact@v4 roots the artifact at the least
           # common ancestor of the uploaded paths — `android/` here, since the APK is
@@ -150,5 +157,14 @@ jobs:
             runelite-android-release/**/client-version.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # PATCH by the id this run's action reported, not by tag: releases/tags/<tag>
+      # does not return a draft (the action's own draft branch lists all releases for
+      # that reason), and publishing the draft is what makes the release immutable.
+      - name: Publish the Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh api -X PATCH "repos/${{ github.repository }}/releases/${{ steps.release.outputs.id }}" -F draft=false --jq .html_url
 
       # In a production setup: Include Fastlane steps here to submit to App Store Connect / TestFlight
