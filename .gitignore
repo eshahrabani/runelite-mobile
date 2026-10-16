@@ -11,6 +11,11 @@ local.properties
 android/src/main/assets/runelite-dex.jar
 android/src/main/assets/client-version.txt
 
+# Release signing material (never commit: the identity must stay stable, the secret private)
+keystore.properties
+*.keystore
+*.jks
+
 # IDE
 .idea/
 *.iml

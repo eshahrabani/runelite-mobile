@@ -209,7 +209,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String leg2State;
     private String leg2Nonce;
     private boolean loginActive = false;
-    private boolean updateDialogShown = false;
+    /** Version whose update dialog the user already declined, so a *new* version still asks. */
+    private String declinedVersion;
+
+    // ── Client-update polling: the "weekly OSRS update" window.
+    //    A player can sit on the launcher (or in the game) while RuneLite and CI publish the
+    //    client for a new game revision, and the game is unplayable until it is installed.
+    //    So: re-check every UPDATE_POLL_MS while the activity is in front, keep a visible
+    //    status line, and offer the update the moment a newer client appears. A whole CI run
+    //    costs ~190 s (measured 2026-10-16: Android job 177 s, publish 7 s), so a 2-minute
+    //    poll bounds publish -> offered at ~2 min, and publish -> installed at ~3-4 min. ──
+    private static final long UPDATE_POLL_MS = 120_000;
+    private TextView tvClientStatus;
+    private final android.os.Handler updatePollHandler = new android.os.Handler(android.os.Looper.getMainLooper());
+    private final Runnable updatePollTask = this::startUpdateCheckAsync;
+    private boolean updatePollActive;
+    private boolean updateInProgress;
+    private String lastVersionCheckStamp;
 
     private String codebase = "";
     private final Map<String, String> appletParameters = new HashMap<>();
@@ -494,6 +510,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         btnCheckUpdates = linkButton("Check for updates");
         btnCheckUpdates.setOnClickListener(v -> checkForUpdates(true));
         launcherPanel.addView(btnCheckUpdates);
+
+        // Update/health line: what the client-update poll found, and -- during a weekly OSRS
+        // update -- the one-tap way out of a client the game refuses. See updateClientStatus.
+        tvClientStatus = new TextView(this);
+        tvClientStatus.setTextColor(UiTheme.TEXT_DIM);
+        tvClientStatus.setTextSize(11f);
+        tvClientStatus.setGravity(Gravity.CENTER);
+        tvClientStatus.setPadding(dp, dp * 2, dp, dp * 2);
+        launcherPanel.addView(tvClientStatus);
 
         // ── Host diagnostics: what the old drawer's Host tab reported. The drawer is
         //    RuneLite's own Swing sidebar now, so this lives where a failed boot and
@@ -1389,21 +1414,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     // ═══════════════════════════════════════════════════════════════════════
 
     private void startUpdateCheckAsync() {
+        updatePollHandler.removeCallbacks(updatePollTask);
         new Thread(() -> {
             String latest = ClientUpdater.fetchAvailableClientVersion();
-            if (latest == null) {
-                return;
-            }
             String installed = ClientUpdater.installedClientVersion(this);
-            if (installed.equals("unknown") || latest.equals(installed)) {
-                return;
-            }
             runOnUiThread(() -> {
-                if (!updateDialogShown) {
+                updateClientStatus(latest, installed);
+                boolean newer = latest != null && installed != null && !installed.equals("unknown")
+                    && compareVersions(latest, installed) > 0;
+                // Only pop the dialog over the launcher: mid-game it would interrupt play, and
+                // the status line already carries the same information for the way back.
+                boolean launcherVisible = launcherScroll != null
+                    && launcherScroll.getVisibility() == View.VISIBLE;
+                if (newer && launcherVisible && !latest.equals(declinedVersion) && !updateInProgress) {
                     showUpdateDialog(latest, installed);
+                }
+                if (updatePollActive) {
+                    updatePollHandler.postDelayed(updatePollTask, UPDATE_POLL_MS);
                 }
             });
         }, "UpdateCheck").start();
+    }
+
+    /**
+     * Launcher status line for the client-update state -- the guide through a weekly OSRS
+     * update, when the game can refuse the installed client until the new one lands. While
+     * RuneLite/CI have not published yet the line says so and keeps retrying; as soon as a
+     * newer client exists it becomes a one-tap install.
+     */
+    private void updateClientStatus(String latest, String installed) {
+        if (tvClientStatus == null) {
+            return;
+        }
+        float density = getResources().getDisplayMetrics().density;
+        if (latest == null) {
+            tvClientStatus.setText("Can't reach the update server"
+                + (lastVersionCheckStamp == null ? "" : " (last checked " + lastVersionCheckStamp + ")")
+                + "\nIf the game says the client is out of date, a new build is on its way -- retrying every 2 min.");
+            tvClientStatus.setTextColor(UiTheme.RED);
+            tvClientStatus.setBackground(UiTheme.rounded(0x22E57373, UiTheme.RED, 1f, 8f, density));
+            tvClientStatus.setOnClickListener(null);
+            return;
+        }
+        lastVersionCheckStamp = new java.text.SimpleDateFormat("HH:mm", java.util.Locale.US)
+            .format(new java.util.Date());
+        int cmp = compareVersions(latest, installed);
+        String from = installed == null || installed.equals("unknown") ? "installed" : installed;
+        if (cmp > 0) {
+            tvClientStatus.setText("Update available: v" + from + " -> v" + latest
+                + " (checked " + lastVersionCheckStamp + ")\nTap to download and install now.");
+            tvClientStatus.setTextColor(0xFFFFD75E);
+            tvClientStatus.setBackground(UiTheme.rounded(0x22FFD75E, 0xFFFFD75E, 1f, 8f, density));
+            tvClientStatus.setOnClickListener(v -> showUpdateDialog(latest, installed));
+        } else if (cmp < 0) {
+            tvClientStatus.setText("Client v" + installed + " is newer than the published v" + latest
+                + " -- nothing to do (checked " + lastVersionCheckStamp + ").");
+            tvClientStatus.setTextColor(UiTheme.TEXT_MUTED);
+            tvClientStatus.setBackground(null);
+            tvClientStatus.setOnClickListener(null);
+        } else {
+            tvClientStatus.setText("Client v" + installed + " is up to date (checked "
+                + lastVersionCheckStamp + ").");
+            tvClientStatus.setTextColor(UiTheme.TEXT_DIM);
+            tvClientStatus.setBackground(null);
+            tvClientStatus.setOnClickListener(null);
+        }
     }
 
     private void checkForUpdates(boolean manual) {
@@ -1419,8 +1494,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 tvUpdateText.setText("");
                 tvUpdateText.setVisibility(View.GONE);
-                if (latest.equals(installed)) {
+                updateClientStatus(latest, installed);
+                int cmp = compareVersions(latest, installed);
+                if (cmp == 0) {
                     Toast.makeText(this, "Client is up to date (v" + installed + ")", Toast.LENGTH_SHORT).show();
+                } else if (cmp < 0) {
+                    // The published release is older than what is installed (a rollback, or a
+                    // hand-installed client): never offer that as an update.
+                    Toast.makeText(this, "Installed client v" + installed + " is newer than the published v"
+                        + latest + " -- nothing to do", Toast.LENGTH_LONG).show();
                 } else {
                     showUpdateDialog(latest, installed);
                 }
@@ -1429,14 +1511,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     private void showUpdateDialog(String latest, String installed) {
-        updateDialogShown = true;
         new AlertDialog.Builder(this)
             .setTitle("RuneLite client update available")
             .setMessage("A new game client is available (v" + installed + " -> v" + latest + ").\n\n"
                 + "Download and install it now? (~6 MB, takes seconds.) "
-                + "The old client keeps working if you decline.")
+                + "The old client keeps working if you decline -- but after a weekly OSRS "
+                + "update the game may refuse it until this is installed.")
             .setPositiveButton("Update now", (d, w) -> runClientUpdate(latest))
-            .setNegativeButton("Later", null)
+            .setNegativeButton("Later", (d, w) -> declinedVersion = latest)
             .setCancelable(true)
             .show();
     }
@@ -1448,6 +1530,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         tvUpdateText.setVisibility(View.VISIBLE);
         tvUpdateText.setText("Downloading update...");
         btnCheckUpdates.setEnabled(false);
+        updateInProgress = true;
         new Thread(() -> {
             try {
                 ClientUpdater.downloadAndInstall(this, version, (stage, percent, etaMillis) -> runOnUiThread(() -> {
@@ -1458,7 +1541,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     updateProgress.setVisibility(View.GONE);
                     tvUpdateText.setVisibility(View.GONE);
                     btnCheckUpdates.setEnabled(true);
+                    updateInProgress = false;
+                    declinedVersion = null;
                     updateLauncherUi();
+                    startUpdateCheckAsync();   // the status line now reads "up to date"
                     new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Client updated")
                         .setMessage("RuneLite client updated to v" + version + ". Restart the game now to use it?")
@@ -1472,6 +1558,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     updateProgress.setVisibility(View.GONE);
                     tvUpdateText.setText("Update failed: " + e.getMessage());
                     btnCheckUpdates.setEnabled(true);
+                    updateInProgress = false;
                     new AlertDialog.Builder(MainActivity.this)
                         .setTitle("Update failed")
                         .setMessage("The update could not be installed:\n" + e.getMessage()
@@ -1677,6 +1764,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 // report as stale on the launcher after every Play.
                 if (apkTime > 0) {
                     localJarFile.setLastModified(apkTime);
+                }
+                // The files-dir jar is now the asset build, so record that version: otherwise
+                // the launcher keeps reporting the old one, re-copies the asset on every boot,
+                // and the update check nags for a client that is already installed.
+                try (FileOutputStream vf = new FileOutputStream(new File(getFilesDir(), ClientUpdater.VERSION_FILE_NAME))) {
+                    vf.write(ClientUpdater.currentClientVersion(this).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not record the asset client version", e);
                 }
             }
             Log.i(TAG, "Using dexed client: " + localJarFile.getAbsolutePath() + " (" + localJarFile.length() + " bytes)");
@@ -3919,6 +4014,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
 
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // The activity is in front: keep watching the release feed (see UPDATE_POLL_MS) so a
+        // client published during a weekly OSRS update is offered without a relaunch.
+        updatePollActive = true;
+        startUpdateCheckAsync();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        updatePollActive = false;
+        updatePollHandler.removeCallbacks(updatePollTask);
+    }
 
     @Override
     protected void onStop() {

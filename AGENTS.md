@@ -11,10 +11,18 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   The `downloadAndDexJar` task hooks into `preBuild` and **requires network**
   (static.runelite.net + repo.runelite.net) and Android SDK build-tools (d8).
   Offline android builds fail at preBuild, not at compile.
+  Release signing identity comes from `android/keystore.properties` (gitignored:
+  `storeFile`/`storePassword`/`keyAlias`/`keyPassword`) or the `KEYSTORE_FILE`/
+  `KEYSTORE_PASSWORD`/`KEY_ALIAS`/`KEY_PASSWORD` env vars; without one the release
+  APK is debug-key-signed and `packageRelease` prints a warning. Use the **same**
+  identity as CI (secret `SIGNING_KEYSTORE_B64` + `SIGNING_KEYSTORE_PASSWORD`,
+  alias `runelitemobile`): an APK signed with a different key cannot be installed
+  over a release (INSTALL_FAILED_UPDATE_INCOMPATIBLE), so the only way forward is
+  a data-wiping uninstall.
 - `./gradlew :ios:robovmIPABuild` — macOS + Xcode only (RoboVM 2.3.24).
-- CI (`.github/workflows/build.yml`): weekly Wednesday cron (after Jagex's weekly
-  game update) + manual dispatch; artifact at
-  `android/build/outputs/apk/release/android-release.apk`.
+- CI (`.github/workflows/build.yml`): freshness-gated schedule (Wed 07-21 UTC every
+  5 min, thinning outwards; a manual dispatch always builds and publishes); artifact
+  at `android/build/outputs/apk/release/android-release.apk`.
 - Java 11 source/target (CI uses Zulu 11; a newer local JDK works). No tests,
   no lint config, no README.
 
@@ -133,7 +141,23 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   checksum) as release assets named exactly `runelite-dex.jar`,
   `client-version.txt`, `runelite-dex.jar.sha256` — those names are the URL
   tails the app fetches. A failed download or checksum mismatch leaves the old
-  client installed and working.
+  client installed and working. The launcher carries the whole update state in a
+  status line (`updateClientStatus`, under the version row) and re-checks every
+  `UPDATE_POLL_MS` (2 min) while the activity is resumed, so a client published
+  during a weekly OSRS update is offered without a relaunch; the dialog is only
+  popped over the launcher, never mid-game. The trigger is exact string inequality
+  of `client-version.txt`, so a same-version rebuild would never reach a user, and
+  a published release *older* than the installed client is refused rather than
+  offered (`compareVersions`). `bootGameClient` writes the asset version into
+  `files/client-version.txt` when it copies the APK's jar, so an APK update over an
+  older client no longer re-copies the 10 MB asset on every boot.
+  **CI is freshness-gated**: `build.yml`'s `check` job compares bootstrap.json's
+  client version with the latest release's `client-version.txt` and skips the
+  building jobs when they match, so the frequent crons (Wed 07-21 UTC every 5 min,
+  Wed night every 10, Thu every 15 min, otherwise every 2 h) cost one curl when
+  there is nothing to do. Downtime target: a whole run is ~190 s measured, so
+  RuneLite publishing -> users able to pull is ~5 min (cron) + ~3 min (build and
+  publish) + the app's own 2-minute poll.
 - **Render loop is fixed 765×503** (the client's own frame size — `GAME_W` in
   MainActivity must match it): `appletPixels` (MainActivity) ↔
   `AWTBridge.activePixels/activeWidth/activeHeight`. Change all three
