@@ -126,12 +126,28 @@ jobs:
           name: Weekly Release - ${{ github.run_number }}
           draft: false
           prerelease: false
+          # `**`, not literal paths: upload-artifact@v4 roots the artifact at the least
+          # common ancestor of the uploaded paths — `android/` here, since the APK is
+          # under android/build/outputs/apk/release/ and the jar, its sha256 and the
+          # version file under android/src/main/assets/ — so download-artifact extracts
+          # runelite-android-release/{build/outputs/apk/release,src/main/assets}/… .
+          # The literal paths matched nothing, and the action's default
+          # fail_on_unmatched_files=false let that run stay green with an empty release
+          # (run #8 = weekly-release-8: zero assets, every releases/latest/download/<name>
+          # a 404), so the flag is now on — an unmatched pattern fails this step before a
+          # release is created, instead of publishing nothing. Asset names are the
+          # basename of each match (asset() in the action's src/github.ts), so these four
+          # keep the exact names ClientUpdater and the sideload links fetch.
+          # The IPA is deliberately absent: the iOS job is continue-on-error and fails,
+          # so runelite-ios-unsigned/<file>.ipa can never match and this flag would reject
+          # the run for it. The IPA stays a workflow artifact; add it back here once that
+          # job goes green (then the pattern always matches and the flag can stay).
+          fail_on_unmatched_files: true
           files: |
-            runelite-android-release/*.apk
-            runelite-android-release/runelite-dex.jar
-            runelite-android-release/runelite-dex.jar.sha256
-            runelite-android-release/client-version.txt
-            runelite-ios-unsigned/*.ipa
+            runelite-android-release/**/*.apk
+            runelite-android-release/**/runelite-dex.jar
+            runelite-android-release/**/runelite-dex.jar.sha256
+            runelite-android-release/**/client-version.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
