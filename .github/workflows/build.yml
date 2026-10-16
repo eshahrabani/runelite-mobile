@@ -20,7 +20,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # JDK 17: android-actions/setup-android@v3 installs cmdline-tools 16.0, whose
+      # JDK 17: android-actions/setup-android@v4 with cmdline-tools-version 12266719 installs cmdline-tools 16.0, whose
       # sdkmanager requires JDK 17+ ("This tool requires JDK 17 or later. Your
       # version was detected as 11.0.32." -> exit 1), and AGP 8.2.2 itself requires
       # JDK 17 to run. Bytecode stays Java 11: android/build.gradle pins
@@ -33,8 +33,27 @@ jobs:
           java-version: '17'
           cache: 'gradle'
 
+      # @v4, not @v3: @v3's default `packages` is the literal "tools platform-tools" and
+      # Google no longer serves the legacy `tools` package (it is absent from
+      # repository2-3.xml), so `sdkmanager tools` exits 1 with "Failed to find package
+      # 'tools'" and the step dies before the build starts. Both inputs are pinned so no
+      # 4.x default can install anything here either:
+      #  - packages: '' — the action's package loop then runs zero sdkmanager installs.
+      #    This job needs no packages: ubuntu-latest already ships platforms;android-34
+      #    and build-tools (AGP's aapt2/d8 plus downloadAndDexJar's <build-tools>/d8),
+      #    and adb/platform-tools is never invoked by this workflow.
+      #  - cmdline-tools-version 12266719 (16.0) — the version this job's JDK 17 is
+      #    already proven against (its `sdkmanager --licenses` succeeds in the current
+      #    runs) and the one preinstalled on the runner image, so the ~130 MB
+      #    cmdline-tools download only happens if the image ever drops it.
+      # The action is kept for licence acceptance (AGP's SDK auto-download reads
+      # <sdk>/licenses), the ANDROID_HOME/ANDROID_SDK_ROOT exports, PATH and the
+      # problem matchers.
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
+        with:
+          cmdline-tools-version: '12266719' # 16.0
+          packages: ''
 
       - name: Build Android APK
         run: ./gradlew :android:assembleRelease
