@@ -509,7 +509,14 @@ public final class SwingSelfTest {
                     }
                 }
                 if (dialog == null) {
+                    // Nothing appeared: make sure a late dialog cannot hang the loop either.
                     problem[0] = "no dialog appeared";
+                    SwingEdt.post(() -> {
+                        Window late = findDialog();
+                        if (late != null) {
+                            late.dispose();
+                        }
+                    });
                     return;
                 }
                 // showConfirmDialog(parent, message) defaults to YES_NO_CANCEL, so the
@@ -527,12 +534,25 @@ public final class SwingSelfTest {
                 }
                 click(button);
                 clicked[0] = true;
+                // Watchdog: whatever happens next, a dialog must not be able to keep the
+                // caller's nested loop (and the whole dispatch thread) alive. It polls
+                // because the click's effect is asynchronous.
                 SwingEdt.post(() -> {
-                    Window still = findDialog();
-                    if (still != null) {
-                        // The click did not dismiss it: close it so the caller's nested loop
-                        // ends and the case fails instead of hanging the dispatch thread.
-                        still.dispose();
+                    for (int i = 0; i < 40; i++) {
+                        Window still = findDialog();
+                        if (still == null) {
+                            return;
+                        }
+                        if (i == 39) {
+                            still.dispose();
+                            return;
+                        }
+                        try {
+                            Thread.sleep(25);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
                     }
                 });
             } catch (Throwable t) {
