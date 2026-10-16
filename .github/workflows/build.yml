@@ -2,10 +2,22 @@ name: Weekly RuneLite Mobile Build
 
 on:
   schedule:
-    # Run every Wednesday at 13:00 UTC (approximately after Jagex updates OSRS)
-    - cron: '0 13 * * 3'
+    # Downtime target: <15 min from RuneLite publishing a client for a new game revision to
+    # the release being pullable, so a weekly OSRS update never leaves the game unplayable
+    # for long. A whole run costs ~190 s measured (run #11: Android job 177 s, publish 7 s)
+    # and the `check` job below skips the expensive jobs when the published client is
+    # already current, so wide slots are cheap. RuneLite's recent publishes (jar
+    # Last-Modified, UTC): Wed 09:45 (1.13.1), Wed 10:07 (1.12.37), Wed 14:31 (1.12.39),
+    # Wed 16:23 (1.12.38), Wed 18:09 (1.13.2), Mon 14:16 (1.13.0); Jagex updates OSRS
+    # ~10:00-11:00 UTC on Wednesdays. GitHub may add a few minutes of jitter to scheduled
+    # runs, and disables schedules after 60 days without repository activity (any push
+    # re-enables them).
+    - cron: '*/5 7-21 * * 3'        # Wednesday: the weekly-update window, <=5 min detection
+    - cron: '*/10 0-6,22-23 * * 3'  # Wednesday night: a late publish is not missed
+    - cron: '*/15 0-12 * * 4'       # Thursday: hotfixes after a stalled Wednesday
+    - cron: '0 */2 * * *'           # other days: off-schedule releases (1.13.0 was a Monday)
   workflow_dispatch:
-    # Allow manual triggers for testing or mid-week hotfixes
+    # Manual triggers skip the freshness guard and always build (hotfixes/testing).
 
 # Needed so the distribute job can create a GitHub Release (new repos default
 # the GITHUB_TOKEN to read-only).
@@ -13,8 +25,36 @@ permissions:
   contents: write
 
 jobs:
+  # Cheap freshness guard: the building jobs only run when bootstrap.json names a client
+  # version the latest release does not carry yet. The criterion mirrors the app's own
+  # update trigger (ClientUpdater compares client-version.txt exactly), so a same-version
+  # rebuild by RuneLite would never reach a user anyway. No checkout, no JDK: a no-op run
+  # is one curl against bootstrap.json plus one against the release.
+  check:
+    name: Check RuneLite version
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.compare.outputs.build }}
+    steps:
+      - name: Compare bootstrap.json with the latest release
+        id: compare
+        run: |
+          bootstrap="$(curl -fsS --max-time 30 https://static.runelite.net/bootstrap.json || echo '')"
+          published="$(printf '%s' "$bootstrap" | sed -n 's/.*"name": "client-\([0-9][^"]*\)\.jar".*/\1/p' | head -n1)"
+          released="$(curl -fsS --max-time 30 -L "https://github.com/${{ github.repository }}/releases/latest/download/client-version.txt" || echo '')"
+          echo "bootstrap.json client: ${published:-<unreachable>} | latest release: ${released:-<none>}"
+          if [ -n "$published" ] && [ "$published" = "$released" ]; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Up to date: the client RuneLite publishes ($released) is already released."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "A build is needed."
+          fi
+
   build-android:
     name: Build Android Client (Option A Wrapper)
+    needs: check
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.check.outputs.build == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -55,6 +95,31 @@ jobs:
           cmdline-tools-version: '12266719' # 16.0
           packages: ''
 
+      # The APK's signing identity must be identical in every run, or no update can be
+      # installed over a previous one: Android rejects it with
+      # INSTALL_FAILED_UPDATE_INCOMPATIBLE and the user has to uninstall -- losing the
+      # RuneLite config under files/.runelite and the saved sign-in. The keystore lives in
+      # repo secrets; without them the build falls back to the runner's auto-generated
+      # debug keystore (whose key changes every run) and packageRelease says so.
+      #   base64 -w0 <keystore> | gh secret set SIGNING_KEYSTORE_B64
+      #   printf %s '<password>' | gh secret set SIGNING_KEYSTORE_PASSWORD
+      - name: Write release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::warning::No SIGNING_KEYSTORE_B64/SIGNING_KEYSTORE_PASSWORD secret: signing with the debug keystore, so this APK will not install over a previous release."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+          {
+            echo "KEYSTORE_FILE=$RUNNER_TEMP/release.keystore"
+            echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+            echo "KEY_ALIAS=runelitemobile"
+          } >> "$GITHUB_ENV"
+          echo "Release keystore ready (alias runelitemobile)."
+
       - name: Build Android APK
         run: ./gradlew :android:assembleRelease
 
@@ -73,6 +138,8 @@ jobs:
 
   build-ios:
     name: Compile iOS Client (RoboVM Native AOT)
+    needs: check
+    if: ${{ github.event_name == 'workflow_dispatch' || needs.check.outputs.build == 'true' }}
     runs-on: macos-latest
     # Skeleton target: a Toolchain/Xcode incompatibility must not turn the weekly
     # client build red; the IPA stays a workflow artifact.
@@ -112,8 +179,10 @@ jobs:
     name: Publish Releases
     # Only the Android job gates client delivery: a failing macOS-only iOS
     # skeleton job must never block shipping the client. The IPA stays a
-    # workflow artifact (runelite-ios-unsigned).
+    # workflow artifact (runelite-ios-unsigned). `skipped` (freshness guard said
+    # there is nothing new) and `failure` both mean there is nothing to publish.
     needs: [build-android]
+    if: ${{ needs.build-android.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Download Artifacts

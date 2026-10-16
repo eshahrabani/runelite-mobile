@@ -12,6 +12,32 @@ plugins {
     id 'com.android.application'
 }
 
+// ---------------------------------------------------------------------------
+// Release signing identity. It MUST be stable across builds: Android refuses to
+// install an APK over one signed with a different key
+// (INSTALL_FAILED_UPDATE_INCOMPATIBLE), so an unstable key turns every update into
+// an uninstall -- wiping the RuneLite config under files/.runelite and the saved
+// sign-in. A CI runner's auto-generated debug keystore is regenerated per run
+// (verified on 2026-10-16: run #10 3c3deabf…, run #11 3c76a532…, local af829da9…),
+// so release builds use a real keystore whenever one is configured:
+//   local: android/keystore.properties (gitignored)  storeFile/storePassword/keyAlias/keyPassword
+//   CI:    KEYSTORE_FILE / KEYSTORE_PASSWORD / KEY_ALIAS / KEY_PASSWORD env vars
+// Without one the build falls back to the debug key and packageRelease says so.
+// ---------------------------------------------------------------------------
+def signingProps = new Properties()
+def signingPropsFile = file('keystore.properties')
+if (signingPropsFile.exists()) {
+    signingPropsFile.withInputStream { signingProps.load(it) }
+}
+def signingValue = { String key, String env, String fallback = null ->
+    project.findProperty(key) ?: signingProps.getProperty(key) ?: System.getenv(env) ?: fallback
+}
+def releaseStorePath = signingValue('storeFile', 'KEYSTORE_FILE')
+def releaseStorePassword = signingValue('storePassword', 'KEYSTORE_PASSWORD')
+def releaseKeyAlias = signingValue('keyAlias', 'KEY_ALIAS', 'runelitemobile')
+def releaseKeyPassword = signingValue('keyPassword', 'KEY_PASSWORD', releaseStorePassword)
+def hasReleaseKeystore = releaseStorePath != null && releaseStorePassword != null
+
 android {
     namespace 'org.runelite.mobile'
     compileSdk 34
@@ -36,15 +62,40 @@ android {
         buildConfig true
     }
 
+    // Release signing identity -- see the keystore resolution at the top of the file.
+    // Falling back to the debug key keeps local builds working, but an APK signed with
+    // an identity other than the previous release's cannot be installed over it.
+    if (hasReleaseKeystore) {
+        signingConfigs {
+            release {
+                storeFile file(releaseStorePath)
+                storePassword releaseStorePassword
+                keyAlias releaseKeyAlias
+                keyPassword releaseKeyPassword
+                storeType 'jks'
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            signingConfig hasReleaseKeystore ? signingConfigs.release : signingConfigs.debug
         }
     }
     compileOptions {
         sourceCompatibility JavaVersion.VERSION_11
         targetCompatibility JavaVersion.VERSION_11
+    }
+}
+
+// Say which identity the release APK gets: an unstable key is the difference between an
+// in-place APK update and a data-wiping uninstall for every sideloaded user.
+tasks.matching { it.name == 'packageRelease' }.configureEach {
+    doFirst {
+        println hasReleaseKeystore
+            ? "  [signing] release APK signed with ${releaseStorePath}"
+            : "  [signing] WARNING: no release keystore configured (android/keystore.properties or KEYSTORE_FILE) -- signing with the debug key, so this APK will NOT install over a previous release"
     }
 }
 
