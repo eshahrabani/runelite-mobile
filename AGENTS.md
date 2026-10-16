@@ -480,12 +480,16 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   `post`/`postDeferred` counts the proxy saw; `GameTick`/`BeforeRender` are posted by
   RuneLite's own `Hooks` straight to the bus, so they are never asserted on). An exception
   while the game is not `LOGGED_IN` is recorded as `SKIP(state)`, a link error always fails.
-  Trigger it from the Host tab or from adb (the render loop consumes the request file
-  every 5 s):
+  The pass must always produce a report: the on-screen self-test case (a modal dialog) and
+  the panel-render metric (`PluginConformance.VERIFY_PANELS`) are **not** part of it, because a
+  dialog that never gets its click and a panel whose layout loops both hang the dispatch
+  thread. Panel behaviour is covered by the manual device checks. Trigger it from the
+  launcher's Host section or from adb (the render loop consumes the request file every 5 s):
   `adb shell "echo 1 > /sdcard/Android/data/org.runelite.mobile/files/conformance.request"`,
   then `adb pull …/files/conformance-report.txt`; the summary also goes to logcat as
-  `CONFORMANCE: plugins=… pass=… fail=… skip=…`. Verified on the device logged in:
-  115/115 plugins reported, 0 FAIL, `subs=<n>/<n>` equal on every line, `cfg=<n>/0`,
+  `CONFORMANCE: plugins=… pass=… fail=… skip=…`. Verified on the device (login screen,
+  current build): `plugins=125 pass=12 fail=0 skip=113` (the skips are `SKIP(state)`).
+  Verified earlier logged in: 115/115 plugins reported, 0 FAIL, `subs=<n>/<n>` equal on every line, `cfg=<n>/0`,
   `ovl=<n>/0`, `rc=1` and `entityVeto(entities=112 denied=24)` for `EntityHiderPlugin`
   (denials stop the moment the plugin is stopped, so the veto is provably the plugin's).
 - **Third-party plugins are dexed on the device.** A hub jar is Java 11 `.class`
