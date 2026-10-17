@@ -101,25 +101,34 @@ inserted into `content` at index 0, behind `statusText`.
 
 ## 3. Touch mapping in the drawer
 
-One finger is the mouse. `ACTION_DOWN` dispatches `MOUSE_MOVED` (NOBUTTON) **then** `MOUSE_PRESSED`
-(BUTTON1) at the point — a mouse always moves before it presses, and a Swing widget (a menu, the
-sidebar) picks its hover/selection from the move. View coordinates are device px divided by the UI
-scale (§5) and handed to `UiBridge.dispatchMouse`.
+One finger is the mouse. `ACTION_DOWN` dispatches `MOUSE_MOVED` (NOBUTTON) — a mouse always moves
+before it presses, and a Swing widget (a menu, the sidebar) picks its hover/selection from the move
+— but **not** `MOUSE_PRESSED`: the press is deferred until the gesture is known, because the client
+acts on mouse *down* (the same reason the game surface defers it, see `MainActivity.beginTapPress`).
+`ACTION_MOVE` and `ACTION_UP` then decide which gesture it is. View coordinates are device px
+divided by the UI scale (§5) and handed to `UiBridge.dispatchMouse`.
 
 - **Scrollable target** — `UiBridge.isScrollableAt` is true over a `JViewport` whose view is larger
   than the viewport, or a `JTabbedPane` whose strip is scrollable: a one-finger drag becomes wheel
   notches (`scrollByDrag`: at least `WHEEL_STEP_DP` = 24 dp of travel per event; dragging down is a
   negative AWT rotation = scroll up). RuneLite's panels have no drag semantics of their own, so a
   touch device gets scrolling instead. Once the slop (`DRAG_SLOP_DP` = 10 dp) is crossed the gesture
-  is marked as scrolled and the lift sends `MOUSE_RELEASED` **without** a click — a flick must not
-  toggle whatever the finger happened to be over.
-- **Anywhere else**: travel beyond 10 dp becomes `MOUSE_DRAGGED` (BUTTON1).
+  is marked as a drag and the lift sends nothing at all (no press was ever delivered) — a flick
+  must not toggle whatever the finger happened to be over.
+- **Anywhere else**: travel beyond 10 dp turns the gesture into a drag: `MOUSE_PRESSED` (BUTTON1) at
+  the touch-down point, then a `MOUSE_DRAGGED` (BUTTON1) stream — what a desktop mouse sends. The
+  lift then sends `MOUSE_RELEASED` where the finger is, **without** a click.
+- **Tap** (the lift arrives without the slop crossed): `MOUSE_PRESSED` + `MOUSE_RELEASED` +
+  `MOUSE_CLICKED` (BUTTON1), all at the touch-down point, so the gesture acts on what the finger
+  went down on and not on whatever it drifted over. Two taps within `DOUBLE_TAP_MS` (350 ms) and
+  `DOUBLE_TAP_SLOP_DP` (24 dp) are a **double click**: all three events carry
+  `getClickCount() == 2`, which is what RuneLite's world switcher rows hop on (a triple tap starts a
+  new pair).
 - **Long press**: a finger still for `LONG_PRESS_MS` (400 ms) fires `MOUSE_PRESSED` +
   `MOUSE_RELEASED` with `BUTTON3` — Swing's popup trigger, e.g. a tab's right-click menu — and toasts
   the tooltip under the point (`UiBridge.tooltipAt`), because a desktop user would hover there. The
-  lift then only closes the left press, it does not become a click.
-- **Lift**: `MOUSE_RELEASED` and, unless the gesture scrolled / long-pressed / became two-finger,
-  `MOUSE_CLICKED` (BUTTON1).
+  lift then closes the left press (there is none, since a drag would have cancelled the timer) and
+  does not become a click.
 - **Two fingers** (the second `ACTION_DOWN` cancels the long-press timer and latches the mode): the
   vertical centroid travel accumulates until `WHEEL_STEP_DP`, then `UiBridge.dispatchWheel`, with
   `WHEEL_PIXELS_PER_UNIT` (8 device px) of travel per rotation unit. A **two-finger tap** — both
@@ -127,6 +136,11 @@ scale (§5) and handed to `UiBridge.dispatchMouse`.
   notch — is `BUTTON3` press + release: the second route to the context menu.
 - The lift of a two-finger gesture keeps two-finger mode until the last finger is up, so a surviving
   finger does not silently become the mouse.
+
+`JViewport` follows the desktop contract: the view's location is the negative `viewPosition` (JDK
+`JViewport.setViewPosition`), not a paint-time translation, so `Container.locate`,
+`Component.getLocationOnScreen` and every stage-coordinate path follow the scroll. A tap on a
+scrolled panel therefore resolves to the row under the finger.
 
 ## 4. Virtual windows, popups and input blocking
 
@@ -142,6 +156,12 @@ plugin dialogs and modal option panes; RuneLite's config colour picker is a `JDi
   clamped to 1..3 (`REFERENCE_WIDTH`/`REFERENCE_HEIGHT` = 410/380, `SCREEN_FRACTION` = 0.9), so a
   dialog never renders larger than the drawer and always leaves a tenth of the screen free on each
   side. The chosen geometry is published to the core with `UiBridge.setWindowBounds`.
+- **A window shows on its first `setVisible(true)`.** `Component` defaults to visible and a fresh
+  `Window` does not start hidden the way the JDK's does, so `Window.setVisible(true)` has to treat the
+  "already flagged visible, not yet in `OPEN_WINDOWS`" case as the show — it fires the open/activate
+  events, lays the window out and puts it in `OPEN_WINDOWS`, which is what `topMostWindow()` (and so
+  `hasVisibleWindow()`) reads. Registering without that list entry left the window registered but
+  invisible, which is how the config colour picker "opened" and never appeared.
 - **It is the modality gate.** While a window is up, `UiBridge.dispatchMouse`/`dispatchWheel` route
   every event to the window layer, and the layer's `onTouchEvent` consumes everything (it returns
   `true` for every action), so neither the game nor the drawer sees the gesture: a modal dialog cannot

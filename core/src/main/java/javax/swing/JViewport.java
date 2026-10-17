@@ -2,7 +2,6 @@ package javax.swing;
 
 import java.awt.Component;
 import java.awt.Dimension;
-import java.awt.Graphics;
 import java.awt.Insets;
 import java.awt.Point;
 import java.awt.Rectangle;
@@ -16,10 +15,11 @@ import javax.swing.event.ChangeListener;
  * Swing {@code JViewport}: the scrolling window a {@link JScrollPane} puts its view in.
  *
  * <p>The view's position is {@code viewPosition} (the top-left corner of the view that is
- * shown); the view is translated by {@code -viewPosition} when painted and clipped to the
- * viewport's extent. A non-{@link Scrollable} view is stretched to at least the extent on
- * each axis — this is what makes a plugin panel fill the sidebar width — while a
- * {@code Scrollable} view decides for itself.
+ * shown); the view's location is the negative of {@code viewPosition} (the JDK's
+ * {@code JViewport.setViewPosition}), so hit testing and stage coordinates follow the
+ * scroll; the viewport's clip keeps the off-view part invisible. A non-{@link Scrollable}
+ * view is stretched to at least the extent on each axis — this is what makes a plugin
+ * panel fill the sidebar width — while a {@code Scrollable} view decides for itself.
  */
 public class JViewport extends JComponent implements javax.accessibility.Accessible {
     /** Name of the "view position changed" change event property. */
@@ -67,6 +67,9 @@ public class JViewport extends JComponent implements javax.accessibility.Accessi
         if (view != null) {
             add(view);
             view.addComponentListener(viewListener);
+            // The position survives a view swap, and the view's location *is* the negative
+            // position (JDK contract), so the new view starts where the viewport says.
+            view.setLocation(-viewPosition.x, -viewPosition.y);
         }
         firePropertyChange(VIEW_CHANGED_PROPERTY, null, view);
         revalidate();
@@ -88,6 +91,10 @@ public class JViewport extends JComponent implements javax.accessibility.Accessi
             viewPosition.setLocation(clamped);
         }
         if (!old.equals(viewPosition)) {
+            // The view scrolls opposite to the view position (JDK behaviour). This -- not a
+            // paint-time translate -- is what puts the scroll into the coordinate space that
+            // hit testing and stage coordinates are computed in.
+            view.setLocation(-viewPosition.x, -viewPosition.y);
             fireStateChanged();
             repaint();
         }
@@ -146,9 +153,19 @@ public class JViewport extends JComponent implements javax.accessibility.Accessi
         return new Point(p);
     }
 
-    /** Scrolls so the given rectangle (in view coordinates) is visible. */
+    /**
+     * Scrolls so the given rectangle is visible. The rectangle is in <em>viewport</em>
+     * coordinates (the JDK's {@code JComponent.scrollRectToVisible} contract: it adds the view's
+     * own location, which is the negative scroll offset); the scrolling maths works in view
+     * coordinates.
+     */
     public void scrollRectToVisible(Rectangle contentRect) {
-        scrollToVisible(contentRect);
+        if (contentRect == null) {
+            return;
+        }
+        Rectangle viewRect = new Rectangle(contentRect);
+        viewRect.translate(viewPosition.x, viewPosition.y);
+        scrollToVisible(viewRect);
     }
 
     public void scrollToVisible(Rectangle contentRect) {
@@ -190,19 +207,6 @@ public class JViewport extends JComponent implements javax.accessibility.Accessi
 
     public boolean getScrollMode() {
         return scrollMode;
-    }
-
-    @Override
-    protected void paintChildren(Graphics g) {
-        Component v = view;
-        if (v == null || !v.isVisible()) {
-            return;
-        }
-        Point p = getViewPosition();
-        Graphics gc = g.create();
-        gc.translate(-p.x, -p.y);
-        v.paint(gc);
-        gc.dispose();
     }
 
     public void addChangeListener(ChangeListener listener) {
@@ -302,9 +306,11 @@ public class JViewport extends JComponent implements javax.accessibility.Accessi
                 w = Math.max(w, extent.width);
                 h = Math.max(h, extent.height);
             }
-            view.setBounds(0, 0, Math.max(0, w), Math.max(0, h));
-            // Reposition: the view may have shrunk, so the old position can be stale.
+            // Re-clamp first (the view may have shrunk, so the old position can be stale) and
+            // then place the view: its origin has to follow whichever position survives.
             viewport.setViewPosition(viewport.getViewPosition());
+            Point vp = viewport.getViewPosition();
+            view.setBounds(-vp.x, -vp.y, Math.max(0, w), Math.max(0, h));
         }
     }
 }

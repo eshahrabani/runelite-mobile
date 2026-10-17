@@ -97,7 +97,12 @@ underneath.
 - Mouse/key events are dispatched to the deepest visible component (`UiBridge` hit-tests the
   tree, popups first) and **bubble to the parent while unconsumed, for `JComponent` targets
   only** — the game client's heavyweight components stay the single recipient of their events.
-- ENTERED/EXITED are synthesized as the pointer moves (rollover, button hover).
+  `MOUSE_ENTERED`/`MOUSE_EXITED` are the exception: they are chain events, so they never bubble
+  (a bubble calls an ancestor's `mouseEntered` once per descendant under the pointer; the world
+  switcher's rows brightened once per pointer entry that way).
+- ENTERED/EXITED are synthesized as the pointer moves (rollover, button hover): `UiBridge`
+  leaves every component below the common ancestor of the old and the new target and enters the
+  new chain below that ancestor (the JDK's `LightweightDispatcher` rule).
 - `KeyboardFocusManager` holds the focus owner; a tap on a focusable component focuses it, text
   components fire `Host.textInputRequested`, and `UiBridge.focusOwnerIsTextInput()` is what makes
   `MainActivity` route the keyboard bar's keys into Swing (`UiBridge.dispatchKey`) instead of the
@@ -140,10 +145,10 @@ sets it.
 
 ## 7. Self-tests
 
-`SwingSelfTest` (app dex) runs 22 named cases on the Swing thread from
+`SwingSelfTest` (app dex) runs 26 named cases on the Swing thread from
 `RuneLiteHost.startPlugins`, right after `GraphicsSelfTest`. `GraphicsSelfTest` logs
 `GFX SELFTEST PASS` / `GFX SELFTEST FAIL <case>`; `SwingSelfTest` logs one line per case plus
-`SWING SELFTEST PASS (22 cases)` / `SWING SELFTEST FAIL <case>: <detail>`. A failure is appended to
+`SWING SELFTEST PASS (26 cases)` / `SWING SELFTEST FAIL <case>: <detail>`. A failure is appended to
 `status` as `gfx self-test FAIL: <detail>` or `swing self-test FAIL: <detail>` (shown in the
 launcher's Host section). The cases cover the paint pipeline, each layout manager the shell uses,
 the widget set, popups, the modal dialog's nested loop, the UI scale and the theme. The `optionpane`

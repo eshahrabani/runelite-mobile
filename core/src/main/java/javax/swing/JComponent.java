@@ -576,43 +576,56 @@ public abstract class JComponent extends java.awt.Container
     }
 
     /**
-     * The part of this component that is inside its enclosing viewport (the JDK's
-     * {@code getVisibleRect}); a component outside any viewport is fully visible.
+     * The part of this component that is inside its enclosing window (the JDK's
+     * {@code getVisibleRect}); a component outside any window is fully visible.
      */
     public java.awt.Rectangle getVisibleRect() {
-        java.awt.Rectangle rect = new java.awt.Rectangle(0, 0, getWidth(), getHeight());
+        java.awt.Rectangle rect = new java.awt.Rectangle();
         computeVisibleRect(rect);
         return rect;
     }
 
     public void computeVisibleRect(java.awt.Rectangle visibleRect) {
-        java.awt.Component child = this;
-        for (java.awt.Component p = getParent(); p != null; p = p.getParent()) {
-            if (p instanceof JViewport) {
-                JViewport viewport = (JViewport) p;
-                java.awt.Rectangle visible = viewport.getViewRect();
-                visible.translate(-child.getX(), -child.getY());
-                java.awt.Rectangle own = new java.awt.Rectangle(0, 0, getWidth(), getHeight());
-                visibleRect.setBounds(visible.intersection(own));
-                return;
-            }
-            child = p;
-        }
-        visibleRect.setBounds(0, 0, getWidth(), getHeight());
+        computeVisibleRect(this, visibleRect);
     }
 
-    /** Asks the enclosing viewport to scroll the rectangle into view. */
+    /**
+     * The JDK's walk: intersect every ancestor's bounds and translate into this component's
+     * own space. A scrolled view needs no special case -- its location is the negative scroll
+     * offset (see {@code JViewport.setViewPosition}), which is exactly that translation.
+     */
+    private static void computeVisibleRect(java.awt.Component c, java.awt.Rectangle visibleRect) {
+        java.awt.Rectangle bounds = c.getBounds();
+        java.awt.Container parent = c.getParent();
+        if (parent == null || parent instanceof java.awt.Window) {
+            visibleRect.setBounds(0, 0, bounds.width, bounds.height);
+            return;
+        }
+        computeVisibleRect(parent, visibleRect);
+        visibleRect.x -= bounds.x;
+        visibleRect.y -= bounds.y;
+        visibleRect.setBounds(visibleRect.intersection(
+            new java.awt.Rectangle(0, 0, bounds.width, bounds.height)));
+    }
+
+    /** Asks the enclosing viewport to scroll the rectangle into view (the JDK's walk). */
     public void scrollRectToVisible(java.awt.Rectangle aRect) {
-        java.awt.Component child = this;
-        for (java.awt.Component p = getParent(); p != null; p = p.getParent()) {
-            if (p instanceof JViewport) {
-                JViewport viewport = (JViewport) p;
-                java.awt.Rectangle target = new java.awt.Rectangle(aRect);
-                target.translate(-child.getX(), -child.getY());
-                viewport.scrollToVisible(target);
-                return;
-            }
-            child = p;
+        int dx = getX();
+        int dy = getY();
+        java.awt.Container parent;
+        for (parent = getParent();
+             parent != null && !(parent instanceof JComponent);
+             parent = parent.getParent()) {
+            java.awt.Rectangle bounds = parent.getBounds();
+            dx += bounds.x;
+            dy += bounds.y;
+        }
+        if (parent instanceof JComponent) {
+            aRect.x += dx;
+            aRect.y += dy;
+            ((JComponent) parent).scrollRectToVisible(aRect);
+            aRect.x -= dx;
+            aRect.y -= dy;
         }
     }
 

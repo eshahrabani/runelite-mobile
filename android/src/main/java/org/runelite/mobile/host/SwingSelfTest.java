@@ -2,6 +2,7 @@ package org.runelite.mobile.host;
 
 import android.util.Log;
 
+import org.runelite.mobile.SwingSidebarView;
 import org.runelite.mobile.bridge.AWTBridge;
 import org.runelite.mobile.bridge.PopupLayer;
 import org.runelite.mobile.bridge.SwingEdt;
@@ -15,6 +16,7 @@ import java.awt.Dimension;
 import java.awt.Graphics2D;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
+import java.awt.Image;
 import java.awt.Point;
 import java.awt.Rectangle;
 import java.awt.Window;
@@ -94,6 +96,7 @@ public final class SwingSelfTest {
         CASES.put("tabbedpane", SwingSelfTest::tabbedPane);
         CASES.put("scrollpane", SwingSelfTest::scrollPane);
         CASES.put("viewport_stretch", SwingSelfTest::viewportStretch);
+        CASES.put("viewport_scroll_coords", SwingSelfTest::viewportScrollCoords);
         CASES.put("textfield", SwingSelfTest::textField);
         CASES.put("documentfilter", SwingSelfTest::documentFilter);
         CASES.put("spinner", SwingSelfTest::spinner);
@@ -104,6 +107,9 @@ public final class SwingSelfTest {
         CASES.put("scale", SwingSelfTest::scale);
         CASES.put("html_editorpane", SwingSelfTest::htmlEditorPane);
         CASES.put("theme", SwingSelfTest::theme);
+        CASES.put("tap_click_count", SwingSelfTest::tapClickCount);
+        CASES.put("hover_chain", SwingSelfTest::hoverChain);
+        CASES.put("alpha_stage_blit", SwingSelfTest::alphaStageBlit);
     }
 
     private SwingSelfTest() {
@@ -351,6 +357,34 @@ public final class SwingSelfTest {
         scroll.setSize(200, 100);
         scroll.validate();
         require(content.getWidth() == 200, "view width " + content.getWidth() + " != extent 200");
+    }
+
+    /**
+     * A scrolled viewport has to move the view: touches arrive as stage coordinates, so a
+     * viewport that only translated while painting sent every tap to the row that would have
+     * been there unscrolled (the plugin list, a config panel and the world switcher all broke
+     * this way).
+     */
+    private static void viewportScrollCoords() throws Throwable {
+        JPanel content = new JPanel(null);
+        content.setPreferredSize(new Dimension(100, 1000));
+        JLabel first = new JLabel("first");
+        first.setBounds(0, 0, 100, 100);
+        JLabel second = new JLabel("second");
+        second.setBounds(0, 100, 100, 100);
+        content.add(first);
+        content.add(second);
+        JScrollPane scroll = new JScrollPane(content);
+        scroll.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_NEVER);
+        scroll.setSize(120, 100);
+        scroll.validate();
+
+        scroll.getViewport().setViewPosition(new Point(0, 100));
+        int viewportY = scroll.getViewport().getLocationOnScreen().y;
+        require(content.getLocationOnScreen().y == viewportY - 100,
+            "scrolled view origin " + content.getLocationOnScreen().y + ", expected " + (viewportY - 100));
+        Component hit = scroll.getComponentAt(5, 5);
+        require(hit == second, "tap at (5,5) resolved to " + hit + ", expected the second row");
     }
 
     private static void textField() throws Throwable {
@@ -670,6 +704,76 @@ public final class SwingSelfTest {
         Color background = UIManager.getColor("Panel.background");
         require(background != null, "Panel.background is null");
         require(background.getRGB() == 0xFF282828, "Panel.background is " + background);
+    }
+
+    private static void tapClickCount() throws Throwable {
+        float slop = 24f;
+        require(SwingSidebarView.tapClickCount(1000L, 10f, 10f, 0L, 0f, 0f, slop) == 1,
+            "a tap with no previous tap is not a double click");
+        require(SwingSidebarView.tapClickCount(1300L, 10f, 10f, 1000L, 10f, 10f, slop) == 2,
+            "a tap 300 ms after the previous one must be a double click");
+        require(SwingSidebarView.tapClickCount(1400L, 10f, 10f, 1000L, 10f, 10f, slop) == 1,
+            "a tap after the 350 ms double-click window is a single click");
+        require(SwingSidebarView.tapClickCount(1300L, 40f, 10f, 1000L, 10f, 10f, slop) == 1,
+            "a tap 30 px away is not part of the double click");
+    }
+
+    /**
+     * Hover is a chain event: ENTERED/EXITED are delivered to every component that enters or
+     * leaves ({@code UiBridge.updateHover} walks the chain), so they must not bubble to the
+     * parent — a bubble calls an ancestor's {@code mouseEntered} once per descendant under the
+     * pointer, which is what brightened the world switcher's rows once per pointer entry
+     * (their {@code lastBackground} was overwritten by each extra enter).
+     */
+    private static void hoverChain() throws Throwable {
+        JPanel panel = new JPanel(null);
+        panel.setSize(200, 100);
+        JLabel child = new JLabel("x");
+        child.setBounds(10, 10, 50, 20);
+        panel.add(child);
+        AtomicInteger parentEnters = new AtomicInteger();
+        AtomicInteger childEnters = new AtomicInteger();
+        panel.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                parentEnters.incrementAndGet();
+            }
+        });
+        child.addMouseListener(new java.awt.event.MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                childEnters.incrementAndGet();
+            }
+        });
+        child.dispatchEvent(new MouseEvent(child, MouseEvent.MOUSE_ENTERED,
+            System.currentTimeMillis(), 0, 1, 1, 0, false, MouseEvent.NOBUTTON));
+        require(childEnters.get() == 1, "the child got " + childEnters.get() + " enters");
+        require(parentEnters.get() == 0, "a child's MOUSE_ENTERED bubbled to the parent");
+    }
+
+    /**
+     * The window layer's stage carries alpha (its surround must stay transparent), so an
+     * opaque source drawn into it has to write alpha 255. A verbatim copy left the window's
+     * pixels transparent, which is how the colour picker's colour square ended up showing the
+     * game behind it. The opaque sidebar stage keeps the opposite invariant: a no-alpha
+     * source's alpha-0 pixels are copied verbatim (the frame blit the game relies on).
+     */
+    private static void alphaStageBlit() throws Throwable {
+        int[] src = new int[8 * 8];
+        java.util.Arrays.fill(src, 0xFF00FF00);
+        int[] stagePixels = new int[8 * 8];
+        Image stage = new Image(stagePixels, 8, 8);
+        stage.hasAlpha = true;
+        stage.getGraphics().drawImage(new Image(src, 8, 8), 0, 0, null);
+        require(stagePixels[0] == 0xFF00FF00,
+            "alpha stage blit wrote " + Integer.toHexString(stagePixels[0]));
+
+        int[] frame = new int[8 * 8];
+        int[] frameSrc = new int[8 * 8];
+        frameSrc[0] = 0x00123456; // alpha 0: the rasteriser's ground pixels look like this
+        new Image(frame, 8, 8).getGraphics().drawImage(new Image(frameSrc, 8, 8), 0, 0, null);
+        require(frame[0] == 0x00123456,
+            "opaque stage blit changed the alpha byte: " + Integer.toHexString(frame[0]));
     }
 
     // ------------------------------------------------------------------ helpers

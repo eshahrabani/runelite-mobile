@@ -916,11 +916,14 @@ public class Graphics {
             return;
         }
 
-        if (!srcHasAlpha && !flipX && !flipY
+        if (!srcHasAlpha && !flipX && !flipY && !destHasAlpha
                 && w == srcWidth && h == srcHeight && compositeIsSourceCopy()) {
             // 1:1 copy — the game's every-frame path (drawImage(img, 0, 0, null)
             // with the source already at the display size). One System.arraycopy
             // per row, a native runtime call even while the class is interpreted.
+            // Opaque stages only: on a stage that carries alpha (the window layer) the
+            // source's alpha byte has to be written as opaque, which needs the per-pixel
+            // path below (a verbatim copy left the window's pixels transparent).
             int copyW = px1 - px0;
             for (int dy = py0; dy < py1; dy++) {
                 System.arraycopy(srcPixels, (dy - y) * srcWidth + (px0 - x),
@@ -976,8 +979,12 @@ public class Graphics {
                 int idx = destRow + i;
                 // A source without an alpha channel is opaque (the JDK contract),
                 // so its alpha byte — 0 for the rasteriser's ground pixels — must
-                // not be read as transparency when blending.
-                destPixels[idx] = copy ? argb
+                // not be read as transparency when blending. On a stage that carries
+                // alpha (the window layer) the same rule means the byte has to be
+                // *written* opaque: a verbatim copy would leave the window's pixels
+                // transparent and the game would show through.
+                destPixels[idx] = copy
+                        ? (destHasAlpha ? (argb | 0xFF000000) : argb)
                         : blendPixel(destPixels[idx], srcHasAlpha ? argb : (argb | 0xFF000000));
                 acc += srcWidth;
                 while (acc >= w) {
@@ -1058,7 +1065,8 @@ public class Graphics {
                         ? sampleBilinear(srcPixels, srcWidth, srcHeight, sxf - 0.5, syf - 0.5)
                         : srcPixels[(int) syf * srcWidth + (int) sxf];
                 int idx = row + dx;
-                destPixels[idx] = copy ? argb
+                destPixels[idx] = copy
+                        ? (destHasAlpha ? (argb | 0xFF000000) : argb)
                         : blendPixel(destPixels[idx], srcHasAlpha ? argb : (argb | 0xFF000000));
             }
         }

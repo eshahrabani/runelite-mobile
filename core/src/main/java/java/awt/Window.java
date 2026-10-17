@@ -161,26 +161,19 @@ public class Window extends Container implements RootPaneContainer {
     @Override
     public void setVisible(boolean visible) {
         if (this.visible == visible) {
-            // Still make sure the window layer knows about it (first show of a window
-            // created visible by a subclass before registration).
+            // The window was already flagged visible before its first setVisible(true)
+            // (Component defaults to visible; a fresh Window does not start hidden the way
+            // the JDK's does). That first call is the show: without the OPEN_WINDOWS entry
+            // below, the window was registered but never became the top-most window the app
+            // presents -- the config colour picker opened and never appeared.
             if (visible && !OPEN_WINDOWS.contains(this)) {
-                register();
+                show();
             }
             return;
         }
         super.setVisible(visible);
         if (visible) {
-            valid = false;
-            validate();
-            fireWindowEvent(WindowEvent.WINDOW_OPENED);
-            fireWindowEvent(WindowEvent.WINDOW_ACTIVATED);
-            List<Window> open = OPEN_WINDOWS;
-            synchronized (open) {
-                open.remove(this);
-                open.add(this);
-            }
-            register();
-            requestFocusIfPossible();
+            show();
         } else {
             fireWindowEvent(WindowEvent.WINDOW_DEACTIVATED);
             fireWindowEvent(WindowEvent.WINDOW_CLOSING);
@@ -189,6 +182,21 @@ public class Window extends Container implements RootPaneContainer {
             }
             org.runelite.mobile.bridge.UiBridge.windowDirty();
         }
+    }
+
+    /** The show half of {@link #setVisible(boolean)}: layout, events, registration. */
+    private void show() {
+        valid = false;
+        validate();
+        fireWindowEvent(WindowEvent.WINDOW_OPENED);
+        fireWindowEvent(WindowEvent.WINDOW_ACTIVATED);
+        List<Window> open = OPEN_WINDOWS;
+        synchronized (open) {
+            open.remove(this);
+            open.add(this);
+        }
+        register();
+        requestFocusIfPossible();
     }
 
     private void register() {

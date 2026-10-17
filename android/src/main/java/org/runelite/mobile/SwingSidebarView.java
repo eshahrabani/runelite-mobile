@@ -32,11 +32,14 @@ import java.awt.event.MouseEvent;
  * drawn, so the drawer's runtime-status {@code TextView} placeholder stays visible.
  *
  * <p>Gestures (the same mapping the game surface uses, see {@code MainActivity}):
- * one finger is the mouse — press/drag/release plus a click on lift; a finger held for
- * {@value #LONG_PRESS_MS} ms is a right click (which is also how a Swing tooltip is
- * surfaced, as a {@code Toast}); two fingers are the wheel, and a two-finger tap is a
- * right click. Key events are fed in by {@code MainActivity} while a Swing text
- * component owns the focus.
+ * one finger is the mouse — the press is held back until the gesture is known, so a
+ * scroll or drag can never click what it started on: a tap sends press + release + click
+ * at the touch-down point, a drag sends the press there and streams the drag, and two
+ * taps within {@value #DOUBLE_TAP_MS} ms are a double click (Swing's
+ * {@code getClickCount() == 2}). A finger held for {@value #LONG_PRESS_MS} ms is a right
+ * click (which is also how a Swing tooltip is surfaced, as a {@code Toast}); two fingers
+ * are the wheel, and a two-finger tap is a right click. Key events are fed in by
+ * {@code MainActivity} while a Swing text component owns the focus.
  */
 @SuppressLint("ClickableViewAccessibility")
 public class SwingSidebarView extends View implements UiBridge.Host {
@@ -79,6 +82,10 @@ public class SwingSidebarView extends View implements UiBridge.Host {
     private static final float WHEEL_STEP_DP = 24f;
     /** Device pixels of two-finger travel per wheel rotation unit. */
     private static final float WHEEL_PIXELS_PER_UNIT = 8f;
+    /** Two taps within this long (and within {@link #DOUBLE_TAP_SLOP_DP}) are a double click. */
+    private static final long DOUBLE_TAP_MS = 350L;
+    /** How far apart the two taps of a double click may land. */
+    private static final float DOUBLE_TAP_SLOP_DP = 24f;
 
     private final Callback callback;
     private final Paint blit = new Paint();
@@ -114,12 +121,17 @@ public class SwingSidebarView extends View implements UiBridge.Host {
     private boolean twoFinger;
     /** The gesture started over a scrollable panel: a vertical drag scrolls it. */
     private boolean scrollGesture;
-    private boolean scrolled;
     private float lastScrollY;
     private boolean twoFingerTap;
     private boolean longPressFired;
     private float twoFingerLastY;
     private float wheelAccumPx;
+    /** The left button is down: a MOUSE_PRESSED was delivered for this gesture. */
+    private boolean pressSent;
+    /** When the last tap ended and where it went down, for double-click detection. */
+    private long lastTapMs;
+    private float lastTapX;
+    private float lastTapY;
     private final Runnable longPress = this::fireLongPress;
 
     public SwingSidebarView(Context context, Callback callback) {
@@ -351,13 +363,16 @@ public class SwingSidebarView extends View implements UiBridge.Host {
                 twoFingerLastY = 0f;
                 wheelAccumPx = 0f;
                 scrollGesture = UiBridge.isScrollableAt(logicalX(downX), logicalY(downY));
-                scrolled = false;
                 lastScrollY = downY;
+                pressSent = false;
                 postDelayed(longPress, LONG_PRESS_MS);
                 // A mouse always moves before it presses: Swing components pick their
                 // hover state (and menus the row under the pointer) from the move.
+                // The press itself is deferred: the client acts on mouse *down*, so an
+                // early press would activate what is under the finger before a scroll or
+                // long press could take the gesture over. ACTION_MOVE and ACTION_UP decide
+                // which gesture this is and send the press accordingly.
                 dispatchMouseAt(downX, downY, MouseEvent.MOUSE_MOVED, MouseEvent.NOBUTTON, 0);
-                dispatchMouseAt(downX, downY, MouseEvent.MOUSE_PRESSED, MouseEvent.BUTTON1, 1);
                 return true;
             }
             case MotionEvent.ACTION_POINTER_DOWN: {
@@ -365,6 +380,7 @@ public class SwingSidebarView extends View implements UiBridge.Host {
                 cancelLongPressTimer();
                 twoFinger = true;
                 twoFingerTap = !dragged && !longPressFired;
+                lastTapMs = 0L;
                 twoFingerLastY = centroidY(event);
                 wheelAccumPx = 0f;
                 return true;
@@ -384,7 +400,7 @@ public class SwingSidebarView extends View implements UiBridge.Host {
                     scrollByDrag(event.getY());
                     if (!dragged && Math.hypot(event.getX() - downX, event.getY() - downY) > slop) {
                         dragged = true;
-                        scrolled = true;
+                        lastTapMs = 0L;
                         cancelLongPressTimer();
                     }
                     return true;
@@ -392,10 +408,22 @@ public class SwingSidebarView extends View implements UiBridge.Host {
                 if (Math.hypot(event.getX() - downX, event.getY() - downY) > slop) {
                     if (!dragged) {
                         dragged = true;
+                        lastTapMs = 0L;
                         cancelLongPressTimer();
+                        if (!longPressFired) {
+                            // The gesture is a drag, not a tap: send the held-off press at the
+                            // touch-down point and let the drag stream follow it (sliders,
+                            // scroll-bar thumbs) -- what a desktop mouse sends. After a long
+                            // press (a right click) no left button is sent at all.
+                            pressSent = true;
+                            dispatchMouseAt(downX, downY, MouseEvent.MOUSE_PRESSED,
+                                MouseEvent.BUTTON1, 1);
+                        }
                     }
-                    dispatchMouseAt(event.getX(), event.getY(),
-                        MouseEvent.MOUSE_DRAGGED, MouseEvent.BUTTON1, 1);
+                    if (pressSent) {
+                        dispatchMouseAt(event.getX(), event.getY(), MouseEvent.MOUSE_DRAGGED,
+                            MouseEvent.BUTTON1, 1);
+                    }
                 }
                 return true;
             }
@@ -417,13 +445,24 @@ public class SwingSidebarView extends View implements UiBridge.Host {
                     // close the left press, but do not turn the lift into a click.
                     closeLeftPress();
                 } else if (pressed) {
-                    float x = event.getX();
-                    float y = event.getY();
-                    dispatchMouseAt(x, y, MouseEvent.MOUSE_RELEASED, MouseEvent.BUTTON1, 1);
-                    if (!scrolled) {
-                        // Scrolling must not click whatever the finger happened to be over
-                        // (it would toggle a plugin while flicking the list).
-                        dispatchMouseAt(x, y, MouseEvent.MOUSE_CLICKED, MouseEvent.BUTTON1, 1);
+                    if (!dragged) {
+                        // A tap: press, release and click all at the touch-down point, so the
+                        // whole gesture acts on what the finger went down on (a list row, a tab,
+                        // a button) and not on whatever it drifted over. The click count makes a
+                        // quick second tap a double click (Swing's `getClickCount() == 2`).
+                        int count = nextTapClickCount(downX, downY);
+                        pressSent = true;
+                        dispatchMouseAt(downX, downY, MouseEvent.MOUSE_PRESSED, MouseEvent.BUTTON1,
+                            count);
+                        dispatchMouseAt(downX, downY, MouseEvent.MOUSE_RELEASED, MouseEvent.BUTTON1,
+                            count);
+                        dispatchMouseAt(downX, downY, MouseEvent.MOUSE_CLICKED, MouseEvent.BUTTON1,
+                            count);
+                    } else if (pressSent) {
+                        // The drag delivered the press: close it where the finger is. A
+                        // scrolled gesture sent no press, so it sends nothing here either.
+                        dispatchMouseAt(event.getX(), event.getY(), MouseEvent.MOUSE_RELEASED,
+                            MouseEvent.BUTTON1, 1);
                     }
                 }
                 resetGesture();
@@ -497,6 +536,7 @@ public class SwingSidebarView extends View implements UiBridge.Host {
             return;
         }
         longPressFired = true;
+        lastTapMs = 0L;
         int x = logicalX(downX);
         int y = logicalY(downY);
         dispatchMouseAt(downX, downY, MouseEvent.MOUSE_PRESSED, MouseEvent.BUTTON3, 1);
@@ -510,19 +550,44 @@ public class SwingSidebarView extends View implements UiBridge.Host {
 
     /** Releases the left button if a press is still open, without a click. */
     private void closeLeftPress() {
-        if (pressed) {
+        if (pressed && pressSent) {
             dispatchMouseAt(downX, downY, MouseEvent.MOUSE_RELEASED, MouseEvent.BUTTON1, 1);
         }
     }
 
+    /**
+     * The click count for a tap that ended at {@code (x, y)} now: 2 when it followed a tap
+     * within {@link #DOUBLE_TAP_MS} and {@link #DOUBLE_TAP_SLOP_DP}, else 1. Swing acts on a
+     * double click through {@code MouseEvent.getClickCount()} (RuneLite's world switcher hops on
+     * {@code == 2}), so a double tap has to carry the count. Public for {@code SwingSelfTest}.
+     */
+    public static int tapClickCount(long now, float x, float y, long lastTapMs, float lastTapX,
+                                    float lastTapY, float slopPx) {
+        if (lastTapMs <= 0L || now - lastTapMs > DOUBLE_TAP_MS) {
+            return 1;
+        }
+        return Math.hypot(x - lastTapX, y - lastTapY) <= slopPx ? 2 : 1;
+    }
+
+    /** Records this tap and returns its click count; a triple tap starts a new pair. */
+    private int nextTapClickCount(float x, float y) {
+        long now = System.currentTimeMillis();
+        int count = tapClickCount(now, x, y, lastTapMs, lastTapX, lastTapY,
+            DOUBLE_TAP_SLOP_DP * density);
+        lastTapMs = count == 2 ? 0L : now;
+        lastTapX = x;
+        lastTapY = y;
+        return count;
+    }
+
     private void resetGesture() {
         scrollGesture = false;
-        scrolled = false;
         pressed = false;
         dragged = false;
         twoFinger = false;
         twoFingerTap = false;
         longPressFired = false;
+        pressSent = false;
         wheelAccumPx = 0f;
     }
 

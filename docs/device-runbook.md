@@ -185,7 +185,7 @@ adb logcat -s RuneLiteMobile RuneLiteHost MobilePluginHub
 
 At boot, look for `Client dex AOT: …` (or the `Client dex is NOT AOT-compiled: …` warning,
 `MainActivity`), `Pre-registered game dex classloader for ART dexopt` (`MainActivity`), and, once
-the host starts, `GFX SELFTEST PASS` / `SWING SELFTEST PASS (22 cases)` (or the failing case).
+the host starts, `GFX SELFTEST PASS` / `SWING SELFTEST PASS (26 cases)` (or the failing case).
 Field-by-field interpretation of `callbacks.draw` and `GameState` lines is in
 [diagnostics.md](diagnostics.md).
 

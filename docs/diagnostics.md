@@ -153,7 +153,7 @@ See [core-stubs.md](core-stubs.md) for the graphics semantics these cases encode
 `host/SwingSelfTest.java` (app dex) runs **22** named cases on the Swing dispatch
 thread and covers the paint pipeline, every layout manager the shell uses, the widget
 set, popups, the modal dialog's nested loop, the UI scale and the theme. It logs one
-line per case (`SWING SELFTEST case <name>`), a final `SWING SELFTEST PASS (22 cases)`,
+line per case (`SWING SELFTEST case <name>`), a final `SWING SELFTEST PASS (26 cases)`,
 or `SWING SELFTEST FAIL <name>: <class>: <message>` on the first failure. The `optionpane`
 case puts a modal dialog on screen, so the boot run skips it — logging
 `SWING SELFTEST case optionpane skipped at boot (on-screen case)` — and only

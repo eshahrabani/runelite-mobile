@@ -494,7 +494,7 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
      `logicalSize × scale` (the `SwingSelfTest` `scale` case asserts exactly that — it was
      a real bug: icons scaled through `drawImage` while glyphs stayed logical). Every new
      widget must measure logically.
-  `SwingSelfTest` (app dex, 22 cases) runs at boot right after `GraphicsSelfTest` and logs
+  `SwingSelfTest` (app dex, 26 cases) runs at boot right after `GraphicsSelfTest` and logs
   `SWING SELFTEST PASS` / `FAIL <case>: <detail>`; a failure is appended to `RuneLiteHost.status`
   by `startPlugins` (a pass is logcat-only) and is therefore visible in the launcher's Host section. The `optionpane` case puts a dialog on
   screen, so the boot run skips it — and the conformance pass does **not** run the on-screen

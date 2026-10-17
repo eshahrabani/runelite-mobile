@@ -375,6 +375,23 @@ public final class UiBridge {
         return windowScale;
     }
 
+    /**
+     * A graphics context over a stage buffer. The window layer's bitmap carries alpha (its
+     * surround must stay transparent), so painting into it is alpha-aware: an opaque fill
+     * <em>sets</em> the alpha byte. The sidebar's stage is opaque, so its fills keep the frame
+     * invariant that the destination alpha byte is preserved (the game frame is built from
+     * pixels whose alpha is 0 and must stay 0 -- a blending blit would otherwise leave the
+     * previous frame on screen).
+     */
+    private static java.awt.Graphics2D stageGraphics(int[] pixels, int w, int h, boolean alpha) {
+        if (!alpha) {
+            return new java.awt.Graphics2D(pixels, w, h);
+        }
+        java.awt.Image image = new java.awt.Image(pixels, w, h);
+        image.hasAlpha = true;
+        return (java.awt.Graphics2D) image.getGraphics();
+    }
+
     /** Paints the top-most window (title bar, content, popups); dispatch thread only. */
     public static void paintWindow(final int[] argb, final int deviceW, final int deviceH) {
         if (argb == null || deviceW <= 0 || deviceH <= 0) {
@@ -396,7 +413,7 @@ public final class UiBridge {
         }
         int cw = Math.max(1, w.getWidth());
         int ch = Math.max(1, w.getHeight());
-        java.awt.Graphics2D g = new java.awt.Graphics2D(argb, deviceW, deviceH);
+        java.awt.Graphics2D g = stageGraphics(argb, deviceW, deviceH, true);
         g.scale(windowScale, windowScale);
         g.clipRect(0, 0, cw, ch + WINDOW_TITLE_HEIGHT);
         // Frame background, then the content, then the title bar on top.
@@ -475,7 +492,7 @@ public final class UiBridge {
             return;
         }
         Point origin = c.getLocationOnScreen();
-        java.awt.Graphics2D g = new java.awt.Graphics2D(stagePixels, stageWidth, stageHeight);
+        java.awt.Graphics2D g = stageGraphics(stagePixels, stageWidth, stageHeight, stageIsWindow);
         g.scale(stageScale, stageScale);
         g.clipRect(origin.x + x, origin.y + y, w, h);
         java.awt.Graphics2D gc = (java.awt.Graphics2D) g.create();
@@ -647,13 +664,17 @@ public final class UiBridge {
         }
         Component old = hoverTarget;
         hoverTarget = target;
-        if (old != null && inChain(target, old) == false) {
-            for (Component c = old; c != null && !inChain(target, c); c = c.getParent()) {
-                dispatchEnterExit(c, MouseEvent.MOUSE_EXITED, when, modifiers);
-            }
+        // AWT's rule: the pointer leaves every component below the common ancestor of the old
+        // and the new target and enters the new chain below that ancestor. Comparing both
+        // chains matters -- a walk that only asks "is the old target an ancestor of this
+        // component" re-enters an ancestor that never left, and a component that brightens on
+        // mouseEntered (a world row) then brightens once per pointer event.
+        Component common = commonAncestor(old, target);
+        for (Component c = old; c != null && c != common; c = c.getParent()) {
+            dispatchEnterExit(c, MouseEvent.MOUSE_EXITED, when, modifiers);
         }
         List<Component> entered = new ArrayList<>();
-        for (Component c = target; c != null && !inChain(old, c); c = c.getParent()) {
+        for (Component c = target; c != null && c != common; c = c.getParent()) {
             entered.add(c);
         }
         for (int i = entered.size() - 1; i >= 0; i--) {
@@ -661,16 +682,16 @@ public final class UiBridge {
         }
     }
 
-    private static boolean inChain(Component maybeAncestor, Component c) {
-        if (maybeAncestor == null || c == null) {
-            return false;
-        }
-        for (Component p = c; p != null; p = p.getParent()) {
-            if (p == maybeAncestor) {
-                return true;
+    /** The deepest component that is an ancestor-or-self of both (null when unrelated). */
+    private static Component commonAncestor(Component a, Component b) {
+        for (Component x = a; x != null; x = x.getParent()) {
+            for (Component y = b; y != null; y = y.getParent()) {
+                if (x == y) {
+                    return x;
+                }
             }
         }
-        return false;
+        return null;
     }
 
     private static void dispatchEnterExit(Component c, int id, long when, int modifiers) {

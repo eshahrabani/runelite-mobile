@@ -40,6 +40,8 @@ import java.util.List;
  * <p>Mouse/key events bubble up the tree the way lightweight AWT components do, but only
  * for {@code JComponent} targets: the game's heavyweight components stay the single
  * recipient of their events (bubbling them would deliver one tap to two listeners).
+ * {@code MOUSE_ENTERED}/{@code MOUSE_EXITED} never bubble: they are chain events that
+ * {@code UiBridge.updateHover} already delivers to every component that enters or leaves.
  */
 public class Component implements Serializable {
     /**
@@ -214,7 +216,11 @@ public class Component implements Serializable {
     }
 
     private void onMoved(int oldX, int oldY) {
-        invalidate();
+        // A move changes no layout -- the JDK's Component.setLocation does not invalidate
+        // either. Invalidating here made every JViewport.setViewPosition (i.e. every wheel
+        // notch of a scroll, and every tap's hit-test follow-up) mark the whole sidebar
+        // invalid, so the next paint re-laid-out the entire tree (Container.validateTree
+        // calls doLayout on every container unconditionally): scrolling a panel crawled.
         fireComponentEvent(ComponentEvent.COMPONENT_MOVED);
         if (parent != null) {
             parent.repaint();
@@ -577,6 +583,13 @@ public class Component implements Serializable {
     /**
      * Dispatches an event to this component, bubbling it to the parent when the target is
      * a lightweight Swing component and nothing consumed it (AWT's lightweight semantics).
+     *
+     * <p>{@code MOUSE_ENTERED}/{@code MOUSE_EXITED} never bubble: AWT delivers hover to the
+     * whole component chain itself (the port's {@code UiBridge.updateHover} walks it), so a
+     * bubble would call an ancestor's {@code mouseEntered} once per descendant under the
+     * pointer — RuneLite's world switcher rows brightened once per pointer entry that way
+     * ({@code lastBackground} is overwritten by each extra enter, so the row never came back
+     * to its real background).
      */
     public void dispatchEvent(AWTEvent e) {
         if (e == null) {
@@ -586,8 +599,10 @@ public class Component implements Serializable {
         if (e.isConsumed() || parent == null) {
             return;
         }
+        int id = e.getID();
         boolean bubblable = (e instanceof MouseEvent || e instanceof KeyEvent)
-                && this instanceof javax.swing.JComponent;
+                && this instanceof javax.swing.JComponent
+                && id != MouseEvent.MOUSE_ENTERED && id != MouseEvent.MOUSE_EXITED;
         if (bubblable) {
             parent.dispatchEvent(e);
         }
