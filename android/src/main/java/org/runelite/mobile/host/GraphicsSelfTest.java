@@ -23,7 +23,7 @@ import java.io.InputStream;
  *
  * <p>Run once from {@link RuneLiteHost} at startup: the result is a single logcat line,
  * {@code GFX SELFTEST PASS} or {@code GFX SELFTEST FAIL <case>}, and the same string is
- * exposed for the side panel's Host tab.
+ * exposed in the launcher's Host section.
  */
 public final class GraphicsSelfTest {
 

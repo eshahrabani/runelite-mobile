@@ -4,8 +4,8 @@
 **Read this when:** you touch `core/src/main/java/{java,javax}/**`, `hostshims/**`, the drawer
 (`SidePanel`), `SwingSidebarView`/`SwingWindowLayer`, or you debug a plugin panel that does not
 paint or does not react.
-**Verified against:** `core/src/main/java/org/runelite/mobile/bridge/{SwingEdt,UiBridge,PopupLayer}.java`,
-`core/src/main/java/java/awt/Component.java`, `core/src/main/java/javax/swing/JComponent.java`,
+**Verified against:** `core/src/main/java/org/runelite/mobile/bridge/{SwingEdt,AWTBridge,UiBridge,PopupLayer,TextBridge}.java`,
+`core/src/main/java/java/awt/Component.java`, `core/src/main/java/javax/swing/{JComponent,UiScale}.java`,
 `hostshims/src/net/runelite/client/ui/ClientUI.java`,
 `android/src/main/java/org/runelite/mobile/{SwingSidebarView,SwingWindowLayer}.java`,
 `android/src/main/java/org/runelite/mobile/host/SwingSelfTest.java`
@@ -33,7 +33,7 @@ with a `LinkedBlockingDeque<Runnable>`:
 - `pumpUntil` is a *nested* dispatch loop: while `JOptionPane.showConfirmDialog` blocks the
   Swing thread, queued tasks (the tap that clicks OK, an incoming sidebar repaint) are still
   dispatched. `EventQueue.createSecondaryLoop().enter()` drains the same queue
-  (`SwingUtil.pumpPendingEvents`).
+  (via `SwingEdt.dispatchQueued()`).
 - An exception in a queued task is printed and swallowed; the thread survives it, like the
   desktop EDT does.
 
@@ -41,7 +41,8 @@ with a `LinkedBlockingDeque<Runnable>`:
 
 The app owns the pixels, the core owns the component tree. `UiBridge` is the contract
 (`core/.../bridge/UiBridge.java`), implemented on the app side by `SwingSidebarView` (the
-drawer body) and `SwingWindowLayer` (the full-screen window layer):
+drawer body, and the port's `UiBridge.Host`), which also drives `SwingWindowLayer` (the
+full-screen window layer):
 
 | Direction | API | Notes |
 |---|---|---|
@@ -140,9 +141,13 @@ sets it.
 ## 7. Self-tests
 
 `SwingSelfTest` (app dex) runs 22 named cases on the Swing thread from
-`RuneLiteHost.startPlugins`, right after `GraphicsSelfTest`. Both log a single line —
-`SWING SELFTEST PASS` / `SWING SELFTEST FAIL <case>: <detail>` and the same string is appended to
-`status` (shown in the launcher's Host section). The cases cover the paint pipeline, each layout
-manager the shell uses, the widget set, popups, the modal dialog's nested loop, the UI scale and
-the theme. It is the only automated check of the Swing surface on a release build: run it after
-any change to `core/src/main/java/{java,javax}`.
+`RuneLiteHost.startPlugins`, right after `GraphicsSelfTest`. `GraphicsSelfTest` logs
+`GFX SELFTEST PASS` / `GFX SELFTEST FAIL <case>`; `SwingSelfTest` logs one line per case plus
+`SWING SELFTEST PASS (22 cases)` / `SWING SELFTEST FAIL <case>: <detail>`. A failure is appended to
+`status` as `gfx self-test FAIL: <detail>` or `swing self-test FAIL: <detail>` (shown in the
+launcher's Host section). The cases cover the paint pipeline, each layout manager the shell uses,
+the widget set, popups, the modal dialog's nested loop, the UI scale and the theme. The `optionpane`
+case puts a dialog on screen, so the boot run skips it (`onScreenCaseNames()`; the conformance pass
+skips them too) — run it explicitly with `SwingSelfTest.runCase("optionpane")`. It is the only
+automated check of the Swing surface on a release build: run it after any change to
+`core/src/main/java/{java,javax}`.

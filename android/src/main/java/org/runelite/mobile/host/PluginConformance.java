@@ -56,7 +56,8 @@ import java.util.concurrent.TimeUnit;
  * {@link RuneLiteHost}'s class comment). All of it runs on the Android main thread, which
  * is this port's event dispatch thread — {@code PluginManager.startPlugin} asserts it.
  *
- * <p>Trigger: the side panel's Host tab, or drop a {@code conformance.request} file into
+ * <p>Trigger: the launcher's Host section (Run plugin conformance), or drop a
+ * {@code conformance.request} file into
  * the app-specific external files dir (see {@link #REQUEST_FILE}) — the render loop picks
  * that up, which is the adb path.
  */

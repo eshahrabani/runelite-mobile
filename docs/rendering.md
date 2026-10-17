@@ -2,7 +2,7 @@
 
 **Audience:** developer
 **Read this when:** you are changing the render loop, the frame buffer, the AWT bridge, or debugging a grey, frozen, stale, or torn screen.
-**Verified against:** `android/src/main/java/org/runelite/mobile/MainActivity.java` (`surfaceChanged`, `runRenderLoop`, `bindSceneRasterizerToDisplay`, `paletteInvariant`, `logFrameDiagnostics`, callbacks proxy), `core/src/main/java/java/awt/Graphics.java`, `core/src/main/java/java/awt/image/BufferedImage.java`, `android/src/main/java/org/runelite/mobile/AndroidTextRenderer.java`, `core/src/main/java/org/runelite/mobile/bridge/AWTBridge.java`, `core/src/main/java/org/runelite/mobile/bridge/TextBridge.java`, `docs/telemetry-assessment.md`
+**Verified against:** `android/src/main/java/org/runelite/mobile/MainActivity.java` (`surfaceChanged`, `runRenderLoop`, `bindSceneRasterizerToDisplay`, `paletteInvariant`, `logFrameDiagnostics`, callbacks proxy), `core/src/main/java/java/awt/Graphics.java`, `core/src/main/java/java/awt/Font.java`, `core/src/main/java/java/awt/image/BufferedImage.java`, `core/src/main/java/java/awt/image/DirectColorModel.java`, `android/src/main/java/org/runelite/mobile/AndroidTextRenderer.java`, `core/src/main/java/org/runelite/mobile/bridge/AWTBridge.java`, `core/src/main/java/org/runelite/mobile/bridge/TextBridge.java`, `docs/telemetry-assessment.md`
 
 The port does not draw the game. The client renders its own 765×503 software frame; the port only
 binds the client's output to a display buffer, lets RuneLite's `Hooks` composite plugin overlays into
@@ -81,7 +81,7 @@ completed frame. The proxy's frame-blit branch receives the provider as `args[0]
 `Image` via reflection (`args[0].getClass().getMethod("getImage")`), and inside `synchronized
 (renderLock)` either delegates to `Hooks.draw` (which composites overlays and blits the frame into
 `args[1]`) or does `((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null)` when no host is running.
-Only then does it bump `frameSeq` and `renderLock.notifyAll()`, and on the first frame it clears
+Only then does it bump `frameSeq` and `renderLock.notifyAll()`, and on the first frame it sets
 `firstFramePresented` so the boot overlay hides.
 
 ```mermaid
@@ -100,7 +100,7 @@ sequenceDiagram
     R->>P: "wait on renderLock while frameSeq == lastDrawnSeq"
     P-->>R: "frame ready"
     R->>R: "renderBitmap.setPixels(appletPixels, 0, GAME_W, ...)"
-    R->>S: "drawRect bars + drawBitmap(renderBitmap, srcRect, renderDest, scalePaint)"
+    R->>S: "drawRect bars + drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)"
 ```
 
 `runRenderLoop` blocks in `while (isRunning && frameSeq == lastDrawnSeq) renderLock.wait(100)` before
@@ -163,22 +163,25 @@ starved. It never holds the canvas lock while idle.
 ### 3.3 The two `drawImage` paths and the `hasAlpha` gate
 
 `Graphics.drawImage` writes into a shared non-premultiplied ARGB `int[]`; destination alpha is ignored
-for colour arithmetic and preserved on write (`Graphics.java`). It branches once on
-`img.hasAlpha` (`Graphics.java`):
+for colour arithmetic and preserved on write (`Graphics.java`). There is one fast path — an opaque,
+unflipped 1:1 source (`!srcHasAlpha && w == srcWidth && h == srcHeight && compositeIsSourceCopy()`) —
+and everything else goes through `scaleBlit`, the accumulator walk that blends per pixel only for
+`hasAlpha` sources (`Graphics.java`):
 
 - **Opaque, 1:1:** one `System.arraycopy` per row (`Graphics.java`). This is the game's
   every-frame path — `drawImage(img, 0, 0, null)` with the source already at display size — so it must
   stay branch-free and native.
 - **Opaque, scaled:** a divide-free nearest-neighbour loop stepping source row/column with accumulators
-  (`Graphics.java`), used by the splash logo.
-- **Blended:** only sources with `hasAlpha` take `drawImageBlend`, the same accumulator walk with a
-  per-pixel source-over (`Graphics.java`).
+  (`Graphics.java`, `scaleBlit`), used by the splash logo.
+- **Blended:** sources with `hasAlpha`, and any non-source-copy composite, take `blendPixel` inside the
+  same accumulator walk — a per-pixel source-over, with a non-alpha source's alpha byte forced to
+  `0xFF` first (`Graphics.java`).
 
 `blendPixel` scales source alpha by the composite alpha; when `!destHasAlpha` it blends RGB but keeps
 the destination alpha byte (`Graphics.java`), which is why overlays drawn over the alpha-0 game
 frame blend visually instead of turning opaque. This is the same contract that keeps
 `BufferedImage.getRGB` returning an opaque colour: with an empty alpha mask,
-`DirectColorModel.getRGB` returns `0xFF000000 | (pixel & 0xFFFFFF)` (`BufferedImage.java`).
+`DirectColorModel.getRGB` returns `0xFF000000 | (pixel & 0xFFFFFF)` (`DirectColorModel.java`).
 See [core-stubs.md](core-stubs.md) for the full `Graphics`/`Image` fidelity limits.
 
 ## 4. Presentation cost model
@@ -190,8 +193,7 @@ GAME_W, 0, 0, GAME_W, GAME_H)` and a single
 rects are skipped), because the surface buffer is not cleared by the system and bar pixels are left
 over from the previous geometry.
 
-Do **not** reintroduce the historical per-pixel Java scale loop plus `| 0xFF000000` pass: recorded in
-the port's own recorded measurement at 172-229 ms/frame on a Pixel 8 Pro, versus ~12-15 ms of one core at 2244×1008
+Do **not** reintroduce the historical per-pixel Java scale loop plus `| 0xFF000000` pass: recorded at 172-229 ms/frame on a Pixel 8 Pro, versus ~12-15 ms of one core at 2244×1008
 for the current path. `scalePaint` is configured `setFilterBitmap(false)` and `setDither(false)`
 so the upscale is nearest-neighbour — the same sampling the old loop
 used — with no dithering pass. `scaleMs=` in the GameState log measures exactly `setPixels` + the blit.
@@ -229,12 +231,12 @@ fit rect inside the surface, so the scale is uniform and the leftover strips are
 
 The client has its own frame clock; the port only unlocks it. After `client.initialize()`, bootstrap
 calls `Client.setUnlockedFps(true)` and then `Client.setUnlockedFpsTarget(FPS_TARGET)` with
-`FPS_TARGET = 60` (`MainActivity.java`, `MainActivity.java`).
+`FPS_TARGET = 60` (`MainActivity.java`).
 
 Order matters: `setUnlockedFps` first, `setUnlockedFpsTarget` second, because turning unlocked fps off
 clears the target. With the default clock the presented rate is decoupled from the rendered rate — the
 clock's 20 ms catch-up batch presents once per up to ten cycles — which measured ~0.87 fps on the
-target device (a recorded measurement on the target device). The unlocked clock sleeps to a `1e9/FPS_TARGET`
+target device. The unlocked clock sleeps to a `1e9/FPS_TARGET`
 boundary instead and presents every rendered frame. Game ticks are unaffected by the pacing change;
 this only controls how often a completed frame is handed to the render thread.
 
@@ -275,7 +277,7 @@ File(getCacheDir(), "fonts")); TextBridge.renderer = new AndroidTextRenderer();`
 `android.graphics.Typeface` via `Typeface.Builder` (which only reads files, hence the cache font dir),
 caches one `Paint` per (family, style, size), and draws into a single reusable scratch `Bitmap` that
 it then composites source-over into the destination ARGB array (`AndroidTextRenderer.java`). The
-scratch bitmap is clamped (`MAX_SCRATCH_WIDTH` 1024, `MAX_SCRATCH_HEIGHT` 64), so unusually wide text
+scratch bitmap is clamped (`MAX_SCRATCH_WIDTH` 4096, `MAX_SCRATCH_HEIGHT` 256), so unusually wide text
 is clipped. With no renderer installed every helper degrades to a `str.length()*6` approximation
 instead of throwing, so overlay code never dies because text is unavailable.
 
@@ -292,7 +294,7 @@ Two periodic logs and one overlay describe the frame.
 | `world=` | non-zero pixel count / XOR checksum of the left three quarters of the client frame |
 | `bridge=` | same two numbers for `AWTBridge.activePixels` (what the render thread presents) |
 | `tr=` | XOR checksum of the top-right strip of the client frame (where overlays land) |
-| `ovl=` | `ALWAYS_ON_TOP` overlay count plus per-layer names, from `alwaysOnTopOverlayCount()` |
+| `ovl=` | overlay count summed over every `OverlayLayer`, with per-layer `NAME:count` and `master=` names, from `alwaysOnTopOverlayCount()` |
 | `iface=` | `lastInterfaceDrawn` / overlays registered for it |
 | `entities=` | entity draw calls / denials, with `p=` player and `npc=` NPC subsets |
 | `yellow=` / `red=` | count of pure-yellow / pure-red pixels in the top-right strip (FPS overlay presence) |

@@ -2,7 +2,7 @@
 
 **Audience:** operator/developer
 **Read this when:** a device build runs but renders, taps, plugins, or plugins' state misbehave
-**Verified against:** `android/src/main/java/org/runelite/mobile/MainActivity.java`, `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `android/src/main/java/org/runelite/mobile/host/PluginConformance.java`, `android/src/main/java/org/runelite/mobile/host/MobilePluginHub.java`, `android/src/main/java/org/runelite/mobile/ClientUpdater.java`, `android/build.gradle`, `core/src/main/java/org/runelite/mobile/TileCompositor.java`, `core/src/main/java/java/awt/Graphics.java`
+**Verified against:** `android/src/main/java/org/runelite/mobile/MainActivity.java`, `android/src/main/java/org/runelite/mobile/SidePanel.java`, `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `android/src/main/java/org/runelite/mobile/host/PluginConformance.java`, `android/src/main/java/org/runelite/mobile/host/MobilePluginHub.java`, `android/src/main/java/org/runelite/mobile/ClientUpdater.java`, `android/build.gradle`
 
 Every section is one symptom: what you see, why it happens (with a code anchor), and the fix.
 Logs all use the tag `RuneLiteMobile` unless stated. Deep mechanics live in the linked pages;
@@ -22,13 +22,19 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   presenting the initial bitmap. `MainActivity` reports this as a `callbacks.draw failed` warning
   or `Callbacks.draw(Renderable,boolean) -> true` when no `Hooks` is bound. This is the #1 thing to
   check when rendering "stops".
-- **Fix.** Read the first `callbacks.draw` line after boot (the boot overlay card's status text shows
-  the same `Status Update:` string the log carries). If the line never prints, the proxy is not in
-  the path: confirm `findFieldByType(clientClass, "net.runelite.api.hooks.Callbacks")` bound the
+- **Fix.** Read the first `callbacks.draw` line after boot. That line is logcat-only; the boot
+  overlay's status text mirrors the `Status Update: …` log line instead (`updateStatus` logs the
+  message with that prefix and sets `tvBootStatus` to the bare message). If the line never prints,
+  the proxy is not in the path: confirm `findFieldByType(clientClass, "net.runelite.api.hooks.Callbacks")` bound the
   proxy (`Callbacks proxy bound (field …)`), and that no `callbacks.NAME failed` warning precedes
   it. A `NoClassDefFoundError`/`NoSuchMethodError` thrown inside the frame path appears as
-  `callbacks.draw failed`; resolve that stub gap first. See [rendering.md](rendering.md) and
-  [diagnostics.md](diagnostics.md).
+  `callbacks.draw failed`; resolve that stub gap first. Before the frame path ever runs, the host's
+  own gates log one line each: `GraphicsSelfTest` prints `GFX SELFTEST PASS`/`GFX SELFTEST FAIL <case>`
+  and `SwingSelfTest` prints `SWING SELFTEST PASS`/`SWING SELFTEST FAIL <case>: <detail>` (the boot run
+  skips the on-screen `optionpane` case). A PASS is logcat-only; only a FAIL is appended to
+  `RuneLiteHost.status` (`; gfx self-test FAIL: …` / `; swing self-test FAIL: …`), i.e. the launcher
+  Host section's `status` row. A FAIL there is a graphics/stub gap that no frame ever
+  recovers from. See [rendering.md](rendering.md) and [diagnostics.md](diagnostics.md).
 
 ## Frozen world with a live minimap
 
@@ -41,9 +47,9 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   a desktop resize, which never happens here. The minimap is drawn by a different path, so it
   keeps animating over the frozen scene.
 - **Fix.** Confirm the `Bound 3D rasterizer target to display buffer …` log appears
-  (`MainActivity.bindSceneRasterizerToDisplay`). If it is absent or the bind field is `null`, the
-  obfuscated names `yw.ah`/`yw.ef` no longer exist for the installed client version — the client
-  was bumped and the internal names must be re-derived per
+  (`MainActivity.bindSceneRasterizerToDisplay`). If it does not, look for `Rasterizer bind failed: …`:
+  the obfuscated names `yw.ah`/`yw.ef` (and the depth array `yw.aw` passed to it) no longer exist for
+  the installed client version — the client was bumped and the internal names must be re-derived per
   [telemetry-assessment.md](telemetry-assessment.md) §6. In the throttled `callbacks.draw` line, a
   frozen `world=` with a changing `bridge=` is the same failure from the other side.
 
@@ -55,9 +61,10 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   that every shaded fill and model face reads (`MainActivity.paletteInvariant`). If `fa.ak` was
   re-pointed at the frame buffer, those palette lookups read screen pixels instead of palette
   entries, which collapses to grey/black. `fa.ak` is **not** a pixel target.
-- **Fix.** Never retarget `fa.ak`; only `yw.ah` is a pixel target. Confirm `paletteInvariant()` in
-  the `callbacks.draw` line reports the palette references still point at `fq.aq`. The
-  version-specific names are re-derived on a client bump
+- **Fix.** Never retarget `fa.ak`; only `yw.ah` is a pixel target. Confirm the `pal=` field of the
+  `callbacks.draw` line reports `ok`: `pal=BAD(<non-zero>/65536)` means a rasterizer's `fa.ak` no
+  longer points at the `fq.aq` array (the `az`/`ah`/`an` slots the check walks), `pal=ERR` means the
+  reflective lookup itself failed. The version-specific names are re-derived on a client bump
   ([rendering.md](rendering.md), [telemetry-assessment.md](telemetry-assessment.md)).
 
 ## Stale login-screen remnants
@@ -97,17 +104,20 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 
 ## Taps do nothing while logcat shows `Dispatch mouse id=501 …`
 
-- **What you see.** A press logs `Dispatch mouse id=…at (x,y) to …` (`MainActivity.dispatchMouseEvent`)
-  but the client never reacts; no exception is printed.
+- **What you see.** A press logs `Dispatch mouse id=… at (x,y) to …` (`MainActivity.dispatchMouseEvent`)
+  but the client never reacts; the game does not walk, attack or click. If the event path throws, the
+  only other line is the warn `emitPoint failed` (`MainActivity.emitPoint`), which carries the
+  throwable as its stack.
 - **Why.** `emitPoint` builds a `java.awt.event.MouseEvent` and dispatches it; the client's handler
-  calls a member the port's stub lacks, and the resulting `NoSuchMethodError` is caught as
-  `Throwable` *after* the dispatch log line, so the failure is silent. Missing members that produce
-  exactly this include `MouseEvent.getPoint()/getComponent()`,
-  `InputEvent.getModifiersEx()/getModifiersExText(int)`, and the event constructors.
-- **Fix.** Compare the reference `MouseEvent`/`InputEvent` stubs against the members the client's
-  handler invokes; add the missing members to the hand-written stubs under `core/`. The load-bearing
-  member list and the no-arg-ctor/hand-written-supertype rules are in
-  [core-stubs.md](core-stubs.md); the event path is in [input.md](input.md).
+  calls a member the port's stub lacks, and the resulting `NoSuchMethodError` is caught as `Throwable`
+  *after* the dispatch log line, so the tap is silently dropped as far as the game is concerned. The
+  members the client's own mouse path calls include `MouseEvent.getPoint()/getComponent()`,
+  `InputEvent.getModifiersEx()/getModifiersExText(int)`, and the `(Component,…)` event constructors.
+- **Fix.** Read the `emitPoint failed` stack for the missing symbol and compare the reference
+  `MouseEvent`/`InputEvent` stubs against the members the client's handler invokes; add the missing
+  members to the hand-written stubs under `core/`. The load-bearing member list and the
+  no-arg-ctor/hand-written-supertype rules are in [core-stubs.md](core-stubs.md); the event path is in
+  [input.md](input.md).
 
 ## `⌨` tile missing, or typing does nothing
 
@@ -119,8 +129,13 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 - **Why (typing).** The `TextWatcher` diff in `kbBar` emits `VK_BACK_SPACE` per removed char and
   `dispatchKeyText(added)` for new text; `deliverKeyEvent` walks `getKeyListeners()` on the target
   and canvas and constructs a `java.awt.event.KeyEvent`. If the `KeyEvent` stubs are incomplete
-  (`getKeyText(int)`, `getExtendedKeyCode()`, `setKeyCode`/`setKeyChar`, `paramString`), the event
-  is dropped silently. Two non-bug cases that look identical:
+  (`getKeyText(int)`, `getExtendedKeyCode()`, `setKeyCode`/`setKeyChar`, `paramString`), the client's
+  key handler throws a `NoSuchMethodError` out of the unguarded `deliverKeyEvent` (only `emitPoint`
+  has the `catch (Throwable)`), so that path fails loudly, not silently. Three non-bug cases that look
+  identical:
+  - a Swing text component in the sidebar has the focus: `UiBridge.focusOwnerIsTextInput()` routes the
+    bar's keys into the Swing tree (`SwingSidebarView.dispatchKey`) instead of the game, so characters
+    land in the focused field, not the game;
   - the game's chat input is **not open** — the client ignores chat characters until `Enter` (the
     bar's `Enter` pill or the IME's action) has opened the chat line, and the chat line is drawn at
     the bottom of the game frame, which the soft keyboard covers. The bar itself (top-anchored) shows
@@ -130,7 +145,9 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
     [input.md](input.md) §6).
 - **Fix.** Start the client before expecting the tile; verify the `KeyEvent` stub members against
   the client's key handler. This is an AWT `KeyEvent` bridge, not an in-game IME — see
-  [input.md](input.md) and [core-stubs.md](core-stubs.md).
+  [input.md](input.md) and [core-stubs.md](core-stubs.md). The bar is also the Swing text-input
+  surface (`Host.textInputRequested` shows/hides it), documented in [swing-runtime.md](swing-runtime.md)
+  §4.
 
 ## Overlays absent on the login screen
 
@@ -146,28 +163,30 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 
 ## A plugin listed as active but inert
 
-- **What you see.** The Host tab reports a plugin as loaded/active, but it has no visible effect.
+- **What you see.** The launcher's Host section (`plugin index` / `active plugins` rows) counts a
+  plugin as loaded/active, but it has no visible effect.
 - **Why.** The loader counters derive from successful *instantiation* only and say nothing about
   behaviour: a plugin can be active and still throw on every event (e.g. a missing class) with no
   counter moving (the `PluginConformance` class doc calls this out). Instantiation is not a proof
   it works.
-- **Fix.** Run a conformance pass and read the behavioural metrics: `subs=<reg>/<decl>`,
-  `ovl=<ok>/<bad>`, `cfg=<ok>/<bad>`, `rc=<n>`, and the `entityVeto`/`menuEntry`/`eventFlow`
-  probes. A subscription-count mismatch and any link error always fail. The metric meanings and the
-  trigger are in [diagnostics.md](diagnostics.md); the plugin lifecycle is in
-  [plugin-runtime.md](plugin-runtime.md).
+- **Fix.** Run a conformance pass (the launcher's *Run plugin conformance* pill) and read the
+  behavioural metrics: `subs=<reg>/<decl>`, `ovl=<ok>/<bad>`, `cfg=<ok>/<bad>`, `rc=<n>`, and the
+  `entityVeto`/`menuEntry`/`eventFlow` probes. A subscription-count mismatch and any link error
+  always fail. The metric meanings and the adb trigger are in [diagnostics.md](diagnostics.md); the
+  plugin lifecycle is in [plugin-runtime.md](plugin-runtime.md).
 
 ## A plugin toggle is lost after relaunch
 
-- **What you see.** Enabling/disabling a plugin or editing a config item, then force-stopping or
-  relaunching the app, loses the change.
-- **Why.** RuneLite only writes its profile file from `ConfigManager.sendConfig()`. The port flushes
-  that explicitly; if the flush did not run before the process died, the change was never written to
-  `files/.runelite/profiles2/`. `RuneLiteHost.flushConfig()` is called from the panel toggle/config
-  write paths (`SidePanel`) and from `MainActivity.onStop`.
+- **What you see.** Enabling/disabling a plugin or editing a config item in the Swing sidebar, then
+  force-stopping or relaunching the app, loses the change.
+- **Why.** RuneLite only writes its profile file from `ConfigManager.sendConfig()`, which it runs
+  from a `scheduleWithFixedDelay` task (minutes) and on a profile switch. The port flushes that
+  explicitly; if the flush did not run before the process died, the change was never written to
+  `files/.runelite/profiles2/`. `RuneLiteHost.flushConfig()` is called from `MainActivity.onStop`
+  (and after a `RuneLiteHost.setPluginEnabled` enable/disable).
 - **Fix.** Ensure the config write path reaches `RuneLiteHost.flushConfig()` and that the app is
   backgrounded normally (`onStop`) rather than force-stopped immediately after the change. Storage
-  layout and flush timing are in [plugin-runtime.md](plugin-runtime.md); the panel wiring in
+  layout and flush timing are in [plugin-runtime.md](plugin-runtime.md); the sidebar wiring in
   [side-panel.md](side-panel.md).
 
 ## `Writable dex file … is not allowed`
@@ -208,8 +227,8 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 ## App runs slow; `pm art dump` shows `verify` instead of `speed`
 
 - **What you see.** The game is roughly 10x slower than expected; `pm art dump` reports the client
-  dex as `verify` rather than `[status=speed]`; the launcher shows a red `NOT AOT-COMPILED` line and
-  the Host tab a red `client AOT` row.
+  dex as `verify` rather than `[status=speed]`; the launcher version line turns red with
+  `NOT AOT-COMPILED` and the Host section below it shows a red `client AOT` row.
 - **Why.** The target device runs `dalvik.vm.usejit=false`, so interpreted code is ~10x slower. ART
   keys the odex to the class-loader context (APK path + APK/dex checksums), so an APK install or a
   downloaded client-jar update can invalidate it. `ClientUpdater.clientDexAotStatus` is a **heuristic**
@@ -224,7 +243,7 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   `cmd package compile -m speed -f --secondary-dex org.runelite.mobile` — the `--secondary-dex` pass
   **last**, because the plain package compile drops the client dex back to `verify`. Verify the result with `pm art dump`. Exact copy-pasteable steps and the
   debuggable-build caveat are in [device-runbook.md](device-runbook.md); the AOT-status semantics and
-  the launcher/Host-tab display are in [client-updates.md](client-updates.md).
+  the launcher display are in [client-updates.md](client-updates.md).
 
 ## Where to look next
 
@@ -235,6 +254,7 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
 | Taps/scroll/keyboard not reaching the client | [input.md](input.md) | [core-stubs.md](core-stubs.md) |
 | Missing stub member, `NoSuchMethodError`, static-shape errors | [core-stubs.md](core-stubs.md) | [tools.md](tools.md) |
 | Plugin inert / no effect after load | [diagnostics.md](diagnostics.md) | [plugin-runtime.md](plugin-runtime.md) |
+| Plugin panel does not paint or react | [swing-runtime.md](swing-runtime.md) | [side-panel.md](side-panel.md) |
 | Plugin toggle or config lost | [plugin-runtime.md](plugin-runtime.md) | [side-panel.md](side-panel.md) |
 | Hub jar refuses to load / dexing | [third-party-plugins.md](third-party-plugins.md) | [build-and-release.md](build-and-release.md) |
 | Build/dex failure, pipeline rewrite | [build-and-release.md](build-and-release.md) | [tools.md](tools.md) |

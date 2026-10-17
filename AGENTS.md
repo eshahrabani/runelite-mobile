@@ -23,8 +23,11 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
 - CI (`.github/workflows/build.yml`): freshness-gated schedule (Wed 07-21 UTC every
   5 min, thinning outwards; a manual dispatch always builds and publishes); artifact
   at `android/build/outputs/apk/release/android-release.apk`.
-- Java 11 source/target (CI uses Zulu 11; a newer local JDK works). No tests,
-  no lint config, no README.
+- Java 11 bytecode everywhere (`sourceCompatibility`/`targetCompatibility` = 11).
+  The CI Android job runs Zulu **17** (cmdline-tools 16.0's `sdkmanager` and AGP 8.2.2
+  require it; `javac 17` still honours `core/`'s `--limit-modules`); the iOS job runs
+  Zulu 11. Any local JDK ≥ 11 works. No unit-test framework and no lint config —
+  verification is the on-device selftests plus the conformance pass.
 
 ## Architecture (non-obvious from filenames)
 
@@ -205,7 +208,7 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   `[status=verify]`. The installed APK must not be debuggable: ART Service
   rewrites `-m speed` to `verify` for debuggable packages, so AOT only works on
   the release build (same debug signing key → `install -r` keeps app data).
-  The app reports that state itself: the side panel's Host tab has a `client AOT`
+  The app reports that state itself: the launcher's Host section has a `client AOT`
   row and the launcher version line turns red with `NOT AOT-COMPILED` when the
   odex is stale or missing (`ClientUpdater.clientDexAotStatus` — a heuristic over
   `files/oat/<isa>/runelite-dex.odex` vs the **client jar's** mtime, logging
@@ -309,11 +312,17 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   - `org.runelite.mobile.host.RuneLiteHost` reaches everything RuneLite-specific —
     including the Guice injector, `OkHttpClient` and `RuneLiteAPI.CLIENT` — by **name
     through the child loader**; the app dex has no compile-time RuneLite/Guice/OkHttp
-    dependency at all (only `java.awt.*` stubs, `android.*` and slf4j). Do not add a
-    compile-time `net.runelite.*`/`com.google.inject.*`/`okhttp3.*` reference to app-dex
-    code, and do not add a compile-time `org.runelite.mobile.*` reference to a shim: the
-    only cross-dex links are lambdas/fields the host installs reflectively (see
-    `ClientToolbar.navigationListener`).
+    dependency at all (only `java.awt.*` stubs, `android.*`, slf4j and `core`'s bridge
+    classes). Do not add a compile-time `net.runelite.*`/`com.google.inject.*`/`okhttp3.*`
+    reference to app-dex code. The other direction **is** compile-time: the asset-dex
+    `ClientUI` shim imports `org.runelite.mobile.bridge.AWTBridge`/`UiBridge` (core,
+    parent-first), which is how the sidebar reaches the app; a shim may link only to
+    `core` bridge statics that way, and app-dex code (including `core`) must still reach
+    shim/plugin state reflectively or through those statics.
+  - `UiBridge` is the sidebar's bidirectional link: core defines the `Host` interface and
+    calls into the app-side `SwingSidebarView` (registered by `UiBridge.setHost`), while
+    `ClientUI`/`SwingSidebarView` call back through it (`setSidebarRoot`,
+    `closeSidebarRequested`, `dispatchKey`, `hasVisibleWindow`, …).
   - Shim **constructors** may only take parameters resolvable from the asset dex
     (`Injector`, `java.awt.*`/`javax.swing.*` stubs from the app dex via parent-first
     delegation, `String`, …): Guice reflects on them. Method *signatures* must match the
@@ -332,9 +341,12 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   Panel-only plugins are **no longer excluded**: the drawer hosts RuneLite's real Swing
   panels, so `ConfigPlugin`, `LootTrackerPlugin`, `NotesPlugin`, `TimeTrackingPlugin`,
   `SkillCalculatorPlugin`, `ScreenMarkerPlugin`, `WorldHopperPlugin`, `HiscorePlugin`,
-  `GrandExchangePlugin`, `KourendLibraryPlugin` and `InfoPlugin` all instantiate. The five
-  remaining entries need LWJGL/JNA/a desktop-only library set or a native browser
-  (`GpuPlugin`, `DiscordPlugin`, `WorldMapPlugin`, `DevToolsPlugin`, `ScreenshotPlugin`).
+  `GrandExchangePlugin`, `KourendLibraryPlugin` and `InfoPlugin` all instantiate. Four of the
+  five remaining entries need LWJGL/JNA/a desktop-only library set or a native browser
+  (`GpuPlugin`, `DiscordPlugin`, `DevToolsPlugin`, `ScreenshotPlugin`); the fifth,
+  `WorldMapPlugin`, predates the sidebar and none of its 142 classes references any of those
+  symbols — the exclusion is kept but its reason is unverified (noted in
+  `android/plugin-exclusions.txt`).
   Verified on the device (before the sidebar landed): the index was 114 classes, 114
   instantiate with **0 failures**, 65 active at boot, **141** overlays registered. Note `PluginManager.startPlugins`
   stops at the first plugin whose `startUp()` throws, so one aborted plugin leaves the rest
@@ -348,24 +360,28 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   contains the overlays. The proxy's `openUrl` deliberately does **not** delegate
   (`LinkBrowser` would reach `Runtime.exec`), and a host that failed to start leaves the
   legacy pass-through behaviour in place.
-- **Plugin lifecycle runs on the UI thread.** `AWTBridge.registerUiThread(mainThread,
-  handler::post)` (called from `MainActivity.onCreate`) is the event dispatch thread:
-  `javax.swing.SwingUtilities.invokeLater/invokeAndWait/isEventDispatchThread` route
-  there, which is what `PluginManager`'s EDT contract and `invokeAndWait` need. The
-  host's own thread does only the blocking work (`RuntimeConfigLoader.get()`) before
+- **Plugin lifecycle runs on the Swing EDT.** `AWTBridge.registerUiThread(SwingEdt.ensureStarted(),
+  SwingEdt::post)` (called from `MainActivity.onCreate`) is the event dispatch thread —
+  `Swing-EDT-rlmobile`, not the Android main thread: `javax.swing.SwingUtilities.invokeLater/
+  invokeAndWait/isEventDispatchThread` route there, which is what `PluginManager`'s EDT contract
+  and `invokeAndWait` need. The Android main thread only presents bitmaps and forwards input.
+  The host's own thread does only the blocking work (`RuntimeConfigLoader.get()`) before
   posting the lifecycle.
 - **`java.awt`/`javax.swing` stubs.** The Android runtime has no `java.desktop`, so
-  `core/` defines the surface the pre-compiled jars reference: hand-written pixel/text
-  code (`Graphics`, `Graphics2D`, `Image`, `BufferedImage`, `Font`, `FontMetrics`) plus
-  ~230 **generated** data-only stubs (`javax.swing.**`, `java.beans.**`,
-  `javax.sound.sampled.**`, `com.sun.net.httpserver.**`, …). Regenerate them after a
+  `core/` defines the surface the pre-compiled jars reference. At HEAD the tree holds
+  381 files under `core/src/main/java` (plus `hostshims/src`): **330 hand-written**
+  (the whole Swing runtime — layout managers, `JTable`/`JTree`/`JTextComponent`/`text/*`,
+  `plaf/*`, borders, `UndoManager`, `HTMLEditorKit`, the `bridge/` classes, …) and
+  **51 generated** data-only stubs (`javax.management.**`, `javax.sound.sampled.**`,
+  `com.sun.**`, `javax.accessibility.**`, and a few `java.awt`/`javax.swing` leftovers —
+  the generator's marker header is what tells them apart). Regenerate them after a
   client bump with `python3 tools/gen_stubs.py --rl-jars android/build/rl-jars
   --asm-cp <asm:asm-tree jars>`; the member set comes from the real call sites
   (`tools/RefScan.java`), hierarchy/constants/enums from the local JDK
   (`tools/JdkInfo.java`), and files without the generator's marker header are never
-  touched. The scan also records **how** each member is used (INVOKESTATIC vs
-  INVOKEVIRTUAL/INVOKEINTERFACE, GETSTATIC vs GETFIELD) and the generator emits `static`
-  accordingly: a stub method that is an instance method where the client uses
+  touched — a hand-written class is never overwritten. The scan also records **how** each
+  member is used (INVOKESTATIC vs INVOKEVIRTUAL/INVOKEINTERFACE, GETSTATIC vs GETFIELD)
+  and the generator emits `static` accordingly: a stub method that is an instance method where the client uses
   `invokestatic` is an `IncompatibleClassChangeError` on device
   (`StyleContext.getDefaultStyleContext()` was exactly that). `tools/HostLinkCheck.java`
   verifies both the existence and the static/interface shape, and it checks `core/`'s own
@@ -479,16 +495,17 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
      a real bug: icons scaled through `drawImage` while glyphs stayed logical). Every new
      widget must measure logically.
   `SwingSelfTest` (app dex, 22 cases) runs at boot right after `GraphicsSelfTest` and logs
-  `SWING SELFTEST PASS` / `FAIL <case>: <detail>`; both are also appended to `RuneLiteHost.status`
-  and therefore visible in the launcher's Host section. The `optionpane` case puts a dialog on
-  screen, so the boot run skips it (the conformance pass runs it deliberately).
+  `SWING SELFTEST PASS` / `FAIL <case>: <detail>`; a failure is appended to `RuneLiteHost.status`
+  by `startPlugins` (a pass is logcat-only) and is therefore visible in the launcher's Host section. The `optionpane` case puts a dialog on
+  screen, so the boot run skips it — and the conformance pass does **not** run the on-screen
+  cases either (a dialog that never gets its click would hang the dispatch thread).
   The drawer's touch mapping is documented in `SwingSidebarView`: a one-finger drag inside a
   scrollable panel **scrolls** it (`UiBridge.isScrollableAt` decides; a swipe never clicks), a
   two-finger drag is the wheel, a two-finger tap and a long press are right clicks, and the
   tab strip itself scrolls when a hub install adds more tabs than fit.
 - **Plugin conformance run** (`org.runelite.mobile.host.PluginConformance`). The loader
-  counters all derive from successful *instantiation* (`index=114`, `N plugin(s) active`,
-  `141 overlays`) and say nothing about behaviour — a plugin can be listed as active and
+  counters all derive from successful *instantiation* (the index size, `N plugin(s) active`,
+  the overlay count) and say nothing about behaviour — a plugin can be listed as active and
   still throw on its first event. This pass starts every plugin itself, measures it, and
   puts the client back the way it found it: **subs** (declared `@Subscribe` methods vs
   subscribers the bus actually holds), **ovl** (every overlay the plugin registered is
@@ -537,15 +554,18 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   the default profile into the profile store, and `ProfileManager` creates the directory
   itself. Verified: after a boot that file is ~41 KB, i.e. every plugin's config *item*
   defaults are written (the write path works). **RuneLite only flushes that file from
-  `ConfigManager.sendConfig()`**, which it runs from a `scheduleWithFixedDelay` task
+  `ConfigManager.sendConfig()`, which it runs from a `scheduleWithFixedDelay` task
   (minutes) and on a profile switch — a desktop process exits gracefully, an Android one
-  is force-stopped without warning, so a panel toggle used to be lost on the next launch.
-  `RuneLiteHost.flushConfig()` therefore calls `sendConfig()` after every panel-driven
-  plugin toggle and config write, and `MainActivity.onStop()` flushes on the way out.
-  Verified: enable FPS Control in the panel (`host=65p` → `66p`), `am force-stop`,
-  relaunch → `66 plugin(s) active`. The side panel's own UI state (open/closed, tab)
-  lives in `SharedPreferences` and persists too. The panel is a `rootLayout` child added
-  *before* the login overlay, so the login overlay covers the drawer while it is up.
+  is force-stopped without warning, so a panel change used to be lost on the next launch.
+  The port flushes explicitly: `MainActivity.onStop()` calls `RuneLiteHost.flushConfig()`,
+  the conformance pass flushes after its config probe, and `RuneLiteHost.setPluginEnabled`
+  flushes too (though it has no caller at HEAD — the Swing panel toggles through RuneLite's
+  own `PluginListPanel` → `PluginManager.setPluginEnabled`), so the guaranteed boundary for
+  a drawer toggle or config edit is `onStop()`. Verified earlier with the native panel:
+  enable FPS Control (`host=65p` → `66p`), `am force-stop`, relaunch → `66 plugin(s) active`.
+  The side panel's own UI state (open/closed) lives in `SharedPreferences` and persists too.
+  The drawer is a `rootLayout` child added *before* the login overlay, so the login overlay
+  covers it while it is up.
 - **Diagnostics.** The throttled `callbacks.draw` line prints `host=` (active plugins),
   `ovl=` per overlay layer with a couple of names, `iface=<id>/<overlays>` (the last
   interface the client drew and how many overlays are registered for it),
@@ -567,7 +587,10 @@ inputs**. The build downloads its own copies. Don't edit or depend on them.
 
 ## Repo state
 
-`master` with **17 commits**, clean working tree; `origin` is
+`master`, clean working tree; `origin` is
 `https://github.com/eshahrabani/runelite-mobile.git`. `local.properties` holds the
-machine-specific `sdk.dir` and is already in `.gitignore`. No tests exist; manual
-verification is via the APK on a device/emulator.
+machine-specific `sdk.dir` and is already in `.gitignore`. No JVM test framework
+exists: verification is the on-device selftests (`GraphicsSelfTest`, `SwingSelfTest`),
+the plugin conformance pass and manual checks on the APK. `README.md` is the public
+entry point; this file and `docs/*.md` are the developer doc set (the README's index
+maps pages to topics).

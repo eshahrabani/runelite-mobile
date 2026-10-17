@@ -111,7 +111,9 @@ public final class SwingSelfTest {
 
     /**
      * Cases that put something on screen and are therefore skipped by the boot run: a modal
-     * dialog would flash on every launch. {@code PluginConformance} runs them deliberately.
+     * dialog would flash on every launch. {@code PluginConformance} does not run them
+     * either (a dialog that never gets its click would hang the dispatch thread); they are
+     * driven manually, e.g. through {@link #runCase(String)} from an adb check.
      */
     private static final java.util.Set<String> ON_SCREEN_CASES = new java.util.LinkedHashSet<>(
         java.util.Collections.singletonList("optionpane"));
@@ -151,8 +153,8 @@ public final class SwingSelfTest {
     }
 
     /**
-     * Runs one named case on the calling (dispatch) thread; null when it passed. Used by the
-     * conformance pass for the on-screen cases and by adb-driven checks.
+     * Runs one named case on the calling (dispatch) thread; null when it passed. Used by
+     * adb-driven checks (the conformance pass does not run the on-screen cases).
      */
     public static String runCase(String name) {
         Case test = CASES.get(name);

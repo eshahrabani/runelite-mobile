@@ -2,8 +2,9 @@
 
 **Audience:** everyone who found this repository
 **Read this when:** you want a 60-second orientation, a build, or a pointer into the deep dives
-**Verified against:** `MainActivity.java:60-68`, `android/build.gradle:32`, `RuneLiteHost.java:45`,
-`ClientUpdater.java:33`, `settings.gradle:18-20`
+**Verified against:** `settings.gradle`, `build.gradle`, `android/build.gradle`, `core/build.gradle`,
+`MainActivity.java` (`GAME_W`/`GAME_H`, `FPS_TARGET`, `LONG_PRESS_MS`, `ROTATE_LOCK_DP`),
+`RuneLiteHost.java`, `ClientUpdater.java`, `.github/workflows/build.yml`
 
 RuneLite Mobile runs Old School RuneScape on Android by running RuneLite's *official* injected client
 on the platform's own runtime, ART. It ships no custom game client and no game assets: at build time
@@ -17,8 +18,9 @@ is a skeleton that renders nothing.
 
 RuneLite Mobile is an unofficial Android port of [RuneLite](https://runelite.net), the open-source
 Old School RuneScape client. The port does not reimplement the game or the client: `android/build.gradle`'s
-`syncRuneLiteJars` task fetches RuneLite's pinned `bootstrap.json`, downloads the official injected
-client and its runtime libraries, and `downloadAndDexJar` ASM-transforms and d8-dexes them into
+`syncRuneLiteJars` task fetches RuneLite's pinned `bootstrap.json`, downloads the three official jars
+it names (`client`, `injected-client`, `runelite-api`) plus the runtime libraries they need, and
+`downloadAndDexJar` ASM-transforms and d8-dexes them all into
 `android/src/main/assets/runelite-dex.jar`. At runtime the app installs a `DexClassLoader` over that
 asset, loads the obfuscated `client` class, and asks it to paint into a 765x503 software buffer that
 lives in `core/`'s hand-written `java.awt` stubs.
@@ -60,7 +62,7 @@ State as of this writing. Numbers that move with upstream releases are described
 | Pinch → camera zoom / list scroll (synthesized wheel) | works | [input.md](docs/input.md) |
 | Long press or two-finger tap → right click | works | [input.md](docs/input.md) |
 | On-screen keyboard bridge (`⌨` tile → AWT `KeyEvent`s) | works | [input.md](docs/input.md) |
-| Native side panel (Plugins / Config / Host tabs) | works | [side-panel.md](docs/side-panel.md) |
+| RuneLite's real Swing sidebar (toolbar + plugin panels) in the drawer | works | [side-panel.md](docs/side-panel.md), [swing-runtime.md](docs/swing-runtime.md) |
 | RuneLite plugin runtime (indexed plugins instantiate) | works | [plugin-runtime.md](docs/plugin-runtime.md) |
 | Plugin config persistence | works | [plugin-runtime.md](docs/plugin-runtime.md) |
 | Third-party Plugin Hub jars | works | [third-party-plugins.md](docs/third-party-plugins.md) |
@@ -76,10 +78,12 @@ ordinary key events. Open the game's chat input first (`Enter`), then type.
 A `works` row means the subsystem is wired end-to-end and produces a visible result on device, not
 that it is feature-complete. Known intentional limits:
 
-- Swing-based plugin panels are not rendered. Plugins that register a side panel are listed, and tapping
-  one opens its config instead; the panel itself is not available on mobile.
-- A small set of core plugins is excluded from load because they need the desktop shell, LWJGL/JNA, or
-  a browser. Excluding a plugin that another depends on is not allowed, so the exclusions cascade.
+- The sidebar is RuneLite's real Swing UI running on the port's hand-written `javax.swing`, not a
+  mobile-specific screen; a panel whose activation throws (or cannot be built) is replaced by an error
+  panel for that tab only, and the rest keeps working.
+- A small set of core plugins is excluded from load because they need LWJGL/JNA or a desktop-only
+  library set, a native web browser, or a desktop screenshot folder. Excluding a plugin that another
+  depends on is not allowed, so the exclusions cascade.
 - The iOS target builds and launches but draws nothing.
 - There is no automated test suite; see section 10.
 
@@ -106,7 +110,7 @@ Why the port is hard:
 
 - **No `java.desktop`.** Android ships none of `java.awt`/`javax.swing`/`java.applet`. `core/`
   defines the surface the pre-compiled jars reference, and must keep `--limit-modules
-  java.base,jdk.unsupported` (`core/build.gradle:11`) to legally declare `java.*` packages. See
+  java.base,jdk.unsupported` in `core/build.gradle` to legally declare `java.*` packages. See
   [core-stubs.md](docs/core-stubs.md).
 - **No `sun.misc.Unsafe`.** The injected client reads array offsets and calls `copyMemory`; the build
   rewrites those call sites to `org.runelite.mobile.UnsafeHelper` with ASM. See
@@ -128,7 +132,7 @@ Why the port is hard:
 
 | Requirement | Detail |
 |---|---|
-| JDK | 11 (source/target 11 for every `JavaCompile`; CI uses Zulu 11) |
+| JDK | 17 to run Gradle/AGP (CI uses Zulu 17); bytecode is Java 11 (`source`/`target` 11 for every `JavaCompile`) |
 | Android SDK | `compileSdk 34`, with build-tools (the pipeline invokes `d8`) |
 | `local.properties` | `sdk.dir=<path>` (machine-specific, gitignored) |
 | Network | Required by `syncRuneLiteJars` and the `dexHubPlugin` manifest fetch |
@@ -147,7 +151,7 @@ Why the port is hard:
 | `./gradlew :android:dexHubPlugin -PhubPlugin=<internalName>` | yes | a dexed Plugin Hub jar |
 
 An offline Android build fails in `preBuild → downloadAndDexJar`, never in `:core:compileJava`:
-`afterEvaluate` wires the asset codegen ahead of every compile/dex task (`android/build.gradle:805-815`).
+`afterEvaluate` wires the asset codegen ahead of every compile/dex task.
 `verifyHostLinks` depends on the codegen and the release javac output but is deliberately **not**
 wired into `assembleRelease`. Full pipeline detail is in
 [build-and-release.md](docs/build-and-release.md).
@@ -163,8 +167,14 @@ wired into `assembleRelease`. Full pipeline detail is in
 | APK | `assembleRelease` | device install |
 | unsigned IPA | `:ios:robovmIPABuild` | iOS (skeleton) |
 
-The CI workflow publishes the jar, the version file, the checksum and the APK as release assets; the
-app's updater consumes them by exact name. See [client-updates.md](docs/client-updates.md).
+The CI workflow is **freshness-gated**: it compares `bootstrap.json`'s client version with the latest
+release's `client-version.txt` and skips the building jobs when they match, then publishes the jar, the
+version file, the checksum and the APK as release assets named exactly `runelite-dex.jar`,
+`client-version.txt`, `runelite-dex.jar.sha256` and the APK — the app's updater fetches them by those
+names from `BuildConfig.DIST_BASE`. Release APKs are signed with the identity from
+`android/keystore.properties` or the `KEYSTORE_*` env vars (CI secret `SIGNING_KEYSTORE_B64`, alias
+`runelitemobile`); without one the build falls back to the debug key and warns. See
+[client-updates.md](docs/client-updates.md).
 
 ---
 
@@ -173,8 +183,9 @@ app's updater consumes them by exact name. See [client-updates.md](docs/client-u
 ### Install
 
 1. Build: `./gradlew :android:assembleRelease`.
-2. Install: `adb install -r android/build/outputs/apk/release/android-release.apk` (same debug signing
-   key, so app data survives an upgrade).
+2. Install: `adb install -r android/build/outputs/apk/release/android-release.apk` (use the same
+   signing identity as CI — `android/keystore.properties` or the `KEYSTORE_*` env vars — so app data
+   survives an upgrade).
 3. AOT-compile the shipped client jar (mandatory on a JIT-disabled device):
    ```bash
    adb shell cmd package compile -m speed -f org.runelite.mobile
@@ -187,7 +198,7 @@ Re-run step 3 after **every APK install** and after **every client-jar update**:
 the class-loader context (the base APK path), so an install can invalidate it, and ART then silently
 falls back to `verify`. The APK must not be debuggable: the ART Service rewrites `-m speed` to `verify`
 for debuggable packages. `pm art dump` is the ground truth. The launcher shows a red `NOT AOT-COMPILED`
-line and the Host tab has a `client AOT` row; both come from `ClientUpdater.clientDexAotStatus`, a
+line and its Host section has a `client AOT` row; both come from `ClientUpdater.clientDexAotStatus`, a
 heuristic over the **client jar's** mtime (not the APK's — an APK install alone does not move the
 client dex), which also logs `AOT check: odex=… jar=… apk=…`. Full procedure and semantics in
 [device-runbook.md](docs/device-runbook.md) and [client-updates.md](docs/client-updates.md).
@@ -227,8 +238,11 @@ compile-time `net.runelite.*`/`com.google.inject.*`/`okhttp3.*` reference at all
   out of the asset dex and replaced by shims compiled *into that same dex*.
 - Hub plugins get their own `DexClassLoader` per jar, parented to the client loader, so a hub plugin
   sees the same `net.runelite.api` classes as a core plugin.
-- The only cross-loader links are lambdas/fields the host installs reflectively (for example
-  `ClientToolbar.navigationListener`).
+- Cross-loader links are one-directional: app-dex code (including `core`) never references
+  `net.runelite.*` at compile time. The other direction is compile-time — the asset-dex
+  `ClientUI` shim imports core's `org.runelite.mobile.bridge.{AWTBridge,UiBridge}` and reaches the app
+  through `UiBridge` (`setHost`, `setSidebarRoot`, `closeSidebarRequested`, `dispatchKey`, …), which
+  resolves parent-first into the app dex.
 
 See [plugin-runtime.md](docs/plugin-runtime.md) for the shim/loader contract.
 
@@ -297,7 +311,7 @@ runelite-mobile/
     hostlink-platform-extra.txt  device-verified platform members
     src/main/java/org/runelite/mobile/**   the Android host (MainActivity, RuneLiteHost, ...)
     src/main/assets/      rl-dexer.jar (tracked) + generated runelite-dex.jar/client-version.txt
-  hostshims/              source of the net.runelite.client.ui.* replacements (not a Gradle module)
+  hostshims/              source of the net.runelite.client.** replacements (not a Gradle module)
   tools/                  gen_stubs.py, RefScan.java, JdkInfo.java, HostLinkCheck.java
   docs/                   the deep dives linked below
   ios/                    RoboVM skeleton (build.gradle, robovm.xml, IOSLauncher)
@@ -324,7 +338,8 @@ subsystem you are touching; use the code map when you need a specific file.
 | [input.md](docs/input.md) | L2 | touch, camera drag, or the keyboard bridge misbehaves | developer |
 | [core-stubs.md](docs/core-stubs.md) | L2 | you add or fix a `java.awt`/`javax.swing` stub | developer |
 | [plugin-runtime.md](docs/plugin-runtime.md) | L2 | you work on `RuneLiteHost`, shims, or config | developer |
-| [side-panel.md](docs/side-panel.md) | L2 | you use or change the native panel | developer/operator |
+| [side-panel.md](docs/side-panel.md) | L2 | you use or change the drawer and its right-edge chrome | developer/operator |
+| [swing-runtime.md](docs/swing-runtime.md) | L2 | you touch the port's `javax.swing` runtime, the sidebar view, or virtual windows | developer |
 | [login-and-sessions.md](docs/login-and-sessions.md) | L2 | login or session-token handling | developer |
 | [client-updates.md](docs/client-updates.md) | L2 | the updater or AOT-status logic | developer/operator |
 | [third-party-plugins.md](docs/third-party-plugins.md) | L2 | you install a Plugin Hub jar | developer/operator |
@@ -339,7 +354,8 @@ After a RuneLite client bump, the plugin index, the obfuscated client-internal n
 stubs can all change. The regeneration procedures live in
 [tools.md](docs/tools.md) and [telemetry-assessment.md](docs/telemetry-assessment.md); the
 [build-and-release.md](docs/build-and-release.md) pipeline regenerates the index and the dex on every
-build. If a document and the source disagree, the source wins — line numbers in these pages are hints.
+build. If a document and the source disagree, the source wins — the file and symbol anchors are hints,
+not guarantees.
 
 ---
 
@@ -365,10 +381,10 @@ This is an **unofficial** port. It runs the official RuneLite client and the off
 client through a compatibility layer; it ships neither the game nor a modified client, and it is not
 affiliated with Jagex or the RuneLite project.
 
-- The repository is on `master` with 17 commits at the time of writing.
+- The repository is on `master` with 29 commits at the time of writing.
 - There are **no tests in the tree**; verification is manual, on-device. The only automated checks are
   `:android:verifyHostLinks` (build-time link check) and the runtime `GraphicsSelfTest` /
-  plugin-conformance probes.
+  `SwingSelfTest` / plugin-conformance probes.
 - The port has been exercised on a device with `dalvik.vm.usejit=false`; every performance claim in
   the docs assumes AOT compilation, because interpreted execution is roughly an order of magnitude
   slower.

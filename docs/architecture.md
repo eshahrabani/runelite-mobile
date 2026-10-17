@@ -2,28 +2,36 @@
 
 **Audience:** developer
 **Read this when:** you need the shape of the port before reading any subsystem page.
-**Verified against:** `settings.gradle`, `build.gradle`, `core/build.gradle`, `ios/build.gradle`, `android/build.gradle`, `android/src/main/java/org/runelite/mobile/MainActivity.java`, `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `android/src/main/java/org/runelite/mobile/host/MobilePluginHub.java`, `.gitignore`
+**Verified against:** `settings.gradle`, `build.gradle`, `core/build.gradle`, `ios/build.gradle`, `android/build.gradle`, `android/src/main/java/org/runelite/mobile/MainActivity.java`, `android/src/main/java/org/runelite/mobile/{SidePanel,SwingSidebarView,SwingWindowLayer}.java`, `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `android/src/main/java/org/runelite/mobile/host/MobilePluginHub.java`, `hostshims/src/net/runelite/client/ui/ClientUI.java`, `.gitignore`
 
 ## 1. The shape of the port
 
-The app ships **no game client of its own**. At build time it downloads RuneLite's official
-*injected* client, the game `client`, `runelite-api`, and the runtime libraries pinned by
-`bootstrap.json`, then runs all of them through `d8` into a single asset dex
-(`android/build.gradle:489-492`, asset `android/src/main/assets/runelite-dex.jar`). At runtime the
-app hands that dex to ART and supplies the desktop-JVM surface the client expects: a
-`java.awt`/`javax.swing` stub set living in `core/`, a pixel buffer wired to an Android
-`Bitmap`, and a small reflection bridge (`org.runelite.mobile.**`). RuneLite's own Swing UI is
-stripped from the asset dex and replaced by shims (`hostshims/`); the client's plugin manager runs
-unmodified against a build-time plugin index. The port therefore owns the *host*, not the game.
+The app ships **no game client of its own**. At build time one `bootstrap.json` fetch pins three
+RuneLite jars to the same version — `injected-client-<ver>.jar` (the game), `client-<ver>.jar` (the
+plugin API plus the ~130 core plugins) and `runelite-api-<ver>.jar` (a verified superset of the
+manifest's `-runtime` flavor) — plus the runtime libraries (guice, gson, okhttp, guava, commons,
+protobuf, …). `d8` folds all of them into a single asset dex, `android/src/main/assets/runelite-dex.jar`
+(`android/build.gradle`). At runtime the app hands that dex to ART and supplies the desktop-JVM
+surface the client expects: a hand-written `java.awt`/`javax.swing` implementation living in `core/`,
+a pixel buffer wired to an Android `Bitmap`, and a bridge (`org.runelite.mobile.**`). RuneLite's real
+Swing shell ships and runs on that runtime; only the desktop-window/macOS/LAF classes are stripped
+and replaced by five shims (`hostshims/`) — see [swing-runtime.md](swing-runtime.md). The app's
+drawer (`SidePanel` + `SwingSidebarView`) is that shell's host: it paints the real
+`ClientToolbarPanel` + `JTabbedPane` sidebar built by the `ClientUI` shim, not a native
+reimplementation — the old native Plugins/Config/Host tabs and `PluginPanelRegistry` are gone. The
+client's plugin manager runs unmodified against a build-time plugin index. The port therefore owns
+the *host*, not the game.
 
 The desktop surface the client needs is small but load-bearing. `core/` provides it: the
-`java.awt` component/event/graphics types the client compiles against, `javax.swing` types used by
-plugin code, `java.applet.Applet`/`AppletContext`, `java.awt.image.BufferedImage`, and the
-`java.lang.ProcessHandle`/`sun.misc.Unsafe` replacements the client's indirect references resolve
-to. None of this exists on Android, so `core/` implements it as real code where the client reads
-results (pixel maths, image access) and as data-only stubs where the client only needs the type to
-load. `core/build.gradle:10-12` compiles it with `--limit-modules java.base,jdk.unsupported` so a
-`java.*` package may legally exist there; [core-stubs.md](core-stubs.md) owns the detail.
+`java.awt` component/event/graphics types the client compiles against, the `javax.swing` widgets,
+layout managers and event plumbing RuneLite's Swing shell needs, `java.applet.Applet`/
+`AppletContext`, `java.awt.image.BufferedImage`, and the `java.lang.ProcessHandle`/`sun.misc.Unsafe`
+replacements the client's indirect references resolve to. None of this exists on Android, so `core/`
+implements it as real code where the client reads results (pixel maths, image access, Swing
+painting) and as data-only stubs where the client only needs the type to load. `core/build.gradle`
+compiles it with `--limit-modules java.base,jdk.unsupported`, which is what legally lets it define
+classes in the **`java.applet.*`/`java.awt.*` namespace**; [core-stubs.md](core-stubs.md) owns the
+detail.
 
 ## 2. Three artifacts, three loaders
 
@@ -52,16 +60,18 @@ Parent-first has three consequences you must design around:
 - **Asset-dex-only classes are invisible to app-dex code.** `MainActivity` has **zero**
   compile-time `import net.runelite` statements (grep: none); every client type is reached with
   `dexClassLoader.loadClass(...)` and reflection.
-- **The only cross-loader links are reflection-only.** The host reaches the client by name
-  (`ClientToolbar.navigationListener` is installed reflectively in
-  `RuneLiteHost.installNavigationHook`, `RuneLiteHost.java`); the client reaches the host
-  through app-dex proxies (`ClientConfiguration`, `Callbacks`) whose interface types are resolved
-  from the child loader (`MainActivity.java`).
+- **The only cross-loader links are reflection-only.** The host reaches the client and the
+  RuneLite runtime by name through the child loader — `client`, `net.runelite.api.GameEngine`,
+  `net.runelite.client.ui.ClientUI`, … (`MainActivity.java`; `RuneLiteHost.get`), because no
+  app-dex class has a compile-time `net.runelite.*` dependency; the client reaches the host
+  through the app-dex `ClientConfiguration`/`Callbacks` proxies, whose interface types resolve from
+  the child loader (`MainActivity.java`), and the asset-dex `ClientUI` shim enters the app through
+  the `AWTBridge`/`UiBridge` statics (`hostshims/.../ClientUI.java`).
 
 | Universe | Loader | Contents | Built / anchored at |
 |---|---|---|---|
-| App dex (`classes.dex`) | the Android application class loader | `core/` stubs, `org.runelite.mobile.**`, the slf4j-simple binding, androidx/material | `android/build.gradle:829-846` |
-| Asset dex `assets/runelite-dex.jar` | asset `DexClassLoader` (`parent = getClassLoader()`) | injected client, game `client`, `runelite-api` (duplicates stripped), the runtime libraries, `hostshims/` output, and the `runelite-plugin-index.txt` resource | `android/build.gradle:489-492`, `MainActivity` |
+| App dex (`classes.dex`) | the Android application class loader | `core/` stubs (the `java.*`/`javax.*` surface + `org.runelite.mobile.bridge.*`), `org.runelite.mobile.**`, the slf4j-simple binding, androidx/material | `android/build.gradle` |
+| Asset dex `assets/runelite-dex.jar` | asset `DexClassLoader` (`parent = getClassLoader()`) | `client-<ver>.jar` (plugin API + core plugins), `injected-client-<ver>.jar` (the game), `runelite-api-<ver>.jar` (duplicates stripped), the runtime libraries, `hostshims/` output, and the `runelite-plugin-index.txt` resource | `android/build.gradle`, `MainActivity` |
 | Hub jars | one `DexClassLoader` per jar (`parent = client loader`) | third-party plugin classes plus their resources | `MobilePluginHub.java` |
 
 The two bridges are **dynamic proxies**, not implementors. The app cannot write
@@ -78,30 +88,31 @@ proxy shows up as a silently defaulted return value rather than a compile error 
 |---|---|---|---|
 | `core/` | `java-library` (plain JVM jar) | `core/build/libs` classes: the `java.awt`/`javax.swing`/`java.applet` stubs plus `org.runelite.mobile` bridge classes | compiled into `:android`'s app dex and `:ios` |
 | `android/` | AGP application | APK (`org.runelite.mobile`) **and** the generated `assets/runelite-dex.jar` | shipped to devices |
-| `hostshims/` | **not a Gradle module** | classes compiled by `compileHostShims()` inside `android/build.gradle:189-233` and folded into the asset dex | the asset dex (same loader as the client, so Guice can resolve shim signature types) |
+| `hostshims/` | **not a Gradle module** | the five shim classes compiled by `compileHostShims()` inside `android/build.gradle` and folded into the asset dex | the asset dex (same loader as the client, so Guice can resolve shim signature types) |
 | `ios/` | RoboVM `java` project | unsigned IPA `RuneLiteMobile.ipa` | not shipped by the weekly Android gate |
 | `tools/` | developer scripts / Java tools | none (invoked by hand or by `verifyHostLinks`) | developers only |
 | `docs/` | prose | none | readers |
 
-`settings.gradle` includes exactly `:core`, `:android`, `:ios` (`settings.gradle:18-20`);
-`hostshims/` is absent because its sources are compiled ad hoc into the asset dex. `verifyHostLinks`
-exists for this tree but is deliberately **not** wired into `assembleRelease` (`android/build.gradle:734-749`).
+`settings.gradle` includes exactly `:core`, `:android`, `:ios`; `hostshims/` is absent because its
+sources are compiled ad hoc into the asset dex. `verifyHostLinks` — the gate that resolves every
+reference the shipped classes make against the app+asset dexes, with `android/hostlink-ignore.txt`
+and `android/hostlink-platform-extra.txt` keeping it honest — exists for this tree but is
+deliberately **not** wired into `assembleRelease` (`android/build.gradle`).
 
 The asset dex is a **build output**, produced by two Gradle tasks in `android/build.gradle`:
 `syncRuneLiteJars` downloads and SHA-256-verifies the pinned jars, and `downloadAndDexJar` strips
 replaced classes, rewrites each class through an ASM pass, compiles the shims, runs `d8`, repacks
-resources, and writes the plugin index (`android/build.gradle:288-622`). `afterEvaluate` wires
+resources, and writes the plugin index (`android/build.gradle`). `afterEvaluate` wires
 `preBuild -> downloadAndDexJar` and makes every `JavaCompile`/`dex*` task wait on
 `syncRuneLiteJars`, so a plain `:android:assembleRelease` regenerates the dex if
 needed. `:android` compiles only against `:core`, androidx/material, and `slf4j-api` borrowed from
 `android/build/rl-jars` — never against a RuneLite artifact, which is what keeps app dex free of
-`net.runelite.*` (`android/build.gradle:829-846`). The full pipeline belongs to
-[build-and-release.md](build-and-release.md).
+`net.runelite.*`. The full pipeline belongs to [build-and-release.md](build-and-release.md).
 
 > **Don't be misled by root-level files.** `gamepack_*.jar`, `injected_client.jar`,
-> `runelite-api.jar`, `temp_disasm/`, `java_pid*.hprof`, `screencap.png` and `build/` are manual
-> debugging dumps from past sessions, not build inputs; `.gitignore` lists each of them
-> (`.gitignore:1-31`). The one tracked oddity is `jdb_in` (debugger input), which `.gitignore`
+> `runelite-api.jar`, `temp_disasm/`, `screencap.png` and `build/` are manual
+> debugging dumps from past sessions, not build inputs; `.gitignore` lists each of them.
+> The one tracked oddity is `jdb_in` (debugger input), which `.gitignore`
 > does not cover. The real inputs are `android/build/rl-jars/*.jar` (downloaded) and
 > `android/src/main/AndroidManifest.xml`.
 
@@ -115,7 +126,7 @@ sequenceDiagram
   participant D as "DexClassLoader (asset dex)"
   participant C as "client"
   participant H as "RuneLiteHost thread"
-  participant U as "UI thread"
+  participant U as "Swing EDT"
   participant R as "AWTBridge-RenderThread"
   A->>A: "onCreate: JVM props, pixel binding, ui-thread registration"
   A->>B: "startJagexLogin -> ACTION_VIEW (OAuth leg 1)"
@@ -128,16 +139,18 @@ sequenceDiagram
   S->>C: "bind ClientConfiguration + Callbacks proxies, initialize()"
   S->>H: "new Thread(RuneLiteHost.start).setDaemon(true)"
   H->>H: "OkHttpClient, RuneLiteModule, Guice injector, get components"
+  H->>U: "initSidebar: ClientUI.init() via invokeAndWait"
   H->>U: "AWTBridge.post(RuneLiteHost::startPlugins)"
-  U->>U: "load plugin index, startPlugins, overlays, self-test"
+  U->>U: "load plugin index, startPlugins, overlays, self-tests"
   R->>R: "runRenderLoop waits on renderLock for the first frame"
 ```
 
 The same steps as code paths, in order:
 
 1. `MainActivity.onCreate` (`MainActivity.java`) sets JVM properties, binds `AWTBridge.activePixels`
-   to `appletPixels`, registers the UI thread, installs the text bridge and host context, builds the
-   launcher UI, and pre-registers the dex for ART dexopt.
+   to `appletPixels`, registers the Swing EDT as the runtime's UI thread
+   (`AWTBridge.registerUiThread(SwingEdt.ensureStarted(), SwingEdt::post)`), installs the text
+   bridge and host context, builds the launcher UI, and pre-registers the dex for ART dexopt.
 2. `MainActivity.startJagexLogin` drives the browser-based OAuth flow; the redirect returns
    through `onNewIntent` and ends in session tokens or a manual/imported session. Details: [login-and-sessions.md](login-and-sessions.md).
 3. `MainActivity.launchGame` hides the launcher and starts the `"GameClientBootstrapper"`
@@ -147,11 +160,14 @@ The same steps as code paths, in order:
    `ClientConfiguration` and `Callbacks` proxies, calls `initialize()`, and enables unlocked FPS.
 5. `MainActivity` starts the daemon `"RuneLiteHost"` thread calling
    `RuneLiteHost.start(clientObject, dexClassLoader)`.
-6. `RuneLiteHost.start` (`RuneLiteHost.java`) builds the injector and resolves core components, then posts `RuneLiteHost.startPlugins` to the UI thread via `AWTBridge.post`.
+6. `RuneLiteHost.start` (`RuneLiteHost.java`) builds the injector, initializes the sidebar
+   (`initSidebar` runs the `ClientUI` shim's `init()` on the Swing EDT via `AWTBridge.invokeAndWait`)
+   and resolves core components, then posts `RuneLiteHost.startPlugins` to the Swing EDT via
+   `AWTBridge.post`.
 7. `RuneLiteHost.startPlugins` loads the plugin index, calls
    `PluginManager.loadPlugins`, registers the managers on the `EventBus`, calls
    `overlayManager.init()` and `pluginManager.startPlugins()`, then loads sideloaded hub
-   plugins and runs the graphics self-test. Details: [plugin-runtime.md](plugin-runtime.md).
+   plugins and runs `GraphicsSelfTest` and `SwingSelfTest`. Details: [plugin-runtime.md](plugin-runtime.md).
 8. `surfaceCreated` starts the render thread, which presents client frames until
    `surfaceDestroyed`. Details: [rendering.md](rendering.md).
 
@@ -175,9 +191,10 @@ registered itself with the host: the host thread is only started after `initiali
 
 | Thread | Created / named at | Runs | Crosses the boundary via |
 |---|---|---|---|
-| Android main / UI thread | `Looper.getMainLooper()` registered with `AWTBridge.registerUiThread(...)` (`MainActivity.java`) | view construction, login UI, `startPlugins`, `SwingUtilities.invokeLater`/`invokeAndWait` routing | `handler::post` (`AWTBridge` stores the executor; `RuneLiteHost:249`) |
+| Android main / UI thread | the Android framework | launcher view construction, login UI, bitmap presentation, touch/key forwarding | `runOnUiThread` |
+| `"Swing-EDT-rlmobile"` | `SwingEdt.ensureStarted()`, registered with `AWTBridge.registerUiThread(...)` from `MainActivity.onCreate` | the RuneLite EDT: `initSidebar`, `startPlugins`, the plugin lifecycle, `SwingUtilities.invokeLater`/`invokeAndWait` routing, sidebar/window painting | `AWTBridge.post` / `AWTBridge.invokeAndWait` |
 | `"GameClientBootstrapper"` | `MainActivity.java` | jav_config fetch, dex selection, loader construction, proxy installation, `client.initialize()` | publishes `clientInstance`/`clientObject`; starts the host thread |
-| `"RuneLiteHost"` (daemon) | `MainActivity.java` | `RuneLiteHost.start`: runtime config fetch, Guice injector, component resolution | `AWTBridge.post(RuneLiteHost::startPlugins)` to the UI thread |
+| `"RuneLiteHost"` (daemon) | `MainActivity.java` | `RuneLiteHost.start`: runtime config fetch, Guice injector, sidebar init, component resolution | `AWTBridge.invokeAndWait(initSidebar)` then `AWTBridge.post(RuneLiteHost::startPlugins)` to the Swing EDT |
 | client's own thread | started inside `GameEngine.initialize()` (`MainActivity.java`) | game loop; invokes the `Callbacks` proxy | `Callbacks.draw` → `renderLock`/`frameSeq` |
 | `"AWTBridge-RenderThread"` | `surfaceCreated` (`MainActivity.java`) | blits the latest client frame to the `SurfaceView` | `renderLock.wait` on `frameSeq != lastDrawnSeq` |
 
@@ -186,7 +203,7 @@ the comment at `MainActivity.java` records that doing so tears frames; the loop 
 exactly the frame the client just produced, never one it drives on a timer. Second,
 **guarding is by monitor, not by polling**: the client thread and the render thread rendezvous on
 `renderLock` with `frameSeq`/`lastDrawnSeq` (`MainActivity.java`), and anything that must
-run on the UI thread is posted with `handler::post` rather than touched from another thread.
+run on the EDT is posted with `AWTBridge.post` rather than touched from another thread.
 
 Three boundary contracts are worth naming explicitly:
 
@@ -194,21 +211,21 @@ Three boundary contracts are worth naming explicitly:
   `renderLock` while overlay compositing and the buffer draw happen, and only then advances
   `frameSeq` (`MainActivity.java`). The render thread waits on the same monitor, so the
   client cannot overwrite `appletPixels` mid-copy.
-- **Host thread -> UI thread.** `AWTBridge.registerUiThread(Looper.getMainLooper().getThread(),
-  mainHandler::post)` (`MainActivity.java`) is what lets `SwingUtilities.invokeLater` and
-  `AWTBridge.post` land on the Android main thread; `RuneLiteHost` relies on it for the
+- **Host thread -> Swing EDT.** `AWTBridge.registerUiThread(SwingEdt.ensureStarted(),
+  SwingEdt::post)` (`MainActivity.java`) is what lets `SwingUtilities.invokeLater` and
+  `AWTBridge.post` land on the Swing dispatch thread; `RuneLiteHost` relies on it for the
   `PluginManager` EDT assertion (`RuneLiteHost.java`).
-- **UI thread -> client components.** Plugin lifecycle calls (`startPlugin`/`stopPlugin`,
-  config writes) are made from the UI thread through `RuneLiteHost`, which recomputes its
+- **Swing EDT -> client components.** Plugin lifecycle calls (`startPlugin`/`stopPlugin`,
+  config writes) are made from the EDT through `RuneLiteHost`, which recomputes its
   `activePlugins` snapshot after each (`RuneLiteHost.java`).
 
 ## 6. iOS
 
-`ios/` is a RoboVM 2.3.24 skeleton (`ios/build.gradle:7`). `IOSLauncher` extends
+`ios/` is a RoboVM 2.3.24 skeleton (`ios/build.gradle`). `IOSLauncher` extends
 `UIApplicationDelegateAdapter`, creates a `UIWindow` from the main screen bounds, attaches a bare
 `UIViewController`, and prints a message — there is no rendering and no bridge wiring
 (`ios/src/main/java/org/runelite/mobile/IOSLauncher.java`). The build is macOS + Xcode only and
-produces an **unsigned** IPA (`iosSkipSigning = true`, `ios/build.gradle:26-27`;
+produces an **unsigned** IPA (`iosSkipSigning = true`, `ios/build.gradle`;
 `archs = ['arm64']`). `:ios:robovmIPABuild` is a separate CI job that does **not** gate the weekly
 Android release (`.github/workflows/build.yml`). Treat iOS as a placeholder that keeps the `core/`
 stubs compiling for a second target; [device-runbook.md](device-runbook.md) covers Android only.

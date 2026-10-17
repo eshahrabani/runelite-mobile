@@ -2,7 +2,7 @@
 
 **Audience:** developer
 **Read this when:** you touch Jagex account login, session tokens, the local OAuth callback, or the client's `JX_*` launch contract
-**Verified against:** `MainActivity.startJagexLogin`, `MainActivity.onNewIntent`, `MainActivity.handleLeg1Code`, `MainActivity.handleConsentFragment`, `MainActivity.bootstrapGameClient`, `JagexOAuthClient.java`, `LocalCallbackServer.java`, `AndroidManifest.xml`, `xml/network_security_config.xml`
+**Verified against:** `MainActivity.startJagexLogin`, `MainActivity.onNewIntent`, `MainActivity.handleLeg1Code`, `MainActivity.startConsentLeg`, `MainActivity.handleConsentFragment`, `MainActivity.onLoginSucceeded`, `MainActivity.selectCharacter`, `MainActivity.bootstrapGameClient`, `MainActivity.writeCredentialsFile`, `MainActivity.importCredentialsFile`, `MainActivity.saveManualCredentials`, `MainActivity.signOut`, `JagexOAuthClient.java`, `LocalCallbackServer.java`, `AndroidManifest.xml`, `xml/network_security_config.xml`
 
 The port does not implement authentication. It runs the two-leg OAuth flow that the official
 Jagex Launcher performs, then hands the resulting **game session** to the unmodified client as
@@ -13,8 +13,10 @@ Jagex Launcher performs, then hands the resulting **game session** to the unmodi
 Both legs happen in the **device's external browser**, opened with `Intent.ACTION_VIEW`
 (`MainActivity.openInBrowser`). There is no embedded `WebView` in the login path: Jagex's
 Cloudflare bot protection rejects the `Android WebView` UA-CH runtime, which no WebView API can
-mask, so an external browser is required (comment above `MainActivity.startJagexLogin`). The
-comment at `MainActivity:264` that still says "login WebView overlay" is stale.
+mask, so an external browser is required (comment above `MainActivity.startJagexLogin`). Two
+comments still say "login WebView overlay" — `MainActivity.onCreate` step 3 and the
+`loginOverlay` declaration block ("WebView created lazily in startJagexLogin") — and both
+are stale: `loginOverlay` is a plain `FrameLayout` that is only shown/hidden.
 
 | Leg | Client | Purpose | How the result returns |
 |---|---|---|---|
@@ -75,8 +77,8 @@ nor `nonce`, and leg 2's `nonce` is sent but never checked.
 
 The `code` comes back one of two ways:
 
-- `jagex:` scheme → `handleLeg1Scheme` strips the scheme and parses `code=...&state=...`
-  (splits on `[,&]`, URL-decodes each value).
+- `jagex:` scheme → `handleLeg1Scheme` strips the scheme and scans the `code=...&state=...`
+  pairs (splits on `[,&]`, URL-decodes each value) but keeps only `code`.
 - the https launcher redirect → `handleLeg1Redirect` → `parseUrlParam(url, "code")`.
 
 Both funnel into `handleLeg1Code`, which moves the state to `EXCHANGING` and exchanges the code
@@ -221,10 +223,11 @@ No `login_provider` gate is applied to the consent leg.
 
 Two paths exist when the interactive flow is unavailable:
 
-- **Manual entry.** `btnManual` toggles a panel with `Enable Jagex Account Mode`, `JX_SESSION_ID`,
-  `JX_CHARACTER_ID`, `JX_DISPLAY_NAME`, and `Save & Apply` (`MainActivity.buildLauncherUi`).
-  `saveManualCredentials` requires a session id when enabled, clears the OAuth token fields, then
-  saves through `saveSessionState`.
+- **Manual entry.** `btnManual` ("Manual session tokens (advanced)") toggles a panel built by
+  `MainActivity.buildLauncherUi`: the `swJxMode` switch ("Enable Jagex Account Mode"), the
+  `JX_SESSION_ID (jagexSessionId)` / `JX_CHARACTER_ID (characterId)` / `JX_DISPLAY_NAME` fields,
+  and `Save & Apply`. `saveManualCredentials` requires a session id when `swJxMode` is checked,
+  clears the OAuth token fields, then saves through `saveSessionState`.
 - **`credentials.properties` import.** At `onCreate`, `importCredentialsFile` looks for the file
   first in `getFilesDir()`, then in `getExternalFilesDir(null)`. It accepts the aliases
   `jagexSessionId` / `characterId` / `displayName` via `firstNonEmpty`, requires a non-empty

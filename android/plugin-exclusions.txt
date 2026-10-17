@@ -14,6 +14,11 @@
 # @PluginDependency(BankTagsPlugin) and PluginManager refuses to instantiate a
 # plugin whose dependency is missing ("Unmet dependency for ClueScrollPlugin:
 # BankTagsPlugin"), so excluding bank tags would cost the clue-scroll overlays too.
+# WorldMapPlugin predates the sidebar. Unlike the other four entries, its bytecode
+# (all 142 classes of net/runelite/client/plugins/worldmap/) references no
+# lwjgl/JNA/jshell/FlatLaf/Discord/LinkBrowser/java.awt.Desktop symbol, so the
+# admission rule above does not explain it. Kept excluded until it is re-evaluated
+# against the Swing sidebar on a device; docs/plugin-runtime.md §3 says the same.
 net.runelite.client.plugins.worldmap.WorldMapPlugin
 net.runelite.client.plugins.gpu.GpuPlugin
 net.runelite.client.plugins.devtools.DevToolsPlugin

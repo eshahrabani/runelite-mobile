@@ -71,7 +71,7 @@ public final class RuneLiteHost {
         return injector != null && failure == null;
     }
 
-    /** The startup failure, or null. Surfaced in the side panel's Host tab. */
+    /** The startup failure, or null. Surfaced in the launcher's Host section. */
     public static Throwable failure() {
         return failure;
     }
@@ -149,9 +149,10 @@ public final class RuneLiteHost {
 
     /**
      * Starts the RuneLite runtime. Idempotent; must be called from a background thread
-     * (it performs one blocking HTTP fetch before handing the lifecycle to the UI
-     * thread, because {@code PluginManager} insists plugins start on the event dispatch
-     * thread, which on this port is the Android main thread).
+     * (it performs one blocking HTTP fetch before handing the lifecycle to the event
+     * dispatch thread, because {@code PluginManager} insists plugins start on the EDT —
+     * on this port that is {@link org.runelite.mobile.bridge.SwingEdt}
+     * ({@code Swing-EDT-rlmobile}), registered through {@code AWTBridge.registerUiThread}).
      */
     public static void start(Object gameClient, ClassLoader loader) {
         synchronized (LOCK) {
@@ -245,9 +246,9 @@ public final class RuneLiteHost {
             return;
         }
 
-        // Plugin lifecycle on the UI thread: PluginManager asserts the EDT and uses
+        // Plugin lifecycle on the dispatch thread: PluginManager asserts the EDT and uses
         // SwingUtilities.invokeAndWait internally, and our SwingUtilities routes both to
-        // the main thread (see AWTBridge.registerUiThread).
+        // the registered dispatch thread -- SwingEdt (see AWTBridge.registerUiThread).
         AWTBridge.post(RuneLiteHost::startPlugins);
     }
 

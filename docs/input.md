@@ -2,9 +2,9 @@
 
 **Audience:** developer
 **Read this when:** you touch `MainActivity.setupTouchInput`, the keyboard bar, the camera/pinch gestures, or need to know why a tap or keystroke is dropped.
-**Verified against:** `MainActivity.setupTouchInput`, `MainActivity.handleTwoFingerMove`, `MainActivity.startCameraDrag`, `MainActivity.endCameraDrag`, `MainActivity.toGameX`, `MainActivity.beginTapPress`, `MainActivity.forceCameraDragSetting`, `MainActivity.resolveInputTarget`, `MainActivity.emitPoint`, `MainActivity.dispatchMouseWheel`, `MainActivity.dispatchKeyText`, `MainActivity.deliverKeyEvent`, `MainActivity.buildLauncherUi`, `MainActivity.launchGame`, `SidePanel` (column + `⌨` tile), `java/awt/event/MouseEvent.java`, `java/awt/event/KeyEvent.java`
+**Verified against:** `MainActivity.setupTouchInput`, `MainActivity.handleTwoFingerMove`, `MainActivity.startCameraDrag`, `MainActivity.endCameraDrag`, `MainActivity.toGameX`, `MainActivity.beginTapPress`, `MainActivity.forceCameraDragSetting`, `MainActivity.resolveInputTarget`, `MainActivity.emitSegment`, `MainActivity.emitPoint`, `MainActivity.dispatchMouseWheel`, `MainActivity.dispatchKeyText`, `MainActivity.dispatchKeyCode`, `MainActivity.deliverKeyEvent`, `MainActivity.showKeyboardBar`, `MainActivity.buildLauncherUi`, `MainActivity.launchGame`, `SidePanel` (column + `⌨` tile), `SwingSidebarView.dispatchKey`, `org.runelite.mobile.MousePath`, `org.runelite.mobile.bridge.UiBridge` (`focusOwnerIsTextInput`, `Host.textInputRequested`), `java/awt/event/MouseEvent.java`, `java/awt/event/KeyEvent.java`
 
-Touch and keyboard are a **synthesis layer**: Android `MotionEvent`s and `EditText` edits are rebuilt as `java.awt.event` objects and handed to the injected client's own listeners. The client is never modified; it believes it is running on a desktop with a mouse and keyboard. That is why every failure mode in this document is either a coordinate bug, an event-ordering bug, or a missing member in the stub classes documented in [core-stubs.md](core-stubs.md).
+Touch and keyboard are a **synthesis layer**: Android `MotionEvent`s and `EditText` edits are rebuilt as `java.awt.event` objects and handed to the injected client's own listeners (and, for the keyboard, to RuneLite's real Swing sidebar — section 6). The client is never modified; it believes it is running on a desktop with a mouse and keyboard. That is why every failure mode in this document is either a coordinate bug, an event-ordering bug, or a missing member in the stub classes documented in [core-stubs.md](core-stubs.md).
 
 ## 1. Coordinate mapping
 
@@ -36,7 +36,7 @@ Each case dispatches synthesized `MouseEvent`s through `dispatchMouseEvent` / `e
 |---|---|
 | `ACTION_DOWN` | `MOUSE_MOVED` at the touch point **immediately**; `pointerDown=false`; a long press is scheduled (`scheduleLongPress`, `LONG_PRESS_MS`). **No left-button event is sent yet** — the gesture decides which one it is |
 | `ACTION_MOVE` (before a press) | `MOUSE_MOVED` for each historical sample then the current point — unless the finger has moved past `ROTATE_LOCK_DP`, which turns the gesture into a camera rotate (section 3) |
-| `ACTION_MOVE` (after a press) | `MOUSE_DRAGGED`, same historical-then-current pattern. Only reachable on the lift path (`beginTapPress` sets `pointerDown`), i.e. the drag from the down point to the release point of a tap |
+| `ACTION_MOVE` (press outstanding) | `MOUSE_DRAGGED`, same historical-then-current pattern. Not reachable in practice: no press is outstanding during a move (`pointerDown` is set and cleared only inside `ACTION_UP`), so the tap's `MOUSE_DRAGGED` is the one the `ACTION_UP` row emits |
 | `ACTION_UP` (tap) | `beginTapPress()` sends `MOUSE_MOVED` + `MOUSE_PRESSED` at the down point, then `MOUSE_DRAGGED` to the release point, `MOUSE_RELEASED` and `MOUSE_CLICKED` |
 | `ACTION_UP` (after a long press or a camera drag) | nothing: `suppressUntilUp` / `oneFingerDrag` teardown only |
 | `ACTION_CANCEL` | drops the pending long press; releases the middle button if a camera drag was active |
@@ -65,7 +65,7 @@ The still hold is free for the menu **because the left press was never sent** �
 
 Teardown: `ACTION_UP`/`ACTION_CANCEL` call `endCameraDrag` (middle button up at the current point, `restoreCameraDragSetting()`) and emit **no** left-button event, so a camera drag can never walk or attack; a long press sets `suppressUntilUp` so the lift produces nothing either. `ACTION_POINTER_DOWN` hands a one-finger drag over to the two-finger router (`endCameraDrag` first) and cancels the pending long press.
 
-**Two fingers** do not immediately start a camera drag either: a pinch has to be told apart from a rotation. `ACTION_POINTER_DOWN` only records the gesture's start state (`twoFingerMode = TWO_NONE`, span, centroid, `gestureStartWhen`, `zoomRemainder = 0`), cancels the pending long press and ends a one-finger camera drag; no mouse event is emitted.
+**Two fingers** do not immediately start a camera drag either: a pinch has to be told apart from a rotation. `ACTION_POINTER_DOWN` only records the gesture's start state (`twoFingerMode = TWO_NONE`, span, centroid, `gestureStartWhen`, `zoomRemainder = 0`), cancels the pending long press and ends a one-finger camera drag; no mouse event is emitted (the deferred press means none is outstanding — the code's in-flight-release branch is unreachable, since `pointerDown` is set and cleared only inside `ACTION_UP`).
 
 `ACTION_MOVE` with two pointers routes through `handleTwoFingerMove`, which locks the mode once and never changes it back within one gesture:
 
@@ -164,7 +164,7 @@ That is `MouseEvent(Component,int,long,int,int,int,int,boolean,int)`: modifiers 
 
 ## 6. Keyboard bridge
 
-The game has **no in-game text input**. There is no IME hook inside the client; instead a floating bar injects AWT `KeyEvent`s into the same listeners the mouse path uses.
+The game has **no in-game text input**. There is no IME hook inside the client; instead a floating bar injects AWT `KeyEvent`s. The bar has **two consumers**: the game's own `KeyListener`s, and RuneLite's real Swing sidebar (`SwingSidebarView`, the asset-dex host), which is where the sidebar's text fields are typed. `dispatchKeyText` and `dispatchKeyCode` pick the consumer per event: they first ask `UiBridge.focusOwnerIsTextInput()` — true when the core's `KeyboardFocusManager` focus owner is a `javax.swing.text.JTextComponent` — and, if so, route the run to the Swing focus owner via `SwingSidebarView.dispatchKey` → `UiBridge.dispatchKey` → `KeyboardFocusManager.dispatchKeyEvent`; only otherwise do they fall back to the game's listeners (`MainActivity.dispatchKeyText`, `dispatchKeyCode`).
 
 | Widget | Detail |
 |---|---|
@@ -175,17 +175,19 @@ The game has **no in-game text input**. There is no IME hook inside the client; 
 
 `toggleKeyboardBar` flips `kbBar` visibility and shows/hides the soft keyboard via `InputMethodManager` (`MainActivity.toggleKeyboardBar`). The bar is inset by the right-edge chrome width like the game surface (`applyGameInsets`), so it centres over the game area rather than under the drawer column.
 
+The core can also raise the bar itself: when a Swing text component takes or loses the focus from a pointer press, `UiBridge.focusOwnerChanged` fires `Host.textInputRequested` → the `SwingSidebarView` callback → `MainActivity.showKeyboardBar(boolean)` (thread-hopped to the Android main thread). So a tap on a sidebar text field opens the same bar, and its keystrokes land in the Swing field rather than the game. `showKeyboardBar` is idempotent; `toggleKeyboardBar` is the `⌨`-tile/manual path.
+
 `kbEdit` is **not** `TYPE_TEXT_VARIATION_VISIBLE_PASSWORD`: Gboard treats a password field as one it must take over in landscape (its fullscreen "extract" editor), which covers the app entirely. `TYPE_TEXT_FLAG_NO_SUGGESTIONS` + `IME_FLAG_NO_PERSONALIZED_LEARNING` + `IME_FLAG_NO_EXTRACT_UI` keep the other half of that variation's behaviour (no autocorrect, no learned words) without the takeover.
 
 Text is diffed, not echoed wholesale. A `TextWatcher` computes the common prefix `pf` and common suffix `sf` between `kbPrevText` and the new text, derives `removed = oldLen - pf - sf` and `added = newText.substring(pf, newLen - sf)`, emits one `dispatchKeyCode(VK_BACK_SPACE, '\b')` per removed character, then `dispatchKeyText(added)` (`buildLauncherUi`, `afterTextChanged`). This turns arbitrary `EditText` edits (paste, selection replace) into a minimal stream of key events.
 
-`dispatchKeyText` emits, for each character, `KEY_PRESSED` + `KEY_TYPED` + `KEY_RELEASED`; the key code is the upper-case `VK` value for letters (`c - 32` for `a`–`z`) and the character itself otherwise (`MainActivity.dispatchKeyText`). `dispatchKeyCode` does the same three-event sequence for a single `(keyCode, keyChar)` pair, used for `VK_ENTER` and `VK_BACK_SPACE` (`MainActivity.dispatchKeyCode`).
+`dispatchKeyText` emits, for each character, `KEY_PRESSED` + `KEY_TYPED` + `KEY_RELEASED`; the key code is the upper-case `VK` value for letters (`c - 32` for `a`–`z`, `charKeyCode`) and the character itself otherwise, and the `KEY_TYPED` event carries that same code in the game branch but `VK_UNDEFINED` in the Swing branch (desktop-accurate). `dispatchKeyCode` does the same three-event sequence for a single `(keyCode, keyChar)` pair, used for `VK_ENTER` and `VK_BACK_SPACE` (`MainActivity.dispatchKeyCode`); its `KEY_TYPED` likewise carries `VK_UNDEFINED` on the Swing branch.
 
 `deliverKeyEvent` constructs one `KeyEvent(target, id, when, 0, keyCode, keyChar)` and walks `getKeyListeners()` on the resolved target **and** on `GameEngine.getCanvas()` when the canvas differs from the target (`MainActivity.deliverKeyEvent`). Both are tried because the game registers key listeners on the canvas while RuneLite-side listeners may sit on the component.
 
 ## 7. The stub dependency
 
-Every event above is a `java.awt.event` object built by the port's own stubs. If a member the client touches is missing, the client's listener throws. The mouse path wraps dispatch in `catch (Throwable)` (`emitPoint`, `dispatchMouseEvent`), so a missing member shows up as a logged failure rather than a crash; the keyboard path (`dispatchKeyText`, `deliverKeyEvent`) has no such guard and a missing `KeyEvent` member surfaces as an uncaught error. In both cases the visible symptom is a **silent drop**: taps do nothing, typing does nothing.
+Every event above is a `java.awt.event` object built by the port's own stubs. If a member the client touches is missing, the client's listener throws. The mouse path wraps dispatch in `catch (Throwable)` (`emitPoint`, `dispatchMouseEvent`), so a missing member shows up as a logged failure rather than a crash; the keyboard path's game branch (`dispatchKeyText`, `deliverKeyEvent`) has no such guard and a missing `KeyEvent` member surfaces as an uncaught error (the Swing branch is guarded — `UiBridge.dispatchKey` catches and prints). In both cases the visible symptom is a **silent drop**: taps do nothing, typing does nothing.
 
 The load-bearing members for input are (see [core-stubs.md](core-stubs.md)):
 
@@ -207,6 +209,7 @@ The drawer, its column and the keyboard bar consume only events inside their own
 3. `bootOverlay` — the themed "Starting RuneLite…" card, hidden on the first presented frame.
 4. `kbBar` — the keyboard bar, top-centre.
 5. the `SidePanel` container, created by `new SidePanel(this, rootLayout)` (its column and drawer are added during construction) — so the column and drawer draw over the boot overlay.
-6. `loginOverlay` — added **last**, so the login overlay covers the drawer and every other control while a login is in progress.
+6. `windowLayer` (a `SwingWindowLayer`) — the core's virtual Swing windows (the colour picker, plugin dialogs), presented as bitmaps; above the drawer, and it shows itself only while the core has a visible window up.
+7. `loginOverlay` — added **last**, so the login overlay covers the drawer, the window layer and every other control while a login is in progress.
 
 Removing the launcher (`launchGame`) only sets `launcherScroll` to `GONE`; it does not remove it, so the add order is fixed for the Activity's lifetime. The column and the drawer are hidden as a unit by `SidePanel.setAvailable(false)` on the launcher screen.

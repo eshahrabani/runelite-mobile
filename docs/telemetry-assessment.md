@@ -2,7 +2,7 @@
 
 **Audience:** developer
 **Read this when:** you need to know exactly what the running client can send to Jagex, or you are re-checking this port after a client version bump.
-**Verified against:** `android/build.gradle` `transformClassBytes`, `MainActivity.bootstrapGameClient`, `docs/rendering.md`, `docs/diagnostics.md`
+**Verified against:** `android/build.gradle` (`syncRuneLiteJars`, `transformClassBytes`, the crash-beacon pass), `MainActivity.java` (`bootGameClient` steps 4–6, `bindSceneRasterizerToDisplay`), `core/src/main/java/org/runelite/mobile/{TileCompositor,MousePath}.java`, `docs/rendering.md`, `docs/diagnostics.md`
 
 What this port can and cannot send to Jagex, and how to re-check it.
 
@@ -11,19 +11,22 @@ What this port can and cannot send to Jagex, and how to re-check it.
 Answers "does running this port expose me to account action / leak client identity?"
 by mapping the client-side telemetry substrate that the app actually runs.
 
-- The port does **not** ship a client. At runtime it downloads RuneLite's official
-  `injected-client` + `runelite-api` jars and runs them under `DexClassLoader`
-  (`android/src/main/java/org/runelite/mobile/MainActivity.java`, bootstrap step 5).
+- The port does **not** ship a client. `downloadAndDexJar` (build time) downloads RuneLite's
+  official `injected-client` + `runelite-api` + `client` jars, ASM-transforms them and dexes
+  them into one `assets/runelite-dex.jar`; at runtime `MainActivity.bootGameClient` copies
+  that asset into `files/` and loads it through a `DexClassLoader` (bootstrap step 4),
+  instantiating the game in step 5. Nothing is patched on-device.
 - The version marker `android/src/main/assets/client-version.txt` is **generated** by
   `downloadAndDexJar` (the version pinned by `bootstrap.json`) and is gitignored; it is not
-  checked in. Its value in this working tree is **1.13.1**. On the device, `ClientUpdater`
+  checked in. Its value in this working tree is **1.13.2**. On the device, `ClientUpdater`
   fetches the *published* `client-version.txt` from the CI release base
   (`BuildConfig.DIST_BASE`) and downloads the matching pre-dexed `runelite-dex.jar`; it never
   fetches `bootstrap.json`.
-- The static reverse-engineering corpus is an external private corpus (bot-detection,
-  dupe-hunt and Java-RE notes), taken against `injected-client-1.12.38`.
-  Class names are obfuscated per version; treat its names as the 1.12.x mapping and
-  re-derive on a version bump (section 6).
+- Provenance: the channel map below was established by decompiling the shipped client jar
+  (last full pass: `injected-client-1.12.38`) and cross-checking each wire writer's bytecode;
+  rows that were re-verified against the 1.13.2 jar say so. Class names are obfuscated per
+  version — treat the `js.bb`-style names as the 1.12.x mapping and re-derive them on a
+  version bump (section 6).
 
 Conclusion up front: the Java client has **no client-identity / anti-tamper reporting,
 no automation mode, and no macro/bot detection code**. Account-action exposure is
@@ -32,83 +35,80 @@ therefore *policy* (this port is not on Jagex's approved list) and *behavioural*
 
 ## 2. Client → Jagex channels
 
-All verified against the corpus notes and re-checked against the
-live jar where noted.
-
-| Channel | Carries | Source |
+| Channel | Carries | Evidence |
 |---|---|---|
-| Mouse packets `js.bb` (wire id 40, 7 B) | click count, x, y, `(dt<<1)+isClick` | bot-detection notes §1.2–1.3, Appendix A |
-| Idle disconnect `js.ac` (id 7) | nothing (0 B) | §1.2, §6.4 |
-| Keepalive `js.df` (id 99) | nothing (0 B) | §1.2, §6.4 |
-| Login block UID | 24 bytes from `random.dat` | §1.4, §6.2 |
-| Item transition ledger | `dx.ax` 7-field record → `ca.af(18)` → same socket | dupe notes §4 |
-| Crash beacon | `GET clienterror.ws?cv=&cs=&u=&v1=&v2=&ct=&e=` | §2.1 |
-| Fatal redirects `error_game_*.ws` | path label only | §2.2 |
+| Mouse packets `js.bb` (wire id 40, 7 B) | click count, x, y, `(dt<<1)+isClick` | 1.12.x writer bytecode |
+| Idle disconnect `js.ac` (id 7) | nothing (0 B) | 1.12.x writer bytecode |
+| Keepalive `js.df` (id 99) | nothing (0 B) | 1.12.x writer bytecode |
+| Login block UID | 24 bytes from `random.dat` | 1.12.x login path |
+| Item transition ledger | `dx.ax` 7-field record → `ca.af(18)` → same socket | 1.12.x dupe analysis |
+| Crash beacon | `GET clienterror.ws?cv=&cs=&u=&v1=&v2=&ct=&e=` | 1.13.2: literal in `aat`; neutralised (section 4) |
+| Fatal redirects `error_game_*.ws` | path label only | 1.13.2: `to.co(URL)` → `ClientConfiguration.onError` (local) |
 
 Notes:
 
-- **Beacon** (`u` = user id, `e` = condensed stack containing `Class.method` tokens)
-  is fully armed but *statically orphaned* in the Java build (§6.1) — no static call
-  path reaches its senders; a caller could exist in the non-decompiled runtime jar.
-  In the live 1.13.1 jar the sender lives in `aat` (`aat.aj`, `aat.af`), and this port
-  now neutralises it (section 4). So no request can be emitted.
-- **`error_game_*`** is routed by `tq.qn` to the local
+- **Beacon** (`u` = user id, `e` = condensed stack containing `Class.method` tokens) is armed
+  but *statically orphaned*: no class in the 1.13.2 `injected-client` or `client` jar holds a
+  method reference to its senders `aat.aj`/`aat.af` (constant-pool scan), and the build pass
+  in section 4 forces those methods to return immediately — so no request can be emitted by
+  this port regardless of the call graph.
+- **`error_game_*`** is routed by `to.co(URL)` to the local
   `net.runelite.api.ClientConfiguration.onError` callback, i.e. to this port's proxy
-  (`MainActivity` bootstrap step 6) — the label never reaches the network here.
-- **Keys never go on the wire**: the only consumer of the keyboard queue is local
-  widget dispatch (§1.1).
+  (`MainActivity` bootstrap step 6, which logs `ClientConfig.onError: <label>` and returns) —
+  the label never reaches the network here.
+- **Keys never go on the wire**: the only consumer of the keyboard queue is local widget
+  dispatch (1.12.x analysis).
 - No third-party analytics/crash SDK is present in this app; the `:android` module depends
-  only on `:core`, `androidx.appcompat:appcompat:1.6.1`, `com.google.android.material:material:1.11.0`,
-  an `slf4j-api-*.jar` picked out of the downloaded RuneLite jars, and `org.slf4j:slf4j-simple:1.7.25`
-  (ASM/R8 are build-script-only: `org.ow2.asm:*` is on the buildscript
-  classpath, and d8 comes from the SDK build-tools — neither is an app dependency).
+  only on `:core`, `androidx.appcompat:appcompat:1.6.1`,
+  `com.google.android.material:material:1.11.0`, an `slf4j-api-*.jar` picked out of the
+  downloaded RuneLite jars, and `org.slf4j:slf4j-simple:1.7.25` (ASM/R8 are build-script-only:
+  `org.ow2.asm:*` is on the buildscript classpath, and d8 comes from the SDK build-tools —
+  neither is an app dependency).
 
 ## 3. What the client does NOT send
 
 - No client-identity / "modified client" / anti-tamper reporting of any kind.
-- No macro/bot/cheat detection strings in the Java corpus (only `macroExpand`, a text
-  function — bot-detection notes §"Ruled out").
-- No `--automate_ip/--automate_port` remote-automation mode and no dev console
-  (both exist only in Jagex's C++ client — §3 cross-map rows 4–5).
-- ISAAC (`yt`) masks only opcode bytes; lengths and payloads are plaintext (§5).
+- No macro/bot/cheat detection strings in the Java client (only `macroExpand`, a text
+  function).
+- No `--automate_ip/--automate_port` remote-automation mode and no dev console (both exist
+  only in Jagex's C++ client, not in what this port runs).
+- ISAAC (`yt`) masks only opcode bytes; lengths and payloads are plaintext (1.12.x analysis).
 
 ## 4. Port-specific deltas
 
-- **Host**: `DexClassLoader` + AWT/Swing stubs under `core/src/main/java/java/…`; the
-  game runs RuneLite's own bytecode, so its wire behaviour is RuneLite's.
+- **Host**: `DexClassLoader` + AWT/Swing stubs under `core/src/main/java/java/…`; the game
+  runs RuneLite's own bytecode, so its wire behaviour is RuneLite's.
 - **ASM patch**: `downloadAndDexJar` (`android/build.gradle`) injects read-only
-  `TileCompositor` hooks into the render loop and remaps Android-missing APIs at
-  **build time only** — the client jar is pre-dexed in CI and the app just downloads
-  it, so nothing is patched on-device. Every hook is guarded
-  (`catch (Throwable)` → `TileCompositor.hookFailed`), so port code cannot throw into
+  `TileCompositor` hooks into the render loop and remaps Android-missing APIs at **build time
+  only** — the client jar is pre-dexed in CI and the app just downloads it. Every hook is
+  guarded (`catch (Throwable)` → `TileCompositor.hookFailed`), so port code cannot throw into
   the game's frame loop and cannot contribute a class name to an error path.
-- **Crash-beacon neutralisation**: the ASM pass forces any non-`<init>`/`<clinit>`
-  method that references a `clienterror.ws…` literal to return immediately. Verified
-  on the live 1.13.1 jar: `aat.aj`/`aat.af` now start with `return` (build log
-  `[ASM] Neutered crash beacon in aat.aj`, and `javap` on
-  `android/build/temp-jars/injected-client-cleaned.jar`). The pass runs over every
-  class of the jar, so no gate can skip a class that carries the literal.
-- **Input synthesis**: touch → AWT `MouseEvent`. `setupTouchInput` replays
-  `MotionEvent` history and fills segments via `core/src/main/java/org/runelite/mobile/MousePath.java`
-  so the client sees a continuous, monotonic motion stream instead of single jumps.
-  A **one-finger drag** and a **two-finger rotate** are both synthesized as a
-  **middle-button** (`BUTTON2`) press/drag/release — the client's own camera-drag
-  path — at the finger (or the two-finger centroid); a pinch is a synthesized
-  **mouse wheel** stream, and a long press or a two-finger tap is a **right click**
-  (`BUTTON3`). The left press is **deferred**: nothing is pressed at touch-down, so
-  no gesture can turn into a stray walk/attack click, and a plain tap sends
-  press + release + click on lift. The resulting wire shape is ordinary mouse
-  input, not an automation signal.
-- **Software 3D presentation** (port-only, no wire effect): the 3D rasterizer's
-  per-instance pixel target is re-pointed at the display buffer by
-  `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a
-  256×256 scratch and only the desktop runtime's resize path re-points it), and
-  the 765×503 frame bitmap is drawn with alpha disabled
-  (`renderBitmap.setHasAlpha(false)`) because the rasterizer emits alpha-0 3D
-  pixels that `canvas.drawBitmap` would otherwise blend away. Both are required
-  for the world to be visible at all.
-- **OS fingerprint is truthful** (Linux/aarch64, no Windows spoofing); the JVM
-  properties emulated are only the ones Android lacks.
+- **Crash-beacon neutralisation**: the ASM pass prepends a typed default return
+  (`RETURN`/`ACONST_NULL`/`ICONST_0`/… per the method's return type) to every
+  non-`<init>`/`<clinit>` method whose body loads a `clienterror.ws…` string constant.
+  Verified on the 1.13.2 jar: `aat.aj`/`aat.af` now start with `0: return` (build log
+  `[ASM] Neutered crash beacon in aat.aj`, and `javap -p -c` on
+  `android/build/temp-jars/injected-client-cleaned.jar`). The pass runs over every class of
+  the jar, so no gate can skip a class that carries the literal.
+- **Input synthesis**: touch → AWT `MouseEvent`. `setupTouchInput` replays `MotionEvent`
+  history and fills segments via `core/src/main/java/org/runelite/mobile/MousePath.java` so
+  the client sees a continuous, monotonic motion stream instead of single jumps. A
+  **one-finger drag** and a **two-finger rotate** are both synthesized as a **middle-button**
+  (`BUTTON2`) press/drag/release — the client's own camera-drag path — at the finger (or the
+  two-finger centroid); a pinch is a synthesized **mouse wheel** stream, and a long press or a
+  two-finger tap is a **right click** (`BUTTON3`). The left press is **deferred**: nothing is
+  pressed at touch-down, so no gesture can turn into a stray walk/attack click, and a plain
+  tap sends press + release + click on lift. The resulting wire shape is ordinary mouse input,
+  not an automation signal.
+- **Software 3D presentation** (port-only, no wire effect): the 3D rasterizer's per-instance
+  pixel target is re-pointed at the display buffer by
+  `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a 256×256 scratch and
+  only the desktop runtime's resize path re-points it), and the 765×503 frame bitmap is
+  drawn with alpha disabled (`renderBitmap.setHasAlpha(false)`) because the rasterizer emits
+  alpha-0 3D pixels that `canvas.drawBitmap` would otherwise blend away. Both are required for
+  the world to be visible at all.
+- **OS fingerprint is truthful** (Linux/aarch64, no Windows spoofing); the JVM properties
+  emulated are only the ones Android lacks.
 
 ## 5. Policy position
 
@@ -124,14 +124,21 @@ not appealable.
 
 On a client version bump (watch `bootstrap.json` / `client-version.txt`):
 
-1. Re-decompile: `java -jar vineflower-<ver>.jar <injected-client-<ver>.jar> <decompile-out-dir>`.
-2. Re-run the corpus naming-anchor scans (private tooling)
-   and candidate scans, then re-derive the §2 channels from the bot-detection notes'
-   methodology (send/recv opcode tables move every version).
-3. Re-check the beacon: `unzip -p <client jar> '*.class' | strings | grep clienterror`
-   to find the owning class, then confirm this port neutralises it — the build log
-   must print `[ASM] Neutered crash beacon in <class>.<method>` and `javap` on
-   `android/build/temp-jars/injected-client-cleaned.jar` must show a leading `return`.
-   If the literal is absent, the pass is inert and no action is needed.
-4. Re-check `grep -rl "firebase\|crashlytics\|analytics\|sentry" .` returns nothing in
+1. Decompile the jar the build actually shipped:
+   `java -jar vineflower-<ver>.jar android/build/rl-jars/injected-client-<ver>.jar /tmp/decompiled`
+   (any current Java decompiler works — the point is a fresh tree for the *shipped* version,
+   because every name in section 2 is obfuscated per version).
+2. Re-derive the section 2 channels from the writers: find the socket write path and the
+   packet-id dispatch, and re-capture the mouse/idle/keepalive opcodes and their payload
+   layouts (they move every version).
+3. Re-check the beacon: find the owning class with
+   `for c in $(unzip -Z1 <client jar> | grep '\.class$'); do unzip -p <client jar> "$c" | grep -q clienterror\.ws && echo "$c"; done`,
+   then confirm this port neutralises it — the build log must print
+   `[ASM] Neutered crash beacon in <class>.<method>` and `javap -p -c` on
+   `android/build/temp-jars/injected-client-cleaned.jar` must show the method body starting
+   with a return. If the literal is absent, the pass is inert and no action is needed.
+4. Re-check the `error_game_` path: locate the class holding the `error_game_` literal and
+   confirm it still calls `ClientConfiguration.onError` (local callback) rather than
+   `java.applet.AppletContext.showDocument` (a real URL open).
+5. Re-check `grep -rl "firebase\|crashlytics\|analytics\|sentry" .` returns nothing in
    this repo (no added telemetry SDK).

@@ -2,7 +2,7 @@
 
 **Audience:** developer
 **Read this when:** you are working on the plugin host, host shims, plugin index, or config storage
-**Verified against:** `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `hostshims/src/**`, `android/build.gradle`, `android/plugin-exclusions.txt`, `android/src/main/java/org/runelite/mobile/MainActivity.java`
+**Verified against:** `android/src/main/java/org/runelite/mobile/host/RuneLiteHost.java`, `android/src/main/java/org/runelite/mobile/host/PluginConformance.java`, `hostshims/src/net/runelite/client/**`, `android/build.gradle`, `android/plugin-exclusions.txt`, `android/src/main/java/org/runelite/mobile/MainActivity.java`
 
 The port runs RuneLite's real `PluginManager`, `EventBus`, `ConfigManager` and `OverlayManager`
 from the asset dex. What it does *not* run is the desktop shell those managers normally assume.
@@ -19,8 +19,10 @@ see [build-and-release.md](build-and-release.md); for the conformance/observabil
 Upstream RuneLite discovers plugins with Guava's `ClassPath.from(classLoader)`, which walks
 `java.class.path` on the JVM. On ART there is no classpath to walk: classes come from a dex file
 loaded by a `DexClassLoader`, and `ClassPath.from` returns nothing useful. The port therefore
-**turns the plugin list into a build artifact**. `downloadAndDexJar` scans the cleaned RuneLite
-client jar and writes `runelite-plugin-index.txt` into the asset dex (`android/build.gradle`,
+**turns the plugin list into a build artifact**. `syncRuneLiteJars` downloads the three RuneLite
+jars pinned by one `bootstrap.json` fetch (`client-<ver>.jar`, `injected-client-<ver>.jar`,
+`runelite-api-<ver>.jar`); `downloadAndDexJar` (which depends on it) then scans the cleaned client
+jar and writes `runelite-plugin-index.txt` into the asset dex (`android/build.gradle`,
 `generatePluginIndex`). At startup `RuneLiteHost.loadPluginIndex()` reads that resource back off
 the child loader and feeds the classes to `PluginManager` (`RuneLiteHost.loadPluginIndex`).
 
@@ -44,13 +46,14 @@ flowchart TD
     D --> E["RuntimeConfigLoader.get() on the host thread"]
     E --> F["RuneLiteModule ctor, 10 args"]
     F --> G["Guice.createInjector + RuneLite.setInjector"]
-    G --> H["resolve Callbacks, PluginManager, ConfigManager, EventBus, OverlayManager"]
+    G --> G2["initSidebar: ClientUI.init() builds the sidebar"]
+    G2 --> H["resolve Callbacks, PluginManager, ConfigManager, EventBus, OverlayManager"]
     H --> I["AWTBridge.post(RuneLiteHost::startPlugins)"]
     I --> J["startPlugins on the UI/EDT thread"]
     J --> K["configManager.load() then loadPluginIndex()"]
     K --> L["PluginManager.loadPlugins: bulk, else one by one"]
     L --> M["PluginManager.startPlugins()"]
-    M --> N["MobilePluginHub.loadPlugins then GraphicsSelfTest.run()"]
+    M --> N["MobilePluginHub.loadPlugins, then GraphicsSelfTest + SwingSelfTest"]
 ```
 
 Numbered, with the exact calls:
@@ -82,22 +85,29 @@ Numbered, with the exact calls:
    Injecting now would replace the client's `Callbacks` field with `Hooks` directly, bypassing the
    proxy's frame blit and leaving the render thread waiting on `frameSeq` forever — a black screen
    with a live runtime.
-8. `installNavigationHook` installs the `ClientToolbar.navigationListener` field (`RuneLiteHost.java`,
-   `MainActivity`), then the components are resolved by name through `get(...)`:
+8. `initSidebar` builds RuneLite's real Swing sidebar: it gets
+   `net.runelite.client.ui.ClientUI` and calls its `init()` on the Swing dispatch thread, which
+   builds the `ClientToolbarPanel` + `JTabbedPane` tree and publishes it through
+   `UiBridge.setSidebarRoot` (`RuneLiteHost.java`). A failure is recorded in
+   `RuneLiteHost.sidebarFailure()` but is never fatal. Then the components are resolved by name
+   through `get(...)`:
    `net.runelite.api.hooks.Callbacks`, `net.runelite.client.plugins.PluginManager`,
    `net.runelite.client.config.ConfigManager`, `net.runelite.client.eventbus.EventBus`,
    `net.runelite.client.ui.overlay.OverlayManager`, and optionally
    `net.runelite.client.callback.ClientThread` (`RuneLiteHost.java`).
 9. `AWTBridge.post(RuneLiteHost::startPlugins)` hands the lifecycle to the UI thread
    (`RuneLiteHost.java`). `PluginManager` asserts the event-dispatch thread and calls
-   `SwingUtilities.invokeAndWait` internally; on this port `AWTBridge.registerUiThread` routes both
-   to the Android main thread.
+   `SwingUtilities.invokeAndWait` internally; `MainActivity.onCreate` registers `SwingEdt` as the
+   runtime's UI thread (`AWTBridge.registerUiThread(SwingEdt.ensureStarted(), SwingEdt::post)`), so
+   both route to `Swing-EDT-rlmobile`. The Android main thread only presents bitmaps and forwards
+   input.
 10. `startPlugins` runs on the EDT: sets `jagex.disableBouncyCastle` and
     `runelite.pluginhub.version`, calls `configManager.load()`, reads the plugin index, loads
     plugins (with the fallback above), calls `loadDefaultPluginConfiguration`, registers the three
     managers on the bus, calls `overlayManager.init()`, and finally `pluginManager.startPlugins()`
-    (`RuneLiteHost.java`). Then `MobilePluginHub.loadPlugins` sideloads hub jars and
-    `GraphicsSelfTest.run()` validates the draw surface.
+    (`RuneLiteHost.java`). Then `MobilePluginHub.loadPlugins` sideloads hub jars, and the two
+    self-tests run: `GraphicsSelfTest.run()` validates the draw surface and `SwingSelfTest.run()`
+    the Swing runtime the sidebar and the plugin panels are built from.
 
 All the injector's products are typed as `Object` and reached reflectively: `RuneLiteHost` stores
 no `net.runelite.*` type in a field signature, so the app dex never links the asset dex at compile
@@ -106,7 +116,7 @@ time.
 ## 3. Plugin index lifecycle
 
 `generatePluginIndex(File jar)` runs inside `downloadAndDexJar` and produces
-`runelite-plugin-index.txt` at the asset root (`android/build.gradle:239-286`, `MainActivity`):
+`runelite-plugin-index.txt` at the asset root (`android/build.gradle`, `generatePluginIndex`):
 
 | Step | Rule |
 |---|---|
@@ -119,30 +129,22 @@ time.
 
 The exclusion list is a build input (`android/plugin-exclusions.txt`), read by
 `generatePluginIndex` and by nothing else. A class listed there is still present in the asset dex;
-it is simply never instantiated. Admission rule (from the file's header): the plugin delivers its
-function through the desktop Swing shell, or needs lwjgl / JNA / a desktop browser. The native
-side panel replaces the shell but cannot host foreign `JPanel`s.
+it is simply never instantiated. Admission rule (from the file's header): the plugin needs lwjgl /
+JNA / a desktop-only library set, a native web browser, or a desktop screenshot folder. **Panels
+are no longer a reason to exclude a plugin** — the drawer hosts RuneLite's real Swing panels, so
+the panel-only plugins (`ConfigPlugin`, `LootTrackerPlugin`, `NotesPlugin`, `TimeTrackingPlugin`,
+`SkillCalculatorPlugin`, `ScreenMarkerPlugin`, `WorldHopperPlugin`, `HiscorePlugin`,
+`GrandExchangePlugin`, `KourendLibraryPlugin`, `InfoPlugin`) all instantiate.
 
-At the time of writing the list holds 16 FQCNs:
+At the time of writing the list holds 5 FQCNs:
 
 | Plugin FQCN | Why excluded |
 |---|---|
-| `config.ConfigPlugin` | desktop config shell; replaced by the native Config tab |
-| `worldmap.WorldMapPlugin` | plugin-owned Swing window |
-| `gpu.GpuPlugin` | needs a desktop GL stack |
-| `devtools.DevToolsPlugin` | desktop inspector |
-| `discord.DiscordPlugin` | needs the Discord SDK / desktop integration |
-| `hiscore.HiscorePlugin` | plugin-owned window |
-| `grandexchange.GrandExchangePlugin` | plugin-owned window |
-| `worldhopper.WorldHopperPlugin` | desktop-only shell |
-| `notes.NotesPlugin` | plugin-owned Swing panel |
-| `timetracking.TimeTrackingPlugin` | plugin-owned Swing panel |
-| `screenmarkers.ScreenMarkerPlugin` | Swing interaction |
-| `skillcalculator.SkillCalculatorPlugin` | plugin-owned window |
-| `screenshot.ScreenshotPlugin` | desktop screenshot path |
-| `loottracker.LootTrackerPlugin` | Swing panel |
-| `info.InfoPlugin` | `InfoPanel.<init>` NPE (`JEditorPane.getEditorKit().getStyleSheet()`) |
-| `kourendlibrary.KourendLibraryPlugin` | `GroupLayout.createParallelGroup().addComponent(...)` NPE |
+| `worldmap.WorldMapPlugin` | **unverified** — kept from before the sidebar; no lwjgl/JNA/jshell/FlatLaf/Discord/`LinkBrowser`/`java.awt.Desktop` reference exists in any of its 142 classes, so the admission rule above does not explain it. Re-evaluate on a device before trusting this row. |
+| `gpu.GpuPlugin` | desktop GL stack (`org/lwjgl/`, `net/runelite/rlawt/`) |
+| `devtools.DevToolsPlugin` | desktop inspector (`net/runelite/jshell/`, FlatLaf) |
+| `discord.DiscordPlugin` | Discord SDK / desktop integration (`net/runelite/discord/`) |
+| `screenshot.ScreenshotPlugin` | desktop screenshot folder (opens it through `LinkBrowser`) |
 
 Excluding an entire plugin is the right call only when *nothing* in it can run. `@PluginDependency`
 couples the list: `ClueScrollPlugin` declares `@PluginDependency(BankTagsPlugin)`, and
@@ -153,14 +155,15 @@ the worked example to copy when adding an exclusion.
 
 **Index size is a data-dependent number.** It is whatever `@PluginDescriptor`-annotated direct
 `Plugin` subclasses the weekly client jar contains, minus the exclusions. Do not quote a fixed
-count as a contract; the live value is `RuneLiteHost.indexSize()`, shown in the side panel Host
-tab (`SidePanel.buildHostTab`).
+count as a contract; the live value is `RuneLiteHost.indexSize()`, shown in the launcher's Host
+section (`MainActivity.refreshHostCard`).
 
 **Failure mode.** `pluginManager.startPlugins()` stops at the first plugin whose `startUp()`
 throws and leaves the remainder unstarted (`RuneLiteHost.java`). That is why "enabled" and
-"active" are distinct: a plugin can be enabled (flag set) yet inactive (never started). The host
-reports both, and a fresh toggle restarts from that plugin's flag rather than from the failing
-one.
+"active" are distinct: a plugin can be enabled (flag set) yet inactive (never started). Starting
+or stopping one plugin goes through `PluginManager.startPlugin` / `stopPlugin`
+(`RuneLiteHost.startPlugin` / `stopPlugin`), not a re-run of `startPlugins()`, so a toggle is not
+blocked by an earlier failing plugin.
 
 ## 4. Config storage
 
@@ -168,7 +171,7 @@ The port does not implement config persistence; the client's own `ConfigManager`
 supplies the directory it writes into:
 
 - `MainActivity` sets `user.home` and `jagex.userhome` to `getFilesDir().getAbsolutePath()`
-  (`MainActivity.java`, re-applied at `MainActivity`).
+  (`MainActivity.java`, `onCreate`).
 - `RuneLiteHost.start` reads the static `net.runelite.client.RuneLite.RUNELITE_DIR` and derives the
   session file from it (`RuneLiteHost.java`). The port never assigns `RUNELITE_DIR`;
   upstream derives it under `user.home`, which is why config lands on internal storage.
@@ -185,15 +188,16 @@ apps without warning, so the port calls `sendConfig` explicitly at points that m
 
 | Caller | When |
 |---|---|
-| `SidePanel:732` | after a config item write in the Config tab |
-| `SidePanel:741` | after a plugin enable/disable toggle |
+| `MainActivity.onStop` | so a backgrounded app is flushed before the OS can kill it |
+| `PluginConformance.run` | once at the end of a conformance run, if it touched config |
 | `RuneLiteHost.setPluginEnabled` | after a successful start/stop |
-| `PluginConformance:216` | once at the end of a conformance run, if it touched config |
-| `MainActivity:3333` | `onStop`, so a backgrounded app is flushed before the OS can kill it |
 
-Without those flushes a plugin enablement or config edit survives only until the process is
-force-stopped. `MainActivity.onStop` is the last line of defence; the side-panel calls make an
-edit durable immediately.
+Without a flush a plugin enablement or config edit survives only until the process is
+force-stopped; `MainActivity.onStop` is the last line of defence. Note that the Swing sidebar's own
+toggles and config writes reach RuneLite's `PluginManager` / `ConfigManager` directly (a shim
+cannot call the `android/` host — see §8), so they are made durable by `onStop`, not by
+`RuneLiteHost.setPluginEnabled` (which is the host's public hook, but not on the sidebar's call
+path).
 
 ## 5. `pluginConfigClass` resolution
 
@@ -211,16 +215,18 @@ RuneLite does not expose a plugin's config through a method on the plugin. `Rune
 
 The annotation is `RUNTIME`-retained and `TYPE`-targeted, so the type alone identifies the config
 interface. There is **no `getConfig()` call on the plugin object**. A plugin with no config
-interface, such as `AccountPlugin`, returns `null`; the Config tab renders that as
-`"this plugin has no configuration"` (`SidePanel.showConfigFor`).
+interface, such as `AccountPlugin`, returns `null`. The only consumer is the conformance pass's
+`cfg` metric (`PluginConformance.configProbe`), which records `cfgNote="no config"` for it; the
+sidebar's config UI is RuneLite's own `net.runelite.client.plugins.config.ConfigPanel`, not a port
+UI.
 
 ## 6. Host shims
 
 `hostshims/` is **not a Gradle module**. Its sources are compiled by `compileHostShims()` inside
-`android/build.gradle:189-233` and dexed into the **asset** dex
-(`android/build.gradle:476-492`). Each shim's FQCN equals the upstream class it replaces (same
-package and name), and `HOST_REPLACED_CLASSES` / `HOST_REPLACED_PREFIXES` strip the originals from
-the cleaned client jar (`android/build.gradle:83-102`).
+`android/build.gradle` and dexed into the **asset** dex (`android/build.gradle`, the
+`runelite-dex.jar` writer in `downloadAndDexJar`). Each shim's FQCN equals the upstream class it
+replaces (same package and name), and `HOST_REPLACED_CLASSES` / `HOST_REPLACED_PREFIXES` strip the
+originals from the cleaned client jar (`android/build.gradle`, `isHostReplaced`).
 
 There are **five** shim files under `hostshims/src`. Since the port runs RuneLite's real
 Swing shell (see [swing-runtime.md](swing-runtime.md)), it no longer replaces the toolbar, the
@@ -245,7 +251,7 @@ The package-private nested classes of those five (if any) are stripped with them
 `UnitFormatter(Factory)`, `DynamicGridLayout`, `ClientPanel`, `ClientToolbarPanel`,
 `ColorScheme`, `FontManager`, all of `net/runelite/client/ui/components/**` and the config
 plugin's panels are **not** replaced: they are ordinary Swing/Java code and the port's
-`javax.swing` implementation runs them. `Net.runelite.client.util.SwingUtil` ships for the same
+`javax.swing` implementation runs them. `net.runelite.client.util.SwingUtil` ships for the same
 reason (its only FlatLaf reference is an inlined `String` constant).
 
 Stripped and *not* replaced, because nothing that ships references them:
@@ -253,9 +259,9 @@ Stripped and *not* replaced, because nothing that ships references them:
 `net/runelite/client/ui/OSXFullScreenAdapter` (its superclass `com.apple.eawt.FullScreenAdapter`
 does not exist on Android; only the replaced `ClientUI` referenced it).
 
-### 6.1 Compiler rules for shims
+### 6.2 Compiler rules for shims
 
-`compileHostShims` sets the classpath explicitly (`android/build.gradle:190-199`):
+`compileHostShims` sets the classpath explicitly (`android/build.gradle`):
 
 ```gradle
 def classpath = [coreClasses.absolutePath]
@@ -264,17 +270,17 @@ classpath.add(new File(android.sdkDirectory, "platforms/android-34/android.jar")
 ```
 
 and invokes `javac` with `--limit-modules java.base,jdk.unsupported`
-(`android/build.gradle:206-212`). Three consequences govern every shim:
+(`android/build.gradle`). Three consequences govern every shim:
 
 1. **Shims live in `hostshims/`, not the app source set.** They replace client-jar classes and must
    be dexed into the *asset* dex so Guice can resolve the types in their signatures — for example
    `net.runelite.api.Client` in `ColorPickerManager.create`. The build comment records that a shim
    placed in the app dex made those descriptors unresolvable and broke the 7 plugins that inject a
-   shim (`android/build.gradle:178-188`).
+   shim (`android/build.gradle`, the `compileHostShims` javadoc).
 2. **Constructor parameters must be asset-dex-resolvable.** Guice constructs the shim from the
    client loader, so a parameter type that only exists in the app dex cannot be supplied. That is
-   why `ClientToolbar` and `ClientUI` take an `Injector` instead of upstream's `ClientUI` /
-   `RuneLiteConfig` / `MouseManager` / `Client`.
+   why the `ClientUI` shim takes an `Injector` instead of upstream's `RuneLiteConfig` /
+   `MouseManager` / `Client` / `EventBus` parameters.
 3. **Method signatures must match upstream exactly.** The caller is pre-compiled bytecode in the
    asset dex; a changed descriptor is a `NoSuchMethodError` at runtime. Keep names, parameter
    types, return types and the constant values of fields/enums that get persisted.
@@ -290,11 +296,11 @@ therefore talks to the app through `UiBridge` — a `core/` class both sides see
 reaches the sidebar reflectively (`ClientUI.instance()` / `navigationButtons()`, used by the
 conformance pass).
 
-### 6.2 Nested-class stripping
+### 6.3 Nested-class stripping
 
 `HOST_REPLACED_CLASSES` controls **stripping**, `hostshims/` controls **replacement**; they are
 different sets. `isHostReplaced` treats a class as host-replaced if the entry name equals
-`outer + '.class'` **or** starts with `outer + '$'` (`android/build.gradle:104-124`). Nested classes
+`outer + '.class'` **or** starts with `outer + '$'` (`android/build.gradle`). Nested classes
 are dropped with their outer because d8 refuses an orphan nest member
 (`"Class X$Y requires its nest host"`).
 
@@ -306,6 +312,7 @@ The current list is (`android/build.gradle`):
 | `ui/ContainableFrame` | FlatLaf native window library; only its `Mode` enum is referenced by `RuneLiteConfig` |
 | `ui/FatalErrorDialog` | desktop error dialog with a log-file folder button; must still link |
 | `ui/SplashScreen` | desktop splash window; must still link |
+| `ui/OSXFullScreenAdapter` | macOS-only (superclass `com.apple.eawt.FullScreenAdapter` is absent); **no shim** — nothing that ships references it |
 | `plugins/config/PluginHubPanel` | in-app hub installer (`IconTextField` + live HTTP + device install); replaced by the informational panel |
 
 `HOST_REPLACED_PREFIXES` is just `net/runelite/client/ui/laf/`.
@@ -324,8 +331,8 @@ flowchart LR
     E --> F["render thread presents exactly one frame"]
 ```
 
-The registration entry point is `OverlayManager.add` / `addIfAbsent`, driven by the plugin's
-`startUp()`. `overlayManager.init()` is called once at boot (`RuneLiteHost.startPlugins`). When
+The registration entry point is `OverlayManager.add`, driven by the plugin's `startUp()`.
+`overlayManager.init()` is called once at boot (`RuneLiteHost.startPlugins`). When
 the client calls `callbacks.draw(MainBufferProvider, Graphics, x, y)`, `MainActivity`'s `Callbacks`
 proxy looks up the matching method on `RuneLiteHost.hooks()` and invokes it inside `renderLock`;
 `Hooks` renders the overlays into `mainBufferProvider.getImage()` and blits that image into the
