@@ -169,8 +169,25 @@ summary is `aborted: host not running`. You can also trigger a run from the laun
 in a toast); the pill is disabled unless the host is running and no pass is in flight. Every metric
 in the report and the summary string are documented in [diagnostics.md](diagnostics.md).
 
-## 5. Read logcat
+## 5. Dump all thread stacks (a hung client)
 
+The release APK is not debuggable and the adb shell cannot signal it (`kill -3` is
+`Operation not permitted`), so a hung client thread — the "frozen world" case, where the
+`callbacks.draw` and `GameState` lines stop while `LoginTick` keeps printing — is localised
+through a drop file:
+
+```bash
+adb shell "echo 1 > /sdcard/Android/data/org.runelite.mobile/files/stackdump.request"
+adb pull /sdcard/Android/data/org.runelite.mobile/files/stackdump.txt
+```
+
+`MainActivity.consumeStackDumpRequest` runs on both the main thread's 1 s `LoginTick` and the
+render loop's 5 s tick (a hang can block either), deletes the request and writes every thread's
+state plus its Java stack to `stackdump.txt` next to it. Look for the client thread's frames
+(the game's obfuscated classes) and for `AWTBridge-RenderThread`, whose stack says whether it is
+blocked or merely waiting for a frame.)
+
+## 6. Read logcat
 Filter on the three tags the app uses:
 
 ```bash
@@ -189,7 +206,7 @@ the host starts, `GFX SELFTEST PASS` / `SWING SELFTEST PASS (26 cases)` (or the 
 Field-by-field interpretation of `callbacks.draw` and `GameState` lines is in
 [diagnostics.md](diagnostics.md).
 
-## 6. On-device artifact table
+## 7. On-device artifact table
 
 `<files>` = `/data/data/org.runelite.mobile/files`; `<external>` =
 `/sdcard/Android/data/org.runelite.mobile/files`; `<cache>` = the app cache dir. `app_*` dirs are
@@ -214,12 +231,14 @@ the private directories returned by `Context.getDir(name, MODE_PRIVATE)` (Androi
 | `<cache>/client-update/` | `ClientUpdater.downloadAndInstall` | deleted at the start of the next download | download scratch |
 | `<external>/conformance.request` | operator | render loop | trigger file |
 | `<external>/conformance-report.txt` | `PluginConformance` | operator | plain text report |
+| `<external>/stackdump.request` | operator | main-thread 1 s tick + render loop 5 s tick | trigger file |
+| `<external>/stackdump.txt` | `MainActivity.consumeStackDumpRequest` | operator | every thread's state + Java stack |
 
 Anchors: `MainActivity` (boot block, launcher visibility, AOT status), `ClientUpdater`
 (`clientDexAotStatus`), `MobilePluginHub.loadPlugins`/`dexOnDevice`,
 `OnDeviceDexer.ensureLoaded`/`dex`.
 
-## 7. SharedPreferences key table
+## 8. SharedPreferences key table
 
 The only preferences file is `RuneLiteMobilePrefs`, declared once in `MainActivity`
 (`PREFS_NAME`) and once in `SidePanel` with the same literal. Re-derive the key set with:

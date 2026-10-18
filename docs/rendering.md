@@ -4,33 +4,73 @@
 **Read this when:** you are changing the render loop, the frame buffer, the AWT bridge, or debugging a grey, frozen, stale, or torn screen.
 **Verified against:** `android/src/main/java/org/runelite/mobile/MainActivity.java` (`surfaceChanged`, `runRenderLoop`, `bindSceneRasterizerToDisplay`, `paletteInvariant`, `logFrameDiagnostics`, callbacks proxy), `core/src/main/java/java/awt/Graphics.java`, `core/src/main/java/java/awt/Font.java`, `core/src/main/java/java/awt/image/BufferedImage.java`, `core/src/main/java/java/awt/image/DirectColorModel.java`, `android/src/main/java/org/runelite/mobile/AndroidTextRenderer.java`, `core/src/main/java/org/runelite/mobile/bridge/AWTBridge.java`, `core/src/main/java/org/runelite/mobile/bridge/TextBridge.java`, `docs/telemetry-assessment.md`
 
-The port does not draw the game. The client renders its own 765×503 software frame; the port only
+The port does not draw the game. The client renders its own software frame (765×503 in fixed mode, a
+device-aspect frame in fill mode — §1.1); the port only
 binds the client's output to a display buffer, lets RuneLite's `Hooks` composite plugin overlays into
 that same frame, and copies it to the Android surface. Everything below is the plumbing around those
 three facts.
 
 ## 1. The contract
 
-The game world is a fixed 765×503 ARGB space (`GAME_W`/`GAME_H`, `MainActivity.java`). That is
-the client's own frame size, not a device size; the surface is a separate, larger coordinate space.
-Three buffers must agree or the frame is wrong:
+The game world is a live ARGB space: `frameW`×`frameH` (`MainActivity.java`), which is the client's
+own canvas size, not a device size. `GAME_W`/`GAME_H` (765×503) are its floor and its fallback —
+the fixed display mode's size, which is what the client uses when fill mode is off. The surface is a
+separate, larger coordinate space. Three buffers must agree or the frame is wrong:
 
 | Buffer | Owner | Role |
 |---|---|---|
-| `appletPixels` `int[GAME_W * GAME_H]` | `MainActivity` (`MainActivity.java`) | the display buffer `Graphics.drawImage` writes into; the render thread reads it |
+| `appletPixels` `int[frameW * frameH]` | `MainActivity` (`MainActivity.java`) | the display buffer `Graphics.drawImage` writes into; the render thread reads it |
 | `AWTBridge.activePixels` / `activeWidth` / `activeHeight` | `core` static (`AWTBridge.java`) | the handle core-side code uses to reach that same array |
 | `renderBitmap` | `MainActivity` (`MainActivity.java`) | the Android `Bitmap` the array is copied into and blitted from |
 
-`onCreate` binds the first two together exactly once: `AWTBridge.activePixels = appletPixels;
-AWTBridge.activeWidth = GAME_W; AWTBridge.activeHeight = GAME_H;` (`MainActivity.java`). Change
-`GAME_W`/`GAME_H` and you must change the client's frame size, the array length, and the bridge
-dimensions together — they are not independently adjustable.
+The first two are swapped **together** by `publishFrameSize(w, h)` under `renderLock` — core's
+`Component.getGraphics()` builds its `Graphics2D` over `AWTBridge.activePixels` at call time and the
+client caches that Graphics per frame-buffer instance, so the array and the bridge dimensions must
+change *before* the client asks for a new one (i.e. before its next frame after a resize). Never
+assign `AWTBridge.activePixels` directly.
 
-`renderBitmap` is recreated on every surface change as `Bitmap.createBitmap(GAME_W, GAME_H, ARGB_8888)`
-with `srcRect` set to the whole frame (`MainActivity.surfaceChanged`). The destination is **not** the
-whole surface: the surface is letterboxed to the frame's 765:503 aspect (uniform scale, centred) and
-`fitLeft/fitTop/fitW/fitH` are that fit rect, recomputed on every `surfaceChanged` and logged as
-`surface <w>x<h> fit <w>x<h> at <l>,<t>`.
+`renderBitmap` and the fit rect are built on the **render thread** by `rebuildRenderGeometry()`, which
+runs under `renderLock` at the top of every `runRenderLoop` iteration and early-returns unless the
+frame or surface size changed. `surfaceChanged` only records `surfaceW/H` and asks for the frame size
+(`requestGeometry`). The destination is **not** the whole surface: the surface is letterboxed to the
+frame's aspect (uniform scale, centred) and `fitLeft/fitTop/fitW/fitH` are that fit rect, logged as
+`surface <w>x<h> fit <w>x<h> at <l>,<t> (frame <w>x<h>)`.
+
+### 1.1 Who decides the frame size
+
+The client's canvas size is the client's own state, so the host *drives* it instead of stretching the
+result:
+
+- `requestGeometry()` (UI thread) picks the request: in fill mode the surface's aspect at the apparent
+  UI scale (`round(surfaceH / GAME_H)`), floored at 765×503 and capped at `FILL_PIXEL_BUDGET`
+  (700k px, the budget the client's software renderer and the per-frame blit are sized for); with fill
+  off it is exactly 765×503. The result lands in `pendingFrameW/H`.
+- `setupClientDisplay()` + `applyPendingFrameSize()` (client thread, at the top of the
+  `callbacks.draw` handler, i.e. between two frames) put the client into its **resizable display
+  mode** (`ClientDisplay.requestResizable` → the game's own `ms.bo(int, byte)` applier, which the
+  game's options screen uses too), turn RuneLite's stretch off, resize the applet/container and call
+  the public `GameEngine.resizeCanvas()`, then publish the canvas size the API reports.
+  The mode change is **one-way**: the applier's fixed direction (`ms.bo(1, 0)`) corrupts the client's
+  canvas bookkeeping in this environment — it requests the resizable 7680×2160 maximum, and the next
+  client-side resize threw `NegativeArraySizeException` out of the frame-buffer constructor
+  (`tx.<init>`), killing the client thread — so fill *off* never calls an applier at all. At boot that
+  is the client's own fixed mode (exactly what the port ran before fill existed); after a fill session
+  the mode stays resizable until the app restarts, and only the frame returns to 765×503.
+  The mode applier *resizes the canvas itself* (it requests the shell's maximum), so
+  `applyPendingFrameSize` reads `Client.getCanvasWidth/Height` back first and only publishes when the
+  requested size is already there. Never call `GameEngine.resizeCanvas()` on a canvas that already has
+  the requested size: the client re-derives its canvas fields through its own scrambled arithmetic and
+  a redundant pass threw `NegativeArraySizeException` out of the frame-buffer constructor, which the
+  client thread then hit again in its own resize path and died on.
+- A frame drawn before a resize is **not presented** (`publish == false`): its destination `Graphics`
+  still targets the previous array. The next frame fetches a Graphics over the new one and is
+  presented normally. A `callbacks.draw` frame whose provider size differs from the published frame
+  size (the client resized itself) is adopted the same way, with the provider's cached Graphics
+  invalidated, and the rasterizer bind is skipped for it (§3.1).
+
+With fill off — or if the client does not honour the request — the frame stays 765×503 and the
+presentation is the historical letterbox. The launcher's **Display** card carries the setting, the
+live frame size and the fallback reason.
 
 ```svg
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 250" role="img" aria-label="Pixel flow from the client frame to the surface">
@@ -48,7 +88,7 @@ whole surface: the surface is letterboxed to the frame's 765:503 aspect (uniform
     <text x="300" y="92">Hooks.draw</text>
     <text x="300" y="112" font-size="12" fill="var(--muted)">overlay compositing</text>
     <text x="490" y="92">appletPixels</text>
-    <text x="490" y="112" font-size="12" fill="var(--muted)">int[765*503]</text>
+    <text x="490" y="112" font-size="12" fill="var(--muted)">int[frameW*frameH]</text>
     <text x="680" y="92">renderBitmap</text>
     <text x="680" y="112" font-size="12" fill="var(--muted)">setPixels()</text>
     <text x="880" y="92">Surface canvas</text>
@@ -77,11 +117,14 @@ whole surface: the surface is letterboxed to the frame's 765:503 aspect (uniform
 
 The client calls the `Callbacks.draw(MainBufferProvider, Graphics, int, int)` overload once per
 completed frame. The proxy's frame-blit branch receives the provider as `args[0]` and the destination
-`Graphics` as `args[1]` (callbacks proxy). It binds the rasterizer, grabs the frame
+`Graphics` as `args[1]` (callbacks proxy). It first applies the display setup and the pending frame
+size (§1.1), adopts the provider's size if the client resized itself, then binds the rasterizer,
+grabs the frame
 `Image` via reflection (`args[0].getClass().getMethod("getImage")`), and inside `synchronized
 (renderLock)` either delegates to `Hooks.draw` (which composites overlays and blits the frame into
 `args[1]`) or does `((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null)` when no host is running.
-Only then does it bump `frameSeq` and `renderLock.notifyAll()`, and on the first frame it sets
+Only then does it bump `frameSeq` and `renderLock.notifyAll()` (a frame drawn through the previous
+frame buffer is skipped instead), and on the first *presented* frame it sets
 `firstFramePresented` so the boot overlay hides.
 
 ```mermaid
@@ -92,14 +135,15 @@ sequenceDiagram
     participant R as "render thread"
     participant S as "Surface"
     C->>P: "draw(bufferProvider, Graphics, x, y)"
+    P->>P: "setupClientDisplay() + applyPendingFrameSize()"
     P->>P: "bindSceneRasterizerToDisplay(bufferProvider)"
     P->>H: "Hooks.draw(args)"
     H->>H: "composite plugin overlays into the client frame"
     H->>P: "return"
-    P->>P: "frameSeq++ ; renderLock.notifyAll()"
+    P->>P: "frameSeq++ ; renderLock.notifyAll()  // unless the frame buffer just changed"
     R->>P: "wait on renderLock while frameSeq == lastDrawnSeq"
     P-->>R: "frame ready"
-    R->>R: "renderBitmap.setPixels(appletPixels, 0, GAME_W, ...)"
+    R->>R: "rebuildRenderGeometry() + renderBitmap.setPixels(appletPixels, 0, frameW, ...)"
     R->>S: "drawRect bars + drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)"
 ```
 
@@ -114,16 +158,19 @@ that each presented frame is exactly one completed client frame.
 | Callback | Action |
 |---|---|
 | `surfaceCreated` | sets `isRunning = true`, starts the `"AWTBridge-RenderThread"` thread |
-| `surfaceChanged` | recreates `renderBitmap`, disables its alpha, sets `srcRect`, and recomputes the letterbox fit (`surfaceW/H`, `fitLeft/Top/W/H`) |
+| `surfaceChanged` | records `surfaceW/H` and calls `requestGeometry()`; the bitmap, `srcRect` and the fit rect are built by the render thread's `rebuildRenderGeometry()` |
 | `surfaceDestroyed` | sets `isRunning = false`, interrupts and joins the render thread |
 
-The surface is inset by the right-edge chrome whenever the drawer or its column is showing
+The surface is inset by the right-edge chrome in the sidebar's **resize** mode
 (`applyGameInsets`, see [side-panel.md](side-panel.md)), so a drawer toggle fires `surfaceChanged`
-with a smaller width and the game reletterboxes to the reduced area instead of being overlapped.
+with a smaller width and the game re-renders and reletterboxes to the reduced area instead of being
+overlapped. In **overlap** mode (the default) the inset stays 0, the drawer floats over the game and
+a drawer toggle changes neither the surface nor the frame — that is the mode's point: the resizable
+layout's minimap and tab panel live under the drawer.
 
 The render thread runs at `THREAD_PRIORITY_DISPLAY` so it stays scheduled while the client thread
 saturates a core with the software renderer (`MainActivity.runRenderLoop`). While `renderBitmap == null`
-(no surface yet) the loop sleeps 50 ms per iteration so background work — updates, dexing — is not
+(no surface yet) the loop waits 50 ms per iteration so background work — updates, dexing — is not
 starved. It never holds the canvas lock while idle.
 
 ## 3. The three invariants
@@ -141,6 +188,24 @@ starved. It never holds the canvas lock while idle.
   (`MainActivity.java`). It early-returns when the array reference is unchanged, so it is
   idempotent, and it re-checks per frame because the client can re-point `yw.ah` behind the app's
   back.
+- **Trap — never bind the pre-resize buffer.** The callbacks proxy skips the bind on a frame whose
+  frame buffer *just* changed (`applyPendingFrameSize` returned true, or the provider's size differs
+  from the published frame size). `yw.ef` sets the array **and the clip**; the provider in flight on
+  a resize frame is the *previous* buffer, while the client's own resize path (`to.ahi` →
+  `yi.ab(int)`) has already moved the target array to the new one. Binding the stale buffer therefore
+  leaves the rasteriser with the new array and the *old* clip, and the next scene paint writes past
+  the end of the array:
+
+  ```text
+  java.lang.ArrayIndexOutOfBoundsException: length=384796; index=384796
+      at yw.fb(yw.java:11460)   ... at client.id(client.java:9547)
+      at to.ahc(to.java:476)    at to.afh(to.java:1)    at to.run(to.java:28293)
+  ```
+
+  The client thread dies in its own error path (`Callbacks.error`, `to.stop()`), so the world
+  freezes while every other thread keeps running — the port's `callbacks.draw` frame log marks the
+  exit with `stop=arm` on the last lines (`MainActivity.shutdownState`). The next frame binds the new
+  buffer, which is consistent again.
 - **Trap:** do **not** retarget `fa.ak`. It is not a pixel target; it is each rasterizer's reference to
   the 65536-entry HSL→RGB palette (`fq.aq`). Re-pointing it at the frame makes shaded fills read
   screen pixels — walls take grey from the upper screen, ground and tree trunks go black
@@ -157,8 +222,8 @@ starved. It never holds the canvas lock while idle.
   SRC_OVER, so if the bitmap carries alpha, its alpha-0 pixels are dropped and the previous surface
   content stays visible.
 - **Fix:** `renderBitmap.setHasAlpha(false)` right after the bitmap is created
-  (`MainActivity.surfaceChanged`). Skia then treats the bitmap as opaque. This replaces the older
-  `pixel | 0xFF000000` pass that forced alpha per pixel on the Java side.
+  (`MainActivity.rebuildRenderGeometry`). Skia then treats the bitmap as opaque. This replaces the
+  older `pixel | 0xFF000000` pass that forced alpha per pixel on the Java side.
 
 ### 3.3 The two `drawImage` paths and the `hasAlpha` gate
 
@@ -187,9 +252,9 @@ See [core-stubs.md](core-stubs.md) for the full `Graphics`/`Image` fidelity limi
 ## 4. Presentation cost model
 
 Presentation is two native calls and no Java per-pixel work: `renderBitmap.setPixels(appletPixels, 0,
-GAME_W, 0, 0, GAME_W, GAME_H)` and a single
+frameW, 0, 0, frameW, frameH)` and a single
 `canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)`. Skia scales
-765×503 to the fit rect in native code. Four `drawRect` calls paint the letterbox bars first (empty
+the frame to the fit rect in native code. Four `drawRect` calls paint the letterbox bars first (empty
 rects are skipped), because the surface buffer is not cleared by the system and bar pixels are left
 over from the previous geometry.
 
@@ -198,15 +263,27 @@ for the current path. `scalePaint` is configured `setFilterBitmap(false)` and `s
 so the upscale is nearest-neighbour — the same sampling the old loop
 used — with no dithering pass. `scaleMs=` in the GameState log measures exactly `setPixels` + the blit.
 
-SVG #2 shows the blit geometry: `srcRect` is the whole 765×503 frame and `renderDst` is the centred
-fit rect inside the surface, so the scale is uniform and the leftover strips are painted with
-`barPaint` (`UiTheme.BG_DEEP`).
+Fill mode costs more in the *client* (it software-renders a bigger frame) and more in the blit
+(the destination area grows with the surface). The frame is scaled by the surface's own ratio
+(1.7714 on the target device — the client's 503-px height floor binds before the intended integer
+scale can), which is the same apparent scale the old letterbox used. Both costs are bounded by
+`FILL_PIXEL_BUDGET` (605k px on the target device, versus 385k for 765×503). Measured on the Pixel 8
+Pro (`scaleMs`/`callbacks.draw` `fps`): login screen ~9-18 ms and ~50 fps at 1147×503; in the world
+at the Grand Exchange ~16-27 ms and ~18 fps with a dense scene (26k entity-draw calls) — i.e. the
+scene, not the frame size, is the limit there. That constant is the knob if a slower device cannot
+hold the frame rate — note that on this device the 503-px floor plus the surface aspect make the
+choice discrete: any budget at or above ~577k keeps the fill, anything below it falls back to the
+765×503 letterbox.
+
+SVG #2 shows the blit geometry: `srcRect` is the whole frame (`frameW`×`frameH`) and `renderDst` is
+the centred fit rect inside the surface, so the scale is uniform and the leftover strips are painted
+with `barPaint` (`UiTheme.BG_DEEP`).
 
 ```svg
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 330" role="img" aria-label="765 by 503 frame scaled into the centred letterbox fit rect">
-  <text x="30" y="28" font-size="16" fill="var(--fg)">Blit geometry: srcRect (765&#215;503) &#8594; renderDst (centred fit rect)</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 920 330" role="img" aria-label="client frame scaled into the centred fit rect">
+  <text x="30" y="28" font-size="16" fill="var(--fg)">Blit geometry: srcRect (frameW&#215;frameH) &#8594; renderDst (centred fit rect)</text>
   <rect x="60" y="100" width="230" height="151" fill="var(--surface)" stroke="var(--border)"/>
-  <text x="175" y="90" font-size="14" fill="var(--fg)" text-anchor="middle">srcRect (0,0,765,503)</text>
+  <text x="175" y="90" font-size="14" fill="var(--fg)" text-anchor="middle">srcRect (0,0,frameW,frameH)</text>
   <text x="175" y="182" font-size="13" fill="var(--muted)" text-anchor="middle">renderBitmap</text>
   <rect x="520" y="60" width="340" height="223" fill="var(--surface)" stroke="var(--border)"/>
   <rect x="520" y="103" width="340" height="137" fill="var(--c1)" fill-opacity="0.25" stroke="var(--accent)"/>
@@ -220,10 +297,10 @@ fit rect inside the surface, so the scale is uniform and the leftover strips are
   </defs>
   <text x="330" y="205" font-size="12" fill="var(--fg)">drawBitmap(scalePaint)</text>
   <text x="330" y="222" font-size="12" fill="var(--muted)">Skia nearest-neighbour, setFilterBitmap(false)</text>
-  <text x="175" y="272" font-size="12" fill="var(--muted)" text-anchor="middle">765 px wide</text>
-  <text x="47" y="180" font-size="12" fill="var(--muted)" text-anchor="middle" transform="rotate(-90 47 180)">503 px high</text>
+  <text x="175" y="272" font-size="12" fill="var(--muted)" text-anchor="middle">frameW px wide</text>
+  <text x="47" y="180" font-size="12" fill="var(--muted)" text-anchor="middle" transform="rotate(-90 47 180)">frameH px high</text>
   <text x="690" y="299" font-size="12" fill="var(--muted)" text-anchor="middle">barPaint fills the four strips around the fit</text>
-  <text x="30" y="318" font-size="12" fill="var(--muted)">Uniform scale (min of the two ratios), centred: the game keeps its 765:503 aspect and is never stretched.</text>
+  <text x="30" y="318" font-size="12" fill="var(--muted)">Uniform scale (min of the two ratios), centred: the game keeps its aspect and is never stretched.</text>
 </svg>
 ```
 

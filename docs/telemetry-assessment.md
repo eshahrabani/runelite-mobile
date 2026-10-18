@@ -103,7 +103,8 @@ Notes:
 - **Software 3D presentation** (port-only, no wire effect): the 3D rasterizer's per-instance
   pixel target is re-pointed at the display buffer by
   `MainActivity.bindSceneRasterizerToDisplay()` (the client leaves it on a 256×256 scratch and
-  only the desktop runtime's resize path re-points it), and the 765×503 frame bitmap is
+  only the desktop runtime's resize path re-points it), and the frame bitmap (765×503 in fixed
+  mode, the device-aspect frame in fill mode — see section 6) is
   drawn with alpha disabled (`renderBitmap.setHasAlpha(false)`) because the rasterizer emits
   alpha-0 3D pixels that `canvas.drawBitmap` would otherwise blend away. Both are required for
   the world to be visible at all.
@@ -142,3 +143,36 @@ On a client version bump (watch `bootstrap.json` / `client-version.txt`):
    `java.applet.AppletContext.showDocument` (a real URL open).
 5. Re-check `grep -rl "firebase\|crashlytics\|analytics\|sentry" .` returns nothing in
    this repo (no added telemetry SDK).
+6. Re-derive the **client-internal names the port drives** (all obfuscated per version; they
+   live in exactly two files — `ClientDisplay` for the display-mode applier, `MainActivity`
+   for the rasterizer/palette probes):
+   - the **display-mode applier** the fill mode uses, `ms.bo(int, byte)`, and its duplicates
+     `client.ne/nw/nv(int)`: all four set the static boolean that is the entire body of
+     `Client.isResized()` and request the shell maximum (`client.agh(7680, 2160, 0)`) or the
+     fixed size. Re-find it from the identity: `javap -p -c client | grep -A3 'isResized'`
+     names the field, then grep the jar for its `putstatic`. `ClientDisplay` tries
+     `ms.bo` first and verifies `isResized()` actually flipped, so a rename costs one candidate
+     and the launcher reports `game fill: unavailable` instead of breaking the game.
+     **Only apply the resizable direction** (`ms.bo(2, 0)`): the fixed direction
+     (`ms.bo(1, 0)`) requests the resizable 7680×2160 maximum anyway — it does not restore the
+     fixed bounds — and the corrupt canvas state it leaves behind made the next client-side
+     resize throw `NegativeArraySizeException` out of `tx.<init>`, killing the client thread.
+     That is why fill off leaves the client's display mode alone.
+   - the 3D rasterizer's binding method `yw.ef(int[], int, int, float[])` with its static target
+     field `yw.ah` and depth array `yw.aw` (`bindSceneRasterizerToDisplay`), and the palette
+     statics `fq.aq`, `fq.az/an/ah` and `fa.ak` (`paletteInvariant`).
+   - the client's own resize path is reached through the **public** `GameEngine.resizeCanvas()`
+     (`to.ahi(int)` behind it), which writes the canvas size and allocates the new frame buffer;
+     the size is read back through `Client.getCanvasWidth/Height`, so the port never names the
+     client's canvas-size fields.
+   - a frame buffer's cached destination `java.awt.Graphics`: the client fetches it once per
+     frame-buffer instance, so `invalidate...` (the type-based field search in
+     `MainActivity.invalidateProviderGraphics`) must find it again if the class layout changes —
+     only needed when the client resizes itself rather than the host.
+   - the client's **shutdown deadline** `to.re` (a static long, plaintext name): the game loop
+     `to.run` exits as soon as it is non-zero and the time has passed it. `ClientDisplay.shutdownDeadline`
+     reads it for the `stop=` field of the frame log — `stop=arm` on the last frames before a
+     frozen world means the client took its own stop/error path (the `to.stop()`/`destroy()`
+     Applet lifecycle, `Client.stopNow()`), which is how the resize-frame rasteriser crash was
+     diagnosed; an exception on the client thread is logged by the client itself as a
+     `System.err` line tagged `[Client] ERROR injected-client - Client error` plus its stack.

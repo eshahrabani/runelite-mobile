@@ -137,6 +137,7 @@ sequenceDiagram
   S->>D: "new DexClassLoader(files/runelite-dex.jar, parent=app)"
   D->>C: "loadClass('client') -> instantiate -> setSize(765,503)"
   S->>C: "bind ClientConfiguration + Callbacks proxies, initialize()"
+  S->>C: "first frame: resizable display mode + device-aspect canvas resize (game fill)"
   S->>H: "new Thread(RuneLiteHost.start).setDaemon(true)"
   H->>H: "OkHttpClient, RuneLiteModule, Guice injector, get components"
   H->>U: "initSidebar: ClientUI.init() via invokeAndWait"
@@ -235,28 +236,32 @@ stubs compiling for a second target; [device-runbook.md](device-runbook.md) cove
 1. The client thread renders the world into its own pixel buffer and invokes
    `callbacks.draw(bufferProvider, Graphics, x, y)` through the `Callbacks` proxy
    (`MainActivity.java`).
-2. The proxy re-points the client's software rasterizer at the live buffer with
-   `bindSceneRasterizerToDisplay(args[0])` (`MainActivity.java`).
+2. The proxy applies the display mode and pending frame size (`setupClientDisplay` +
+   `applyPendingFrameSize`, see [rendering.md](rendering.md) §1.1), then re-points the client's
+   software rasterizer at the
+   live buffer with `bindSceneRasterizerToDisplay(args[0])` (`MainActivity.java`).
 3. If the host's `Hooks` is present, `hooks.draw(...)` composites plugin overlays directly into
    the client frame before anything is copied (`MainActivity.java`).
 4. `Graphics.drawImage(img, x, y, null)` draws that frame into `AWTBridge.activePixels`, which is
    `MainActivity.appletPixels` (`MainActivity.java`).
-5. The proxy advances `frameSeq` under `renderLock`, waking the render thread.
-6. The render thread copies `appletPixels` into `renderBitmap` with `setPixels(...)` and presents
+5. The proxy advances `frameSeq` under `renderLock`, waking the render thread — unless this frame was
+   drawn through a frame buffer that a resize just replaced, in which case it is skipped.
+6. The render thread rebuilds the bitmap and fit rect if the frame or surface size changed,
+   copies `appletPixels` into `renderBitmap` with `setPixels(...)` and presents
    it with `canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)` into the centred
-   765:503 fit rect, after painting the letterbox bars (`MainActivity.runRenderLoop`).
+   fit rect, after painting the letterbox bars (`MainActivity.runRenderLoop`).
 
 The invariants behind steps 3-6 — buffer agreement, the palette repoint, alpha handling and the
 blit geometry — are owned by [rendering.md](rendering.md). For how a tap or key reaches the client,
 see [input.md](input.md); for what the runtime prints while it does, see [diagnostics.md](diagnostics.md).
 
-The three pixel stores that must agree are bound once and never reallocated per frame:
+The three pixel stores must agree, and they are swapped together (never per frame):
 
 | Store | Type | Bound by | Anchor |
 |---|---|---|---|
-| `MainActivity.appletPixels` | `int[GAME_W * GAME_H]` | field initialiser | `MainActivity.java` |
-| `AWTBridge.activePixels/activeWidth/activeHeight` | same array + `765`/`503` | `onCreate` | `MainActivity.java` |
-| `MainActivity.renderBitmap` | `Bitmap` `ARGB_8888`, `setHasAlpha(false)` | `surfaceChanged` | `MainActivity.java` |
+| `MainActivity.appletPixels` | `int[frameW * frameH]` | `publishFrameSize(w, h)` | `MainActivity.java` |
+| `AWTBridge.activePixels/activeWidth/activeHeight` | same array + `frameW`/`frameH` | `publishFrameSize(w, h)` | `MainActivity.java` |
+| `MainActivity.renderBitmap` | `Bitmap` `ARGB_8888` `frameW`×`frameH`, `setHasAlpha(false)` | `rebuildRenderGeometry` (render thread) | `MainActivity.java` |
 
 The client frame and the presented frame are therefore the same pixels: overlays composited inside
 `Hooks.draw` (step 3) are already in `appletPixels` before the render thread touches it. Nothing in

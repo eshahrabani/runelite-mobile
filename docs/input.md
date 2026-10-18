@@ -16,15 +16,28 @@ Surface pixels are mapped into the fixed game space by `toGameX` / `toGameY`:
 private int toGameX(float raw) {
     int w = fitW;
     if (w <= 0) return 0;
-    int x = (int) ((raw - fitLeft) * GAME_W / w);
-    return x < 0 ? 0 : Math.min(x, GAME_W - 1);
+    int x = (int) ((raw - fitLeft) * frameW / w);
+    return x < 0 ? 0 : Math.min(x, frameW - 1);
 }
-// toGameY: same with fitH / fitTop / GAME_H
+// toGameY: same with fitH / fitTop / frameH
 ```
 
-`GAME_W` = `765` and `GAME_H` = `503` (`MainActivity` constants). The client is sized once with `clientInstance.setSize(GAME_W, GAME_H)` during bootstrap, so it always renders and hit-tests in the same 765x503 coordinate space regardless of the physical screen.
+`frameW`/`frameH` are the **live** client frame size (765×503 with game fill off, a device-aspect
+size with it on — see [rendering.md](rendering.md) §1.1). They are the client's own canvas size, read
+from `Client.getCanvasWidth/Height` when the host resizes it, so the client always renders and
+hit-tests in the coordinate space the mapping targets. `GAME_W`/`GAME_H` (`765`x`503`, `MainActivity`
+constants) are the floor and the fill-off size, and `clientInstance.setSize(GAME_W, GAME_H)` sizes the
+container before `initialize()`.
 
-The mapping is **not** a stretch: the surface is letterboxed to the client's 765:503 aspect (uniform scale, centred, bars painted), and `fitLeft`/`fitTop`/`fitW`/`fitH` are the fit rect computed in `surfaceChanged`. The surface itself is narrower than the screen whenever the right-edge chrome is showing (`applyGameInsets`), so the same rect follows the drawer (see [side-panel.md](side-panel.md)). A point that lands in a bar **clamps** to the nearest game pixel rather than being dropped: a finger that strays into a bar mid-gesture keeps its event stream, which the two-finger camera gesture needs. The blit geometry that scales the 765x503 space into the fit rect is described in [rendering.md](rendering.md).
+The mapping is **not** a stretch: the surface is letterboxed to the frame's aspect (uniform scale,
+centred, bars painted), and `fitLeft`/`fitTop`/`fitW`/`fitH` are the fit rect the render thread
+rebuilds whenever the frame or surface size changes (`rebuildRenderGeometry`). The surface itself is
+narrower than the screen whenever the right-edge chrome is showing in the sidebar's **resize** mode
+(`applyGameInsets`), so the same rect follows the drawer (see [side-panel.md](side-panel.md)); in
+**overlap** mode (the default) the surface stays full-width and the drawer simply covers it. A point
+that lands in a bar **clamps** to the nearest game pixel rather than being dropped: a finger that
+strays into a bar mid-gesture keeps its event stream, which the two-finger camera gesture needs. The
+blit geometry that scales the frame into the fit rect is described in [rendering.md](rendering.md).
 
 `wallFor` performs the time half of the same mapping: `MotionEvent` sample times are `uptimeMillis`, so only the offset from the current event is applied to `System.currentTimeMillis()`. The conversion is pure integer arithmetic.
 

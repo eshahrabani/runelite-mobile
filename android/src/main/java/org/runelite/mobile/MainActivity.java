@@ -68,21 +68,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private static final int FPS_TARGET = 60;
     private static final String PREFS_NAME = "RuneLiteMobilePrefs";
+    /**
+     * Upper bound on the client frame's pixel count. The client software-renders this
+     * frame (and the port's blit copies it once per presented frame), so the fill mode
+     * picks the coarsest pixel scale that stays inside this budget: at the apparent
+     * scale of a 503-px-tall frame the Pixel 8 Pro's 2244x1008 surface would ask for
+     * 565k px, which is the target; a much taller surface backs off instead of paying
+     * a linear cost in frame time.
+     */
+    private static final int FILL_PIXEL_BUDGET = 700_000;
 
     // ── Rendering ───────────────────────────────────────────────────────────
     private SurfaceView surfaceView;
     private SurfaceHolder surfaceHolder;
     private volatile boolean isRunning = false;
+    /** Render-thread only: frame buffer bitmap, rebuilt when the frame size changes. */
     private Bitmap renderBitmap;
     /** Surface size in px, read by the render thread. */
     private volatile int surfaceW, surfaceH;
-    /** Centred 765:503 letterbox geometry inside the surface, written by the UI thread. */
+    /** Centred fit of the live client frame inside the surface; read by the UI thread. */
     private volatile int fitLeft, fitTop, fitW, fitH;
     /** Frame counter bumped by the callbacks.draw blit; the render thread waits on it. */
     private long frameSeq, lastDrawnSeq;
+    /** Render-thread only; the frame source rect of the current renderBitmap. */
     private final Rect srcRect = new Rect();
     /** Render-thread only. */
     private final Rect renderDst = new Rect();
+    /** Render-thread only: the geometry renderBitmap/srcRect/fit* were built for. */
+    private int geoW, geoH, geoSurfaceW, geoSurfaceH;
     private final Paint scalePaint = new Paint();
     /** Render-thread only; paints the letterbox bars. */
     private final Paint barPaint = new Paint();
@@ -90,7 +103,41 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static Object clientObject;
     private static Class<?> clientClass;
     private Thread renderThread;
-    private final int[] appletPixels = new int[GAME_W * GAME_H];
+    /**
+     * The display buffer the client draws into (core {@code Component.getGraphics()}
+     * builds a {@code Graphics2D} over {@link AWTBridge#activePixels}), and the client
+     * frame size it holds. Both are swapped together under {@code renderLock}: the
+     * client caches that Graphics per frame-buffer instance, so the array and the
+     * bridge dimensions must change before the client asks for a new one (i.e. before
+     * its next frame after a resize).
+     */
+    private volatile int[] appletPixels = new int[GAME_W * GAME_H];
+    private volatile int frameW = GAME_W, frameH = GAME_H;
+    /** Requested frame size, written by the UI thread, applied on the client thread. */
+    private volatile int pendingFrameW = GAME_W, pendingFrameH = GAME_H;
+    /**
+     * Game fill (the launcher's Display card): the client renders a device-aspect
+     * frame in its own resizable display mode instead of the fixed 765x503 one.
+     * Persisted; a setup that fails turns it off for the session only (the pref stays,
+     * so a later client build -- with different obfuscated internals -- can succeed).
+     */
+    private volatile boolean fillEnabled = true;
+    /** Sidebar mode: true = the drawer floats over a full-width game, false = it insets it. */
+    private volatile boolean sidebarOverlap = true;
+    /** False until {@link #setupClientDisplay()} ran for the current client instance. */
+    private volatile boolean displaySetupDone;
+    /** Display card status: "off", "ok" or "unavailable: &lt;reason&gt;". */
+    private volatile String fillStatus = "off";
+    /**
+     * Minimum spacing between display-mode re-asserts. The client applies its own stored
+     * display setting whenever player settings arrive (login, a settings packet) or the
+     * settings interface opens, which reverts the fill frame; re-applying our mode is
+     * cheap but not free (it reallocates the client's frame buffer), so a client that
+     * resets the mode repeatedly is given up on rather than fought frame by frame.
+     */
+    private static final long FILL_REASSERT_MIN_MS = 5_000;
+    /** When the display mode was last re-asserted ({@code applyPendingFrameSize}). */
+    private long lastFillReassert;
     private boolean pointerDown = false;
     private int lastMouseX = -1;
     private int lastMouseY = -1;
@@ -173,6 +220,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private LinearLayout hostRows;
     private TextView btnHostConformance;
     private TextView btnHostRefresh;
+    /** The launcher's Display section: game fill + sidebar mode. */
+    private LinearLayout displayRows;
+    private TextView btnFillMode;
+    private TextView btnSidebarMode;
     private TextView btnManual;
     private LinearLayout manualPanel;
     private EditText etSessionId;
@@ -246,10 +297,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // standard platform TLS stack instead (verified in the client: qk ctor).
         System.setProperty("jagex.disableBouncyCastle", "true");
 
-        // Bind AWTBridge active pixels to appletPixels
-        AWTBridge.activePixels = appletPixels;
-        AWTBridge.activeWidth = GAME_W;
-        AWTBridge.activeHeight = GAME_H;
+        // Bind AWTBridge active pixels to the client frame buffer (the fixed frame
+        // until the Display card's fill mode sizes the client's canvas).
+        publishFrameSize(GAME_W, GAME_H);
 
         // slf4j-simple is the logging binding (logback is not shipped); INFO reaches
         // logcat as System.err, which is where RuneLite's own log.info/warn end up.
@@ -310,6 +360,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
         // 2. Load saved session state
         loadSessionState();
+        loadDisplayPrefs();
 
         // 3. Build UI: SurfaceView + launcher screen + login WebView overlay
         buildLauncherUi();
@@ -555,6 +606,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hostCard.addView(btnHostRefresh);
 
         refreshHostCard();
+
+        // ── Display: game fill (a device-aspect client frame) and the sidebar mode. ──
+        LinearLayout displayCard = new LinearLayout(this);
+        displayCard.setOrientation(LinearLayout.VERTICAL);
+        displayCard.setBackground(UiTheme.rounded(UiTheme.SURFACE, UiTheme.BORDER, 1f, 12f, density));
+        displayCard.setPadding((int) (14 * density), (int) (12 * density),
+            (int) (14 * density), (int) (12 * density));
+        LinearLayout.LayoutParams displayCardParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        displayCardParams.topMargin = (int) (12 * density);
+        launcherPanel.addView(displayCard, displayCardParams);
+
+        TextView tvDisplayTitle = new TextView(this);
+        tvDisplayTitle.setText("Display");
+        tvDisplayTitle.setTextColor(UiTheme.GOLD);
+        tvDisplayTitle.setTextSize(14f);
+        tvDisplayTitle.setTypeface(null, android.graphics.Typeface.BOLD);
+        displayCard.addView(tvDisplayTitle);
+
+        displayRows = new LinearLayout(this);
+        displayRows.setOrientation(LinearLayout.VERTICAL);
+        displayCard.addView(displayRows);
+
+        btnFillMode = pillAction("Game fill: on");
+        btnFillMode.setLayoutParams(fullWidthParams((int) (6 * density)));
+        btnFillMode.setOnClickListener(v -> toggleFillMode());
+        displayCard.addView(btnFillMode);
+
+        btnSidebarMode = pillAction("Sidebar: overlap");
+        btnSidebarMode.setLayoutParams(fullWidthParams((int) (6 * density)));
+        btnSidebarMode.setOnClickListener(v -> toggleSidebarMode());
+        displayCard.addView(btnSidebarMode);
+
+        refreshDisplayCard();
 
         btnManual = linkButton("Manual session tokens (advanced)");
         btnManual.setTextColor(UiTheme.TEXT_DIM);
@@ -902,6 +987,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         etCharacterId.setText(characterId);
         etDisplayName.setText(displayName);
         refreshHostCard();
+        refreshDisplayCard();
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -918,6 +1004,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hostRows.removeAllViews();
         hostRows.addView(hostRow("client version", RuneLiteHost.clientVersion()));
         hostRows.addView(hostRow("runtime", RuneLiteHost.isRunning() ? "running" : "not running"));
+        hostRows.addView(hostRow("frame", frameW + "x" + frameH + (fillEnabled ? " (fill)" : " (fixed)")));
         hostRows.addView(hostRow("plugin index", RuneLiteHost.indexSize() + " classes"));
         hostRows.addView(hostRow("active plugins", String.valueOf(RuneLiteHost.activePluginCount())));
         hostRows.addView(hostRow("status", RuneLiteHost.status()));
@@ -956,9 +1043,90 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         refreshHostCard();
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Launcher Display section
+
+    /**
+     * Fills the Display card with the live frame geometry. Called from
+     * {@link #updateLauncherUi()} (i.e. whenever the launcher becomes visible) and from
+     * both toggles, so the card always shows what the client is actually doing.
+     */
+    private void refreshDisplayCard() {
+        if (displayRows == null) {
+            return;
+        }
+        displayRows.removeAllViews();
+        if (!fillEnabled) {
+            displayRows.addView(hostRow("game", "off — letterbox " + GAME_W + "x" + GAME_H));
+        } else if (fillStatus.startsWith("unavailable")) {
+            displayRows.addView(hostText("game: " + fillStatus, 11f, UiTheme.RED));
+            displayRows.addView(hostRow("fallback", "letterbox " + frameW + "x" + frameH));
+        } else if ("off".equals(fillStatus)) {
+            // The pref is on but no client has applied it yet (the launcher screen).
+            displayRows.addView(hostRow("game", "on — device-aspect client frame (at boot)"));
+        } else {
+            displayRows.addView(hostRow("game", "on — resizable " + frameW + "x" + frameH
+                + " (" + ((frameW * frameH) / 1000) + "k px)"));
+        }
+        displayRows.addView(hostRow("sidebar", sidebarOverlap
+            ? "overlap — the drawer floats over the game" : "resize — the game is inset"));
+        if (btnFillMode != null) {
+            btnFillMode.setText(fillEnabled ? "Game fill: off" : "Game fill: on");
+        }
+        if (btnSidebarMode != null) {
+            btnSidebarMode.setText(sidebarOverlap ? "Sidebar: resize" : "Sidebar: overlap");
+        }
+    }
+
     /** One {@code label: value} row of the Host card. */
     private View hostRow(String label, String value) {
         return hostText(label + ": " + value, 11f, UiTheme.TEXT_MUTED);
+    }
+
+    // ── Device diagnostics: on-demand thread dump ──────────────────────────
+
+    /** The adb drop file that asks for a thread dump (app-specific external files dir). */
+    static File stackDumpRequestFile(android.content.Context context) {
+        File dir = context.getExternalFilesDir(null);
+        return dir == null ? new File(context.getFilesDir(), "stackdump.request")
+            : new File(dir, "stackdump.request");
+    }
+
+    /** The file a thread dump is written to, next to the request file. */
+    static File stackDumpFile(android.content.Context context) {
+        File dir = context.getExternalFilesDir(null);
+        return dir == null ? new File(context.getFilesDir(), "stackdump.txt")
+            : new File(dir, "stackdump.txt");
+    }
+
+    /**
+     * Consumes {@link #stackDumpRequestFile} if it is there and writes every thread's
+     * Java stack to {@link #stackDumpFile}, one frame per line. The release APK is not
+     * debuggable and the adb shell cannot signal it, so this is how a hung client thread
+     * (the "frozen world" case) is localised on the device. Called from both the render
+     * loop's 5 s tick and the main-thread 1 s tick, because a hang can block either one.
+     */
+    private void consumeStackDumpRequest() {
+        File request = stackDumpRequestFile(this);
+        if (!request.isFile() || !request.delete()) {
+            return;
+        }
+        File out = stackDumpFile(this);
+        Log.i(TAG, "stack dump requested via " + request.getAbsolutePath() + " -> " + out.getAbsolutePath());
+        try (java.io.PrintWriter writer = new java.io.PrintWriter(out, "UTF-8")) {
+            writer.println("# thread dump " + new java.util.Date());
+            for (Map.Entry<Thread, StackTraceElement[]> entry : Thread.getAllStackTraces().entrySet()) {
+                Thread thread = entry.getKey();
+                writer.println("\"" + thread.getName() + "\" state=" + thread.getState()
+                    + " prio=" + thread.getPriority() + " daemon=" + thread.isDaemon());
+                for (StackTraceElement frame : entry.getValue()) {
+                    writer.println("    at " + frame);
+                }
+            }
+            writer.flush();
+        } catch (Exception e) {
+            Log.w(TAG, "stack dump failed", e);
+        }
     }
 
     private TextView hostText(String text, float size, int colour) {
@@ -999,6 +1167,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (!signedIn || sessionId.isEmpty()) {
             signedIn = false;
         }
+    }
+
+    /**
+     * The Display card's two settings: game fill (device-aspect client frame) and the
+     * sidebar mode. Both are read here -- before {@code buildLauncherUi()} -- so the
+     * launcher renders the stored state and {@code bootstrapGameClient} applies it.
+     */
+    private void loadDisplayPrefs() {
+        SharedPreferences prefs = prefs();
+        fillEnabled = prefs.getBoolean("gameFill", true);
+        sidebarOverlap = prefs.getBoolean("sidebarOverlap", true);
     }
 
     private void saveSessionState(String newSessionId, String newCharacterId, String newDisplayName) {
@@ -1620,11 +1799,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         updateLauncherUi();
     }
 
-    /** Insets the game surface and the keyboard bar by the right-edge chrome width. */
+    /**
+     * Insets the game surface and the keyboard bar by the right-edge chrome width.
+     *
+     * <p>Two modes (the launcher's Display card): <b>overlap</b>, the drawer floats over
+     * a full-width game (that is the mode's point -- the resizable layout's minimap and
+     * tab panel live under the drawer), and <b>resize</b>, today's behaviour, where the
+     * surface is inset and the client re-renders at the smaller size. The keyboard bar
+     * sits under the drawer in both modes, so its action pills stay clear of the chrome
+     * either way -- it is chrome, not game.
+     */
     private void applyGameInsets() {
-        int inset = sidePanel != null ? sidePanel.occupiedWidthPx() : 0;
-        insetRight(surfaceView, inset);
-        insetRight(kbBar, inset);
+        int chrome = sidePanel != null ? sidePanel.occupiedWidthPx() : 0;
+        insetRight(surfaceView, sidebarOverlap ? 0 : chrome);
+        insetRight(kbBar, chrome);
     }
 
     private static void insetRight(View view, int px) {
@@ -1897,9 +2085,52 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                 // Frame blit: copy the rendered game buffer into the graphics
                                 if (args.length >= 2 && args[0] != null && args[1] instanceof java.awt.Graphics) {
                                     try {
-                                        bufferProviderStatic = args[0];
-                                        bindSceneRasterizerToDisplay(args[0]);
-                                        Object image = args[0].getClass().getMethod("getImage").invoke(args[0]);
+                                        Object provider = args[0];
+                                        bufferProviderStatic = provider;
+                                        // Display mode + canvas size are the client's own state;
+                                        // both are applied here, on the client thread between two
+                                        // frames, so neither can race the renderer. Order matters:
+                                        // the display mode decides whether the client clamps the
+                                        // canvas to 765x503.
+                                        boolean frameChanged = false;
+                                        if (!displaySetupDone) {
+                                            displaySetupDone = true;
+                                            setupClientDisplay();
+                                            frameChanged = applyPendingFrameSize();
+                                        } else {
+                                            frameChanged = applyPendingFrameSize();
+                                        }
+                                        // The client's frame buffer is the authority on the frame
+                                        // size. A size the host did not ask for (the client resized
+                                        // itself) is adopted here; the Graphics this frame drew
+                                        // through still targets the previous array, so that frame is
+                                        // not published and the next one -- which fetches a Graphics
+                                        // over the new array -- is. A frame that just resized is
+                                        // exempt: the provider in flight is the *old* buffer by
+                                        // construction.
+                                        boolean publish = !frameChanged;
+                                        int[] psz = bufferProviderSize(provider);
+                                        if (!frameChanged && psz != null
+                                            && (psz[0] != frameW || psz[1] != frameH)) {
+                                            publishFrameSize(psz[0], psz[1]);
+                                            invalidateProviderGraphics(provider);
+                                            publish = false;
+                                        }
+                                        // Bind the rasterizer only while the buffer in flight is the
+                                        // published one. On a resize frame the provider is the
+                                        // pre-resize buffer: re-binding it re-points the rasterizer's
+                                        // clip at the old size, while the client's own resize path
+                                        // has already moved the target array to the new buffer, and
+                                        // the next scene paint then writes past its end
+                                        // (ArrayIndexOutOfBoundsException out of yw.fb -- the client
+                                        // thread dies in its own error path and the world freezes).
+                                        // The client's resize path leaves the rasterizer consistent,
+                                        // so the resize frame needs no bind; the next frame binds the
+                                        // new buffer.
+                                        if (psz != null && psz[0] == frameW && psz[1] == frameH) {
+                                            bindSceneRasterizerToDisplay(provider);
+                                        }
+                                        Object image = provider.getClass().getMethod("getImage").invoke(provider);
                                         if (image instanceof java.awt.Image) {
                                             java.awt.Image img = (java.awt.Image) image;
                                             logFrameDiagnostics(img);
@@ -1918,13 +2149,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                                 } else {
                                                     ((java.awt.Graphics) args[1]).drawImage(img, 0, 0, null);
                                                 }
-                                                // Hand the completed frame to the render thread
-                                                // (it waits for frameSeq to change).
-                                                frameSeq++;
-                                                renderLock.notifyAll();
+                                                if (publish) {
+                                                    // Hand the completed frame to the render thread
+                                                    // (it waits for frameSeq to change).
+                                                    frameSeq++;
+                                                    renderLock.notifyAll();
+                                                }
                                             }
-                                            if (!firstFramePresented) {
-                                                // The client is drawing: the boot overlay's job is done.
+                                            if (publish && !firstFramePresented) {
+                                                // A frame reached the surface: the boot overlay's job is done.
                                                 firstFramePresented = true;
                                                 runOnUiThread(MainActivity.this::hideBootOverlay);
                                             }
@@ -2067,6 +2300,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             } catch (Throwable t) {
                 Log.w(TAG, "unlocked fps unavailable", t);
             }
+
+            // The client frame geometry -- the display mode and the canvas size -- is
+            // applied on the client thread at the first frame (see the callbacks.draw
+            // handler): the client is between two frames there, so the display-mode
+            // flip, the RuneLite ResizeableChanged post and the canvas resize cannot
+            // race the renderer.
+            displaySetupDone = false;
+            requestGeometry();
 
             updateStatus("RUNNING: Injected Client Active!");
 
@@ -2760,8 +3001,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (w <= 0) {
             return 0;
         }
-        int x = (int) ((raw - fitLeft) * GAME_W / w);
-        return x < 0 ? 0 : Math.min(x, GAME_W - 1);
+        int x = (int) ((raw - fitLeft) * frameW / w);
+        return x < 0 ? 0 : Math.min(x, frameW - 1);
     }
 
     private int toGameY(float raw) {
@@ -2769,8 +3010,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (h <= 0) {
             return 0;
         }
-        int y = (int) ((raw - fitTop) * GAME_H / h);
-        return y < 0 ? 0 : Math.min(y, GAME_H - 1);
+        int y = (int) ((raw - fitTop) * frameH / h);
+        return y < 0 ? 0 : Math.min(y, frameH - 1);
     }
 
     /**
@@ -2854,6 +3095,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                     @Override
                     public void run() {
                         try {
+                            consumeStackDumpRequest();
                             ClassLoader cl = clientClass.getClassLoader();
                             Object qj = readFieldOn(cl, "client", "qj");
                             Object otl = readFieldOn(cl, "client", "pq");
@@ -3248,27 +3490,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         lastDrawLog = now;
         drawCount = 0;
         int[] imgPx = img.getPixels();
+        int iw = img.getWidth(), ih = img.getHeight();
         StringBuilder pb = new StringBuilder(" px="
             + (imgPx == null ? "null" : System.identityHashCode(imgPx) + "(" + imgPx.length + ")"));
-        if (imgPx != null && imgPx.length >= 765 * 503) {
-            int[] s = {0, 100 * 765 + 100, 250 * 765 + 380, 300 * 765 + 200, 400 * 765 + 200, 380 * 765 + 300};
+        if (imgPx != null && iw > 0 && ih > 0 && imgPx.length >= iw * ih) {
+            int[] s = {0, 100 * iw + 100, Math.min(ih - 1, 250) * iw + Math.min(iw - 1, 380),
+                Math.min(ih - 1, 300) * iw + Math.min(iw - 1, 200), Math.min(ih - 1, 400) * iw + Math.min(iw - 1, 200),
+                Math.min(ih - 1, 380) * iw + Math.min(iw - 1, 300)};
             for (int si = 0; si < s.length; si++) {
                 if (s[si] < imgPx.length) {
                     pb.append(String.format(",%08X", imgPx[s[si]]));
                 }
             }
         }
-        pb.append(" world=").append(regionNonZero(imgPx, img.getWidth(), img.getHeight()))
-            .append("/").append(Integer.toHexString(regionXor(imgPx, img.getWidth(), img.getHeight())));
+        pb.append(" world=").append(regionNonZero(imgPx, iw, ih))
+            .append("/").append(Integer.toHexString(regionXor(imgPx, iw, ih)));
         int[] bridgePx = AWTBridge.activePixels;
-        pb.append(" bridge=").append(regionNonZero(bridgePx, GAME_W, GAME_H))
-            .append("/").append(Integer.toHexString(regionXor(bridgePx, GAME_W, GAME_H)));
+        pb.append(" bridge=").append(regionNonZero(bridgePx, frameW, frameH))
+            .append("/").append(Integer.toHexString(regionXor(bridgePx, frameW, frameH)));
         // Top-right strip of the client's own frame: that is where RuneLite's overlays
         // land (the FPS overlay, infoboxes). The game art behind it is static on the
         // welcome screen, so a change in this XOR is overlay pixels appearing.
-        int stripW = Math.min(240, img.getWidth());
-        pb.append(" tr=").append(Integer.toHexString(regionXorRegion(imgPx, img.getWidth(),
-            img.getWidth() - stripW, 0, img.getWidth(), Math.min(26, img.getHeight()))));
+        int stripW = Math.min(240, iw);
+        pb.append(" tr=").append(Integer.toHexString(regionXorRegion(imgPx, iw,
+            iw - stripW, 0, iw, Math.min(26, ih))));
         pb.append(" ovl=").append(alwaysOnTopOverlayCount()).append("(").append(overlayNames).append(")");
         pb.append(" iface=").append(lastInterfaceDrawn).append("/").append(lastInterfaceOverlays);
         // Cumulative entity-draw counters: `denied > 0` is a plugin vetoing entity
@@ -3278,14 +3523,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // RuneLite's FPS overlay paints pure yellow (or red when it is enforcing a
         // limit) at the top-right of the frame; no game art in that strip uses those
         // colours, so a non-zero count is overlay pixels reaching the frame.
-        pb.append(" yellow=").append(countColour(imgPx, img.getWidth(), img.getWidth() - stripW, 0,
-            img.getWidth(), Math.min(26, img.getHeight()), 0xFFFFFF00));
-        pb.append(" red=").append(countColour(imgPx, img.getWidth(), img.getWidth() - stripW, 0,
-            img.getWidth(), Math.min(26, img.getHeight()), 0xFFFF0000));
+        pb.append(" yellow=").append(countColour(imgPx, iw, iw - stripW, 0,
+            iw, Math.min(26, ih), 0xFFFFFF00));
+        pb.append(" red=").append(countColour(imgPx, iw, iw - stripW, 0,
+            iw, Math.min(26, ih), 0xFFFF0000));
         pb.append(" ").append(paletteInvariant())
             .append(" host=").append(RuneLiteHost.isRunning() ? RuneLiteHost.activePluginCount() + "p" : "-")
+            .append(" stop=").append(shutdownState())
             .append(" blitMs=").append(String.format("%.1f", lastBlitNanos / 1e6));
-        Log.d(TAG, "callbacks.draw: " + img.getWidth() + "x" + img.getHeight()
+        Log.d(TAG, "callbacks.draw: " + iw + "x" + ih
             + " fps=" + ((n * 1000.0) / elapsed) + " (" + n + " in " + elapsed + "ms)" + pb);
     }
 
@@ -3447,20 +3693,307 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
             if (rasterizerBoundPixels == pixels && rasterizerTargetField.get(null) == pixels) return;
 
-            int width = (int) bufferProviderIface.getMethod("getWidth").invoke(bufferProvider);
-            int height = (int) bufferProviderIface.getMethod("getHeight").invoke(bufferProvider);
+            int[] size = bufferProviderSize(bufferProvider);
+            if (size == null) return;
             Class<?> rasterizer = cl.loadClass("yw");
             float[] depth = (float[]) rasterizer.getField("aw").get(null);
             Method bind = rasterizer.getDeclaredMethod("ef", int[].class, int.class, int.class, float[].class);
             bind.setAccessible(true);
-            bind.invoke(null, pixels, width, height, depth);
+            bind.invoke(null, pixels, size[0], size[1], depth);
 
             rasterizerBoundPixels = pixels;
             Log.i(TAG, "Bound 3D rasterizer target to display buffer "
-                + System.identityHashCode(pixels) + "(" + width + "x" + height + ")");
+                + System.identityHashCode(pixels) + "(" + size[0] + "x" + size[1] + ")");
         } catch (Throwable t) {
             Log.w(TAG, "Rasterizer bind failed: " + t);
         }
+    }
+
+    /**
+     * The frame size a {@code net.runelite.api.BufferProvider} reports, or null when
+     * it is not one (or the interface is not loaded yet). The client's own frame
+     * buffer is the authority on how big the frame it just drew is, so this is what
+     * the host adopts when the client resizes itself.
+     */
+    private int[] bufferProviderSize(Object provider) {
+        if (provider == null || clientClass == null) {
+            return null;
+        }
+        try {
+            ClassLoader cl = clientClass.getClassLoader();
+            if (bufferProviderIface == null) {
+                bufferProviderIface = cl.loadClass("net.runelite.api.BufferProvider");
+                bufferProviderWidthMethod = bufferProviderIface.getMethod("getWidth");
+                bufferProviderHeightMethod = bufferProviderIface.getMethod("getHeight");
+            }
+            if (!bufferProviderIface.isInstance(provider)) {
+                return null;
+            }
+            return new int[]{
+                (Integer) bufferProviderWidthMethod.invoke(provider),
+                (Integer) bufferProviderHeightMethod.invoke(provider)};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private Class<?> bufferProviderIface;
+    private Method bufferProviderWidthMethod;
+    private Method bufferProviderHeightMethod;
+
+    /**
+     * Swaps the display buffer and the live frame size. Must be called on the client
+     * thread (or the UI thread before the client exists) and pairs the array with
+     * {@link AWTBridge}'s dimensions under {@code renderLock}, so the render thread's
+     * {@code setPixels} can never pair a stride with the wrong array.
+     */
+    private void publishFrameSize(int w, int h) {
+        if (w <= 0 || h <= 0) {
+            return;
+        }
+        synchronized (renderLock) {
+            // Keep the array when the size did not change: it is the client's drawing
+            // target and re-allocating it would blank a frame.
+            int[] px = (w == frameW && h == frameH && appletPixels != null && appletPixels.length == w * h)
+                ? appletPixels
+                : new int[w * h];
+            appletPixels = px;
+            frameW = w;
+            frameH = h;
+            AWTBridge.activePixels = px;
+            AWTBridge.activeWidth = w;
+            AWTBridge.activeHeight = h;
+        }
+    }
+
+    /**
+     * Nulls the frame-buffer's cached {@code java.awt.Graphics} (found by type, so it
+     * survives obfuscation). The client fetches that Graphics from
+     * {@code Component.getGraphics()} -- a snapshot of {@link AWTBridge#activePixels} --
+     * exactly once per frame-buffer instance, so after a client-initiated resize it
+     * still targets the previous frame size and would paint into the old array forever.
+     */
+    private static void invalidateProviderGraphics(Object provider) {
+        if (provider == null) {
+            return;
+        }
+        try {
+            for (Class<?> c = provider.getClass(); c != null; c = c.getSuperclass()) {
+                for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                    if (f.getType() == java.awt.Graphics.class && !java.lang.reflect.Modifier.isStatic(f.getModifiers())) {
+                        f.setAccessible(true);
+                        if (f.get(provider) != null) {
+                            f.set(provider, null);
+                        }
+                        return;
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Could not invalidate the frame buffer's Graphics cache: " + t);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Frame geometry (host side) and client display mode
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Chooses the client frame size the surface should present, and stores it as the
+     * pending request for the client thread.
+     *
+     * <p>Fill mode asks for the surface's own aspect at the apparent UI scale
+     * ({@code round(surfaceH / GAME_H)}, i.e. the integer scale the fixed frame would have
+     * been presented at), clamped to the client's own floor (765x503, the same bound
+     * upstream RuneLite's {@code ClientUI} clamps to) and to {@link #FILL_PIXEL_BUDGET}.
+     * When the height floor binds -- the surface is shorter than {@code s} 503-px frames,
+     * so the frame cannot follow the scale -- the width is widened to the surface's aspect
+     * instead, so the fit still fills the screen; if that would break the budget the frame
+     * keeps the scaled width and the fit leaves bars (a centred fit never distorts).
+     */
+    private void requestGeometry() {
+        int w = GAME_W, h = GAME_H;
+        if (fillEnabled && surfaceW > 0 && surfaceH > 0) {
+            int s = Math.max(1, Math.min(3, Math.round(surfaceH / (float) GAME_H)));
+            for (;;) {
+                w = Math.max(GAME_W, Math.round(surfaceW / (float) s));
+                h = Math.max(GAME_H, Math.round(surfaceH / (float) s));
+                if ((long) w * h <= FILL_PIXEL_BUDGET || s >= 4) break;
+                s++;
+            }
+            if (h == GAME_H) {
+                // The client's floor bound the height, so the scaled width is too narrow
+                // for the surface's aspect (the fit would leave side bars). Widen the
+                // frame to the surface's aspect, unless that breaks the pixel budget.
+                int aspectW = Math.max(GAME_W, Math.round(surfaceW * (GAME_H / (float) surfaceH)));
+                if ((long) aspectW * GAME_H <= FILL_PIXEL_BUDGET) {
+                    w = aspectW;
+                }
+            }
+        }
+        pendingFrameW = w;
+        pendingFrameH = h;
+    }
+
+    /** UI thread: flips fill mode, persisted, applied by the client thread's next frame. */
+    private void toggleFillMode() {
+        fillEnabled = !fillEnabled;
+        prefs().edit().putBoolean("gameFill", fillEnabled).apply();
+        // The live apply is the boot path: the client thread picks the request up on its
+        // next frame. Turning fill on also re-applies the resizable display mode; turning
+        // it off only shrinks the frame back to 765x503 (the mode switch is one-way, see
+        // ClientDisplay.requestResizable).
+        displaySetupDone = false;
+        fillStatus = "pending";
+        requestGeometry();
+        refreshDisplayCard();
+    }
+
+    /** UI thread: flips the sidebar mode (overlap vs resize), persisted. */
+    private void toggleSidebarMode() {
+        sidebarOverlap = !sidebarOverlap;
+        prefs().edit().putBoolean("sidebarOverlap", sidebarOverlap).apply();
+        // Resizes the game surface, which fires surfaceChanged -> requestGeometry().
+        applyGameInsets();
+        refreshDisplayCard();
+    }
+
+    /**
+     * Client thread (from the draw handler, i.e. between two frames): applies the display
+     * setup the current fill setting needs. Fill on puts the client into its own resizable
+     * display mode -- the client hard-sets its canvas to 765x503 and clamps to it in fixed
+     * mode -- so a failure here leaves the frame at 765x503, i.e. the pre-fill behaviour.
+     * Fill off touches the client's display state **only** through the frame size: the
+     * fixed direction of the mode applier corrupts the client's canvas bookkeeping
+     * ({@link ClientDisplay#requestResizable} documents the crash), so the client keeps
+     * whatever mode it booted with.
+     */
+    private void setupClientDisplay() {
+        if (clientObject == null || clientClass == null) {
+            displaySetupDone = false;   // retry at the next frame
+            return;
+        }
+        ClassLoader cl = clientClass.getClassLoader();
+        if (!fillEnabled) {
+            fillStatus = "off";
+            pendingFrameW = GAME_W;
+            pendingFrameH = GAME_H;
+            Log.i(TAG, "fill: off (" + GAME_W + "x" + GAME_H + " frame, client display mode untouched)");
+            return;
+        }
+        try {
+            // An active RuneLite stretch owns the canvas (it reports the *real* size
+            // instead of the requested one); fill mode needs the canvas itself.
+            ClientDisplay.disableStretch(clientObject, cl);
+            if (!ClientDisplay.requestResizable(clientObject, cl)) {
+                failFill("display mode unchanged");
+                return;
+            }
+            fillStatus = "ok";
+            Log.i(TAG, "fill: resizable mode applied (isResized=true)");
+        } catch (Throwable t) {
+            failFill(String.valueOf(t));
+        }
+    }
+
+    /** Turns fill mode off for this session (the pref stays; the frame falls back). */
+    private void failFill(String reason) {
+        fillStatus = "unavailable: " + reason;
+        fillEnabled = false;
+        pendingFrameW = GAME_W;
+        pendingFrameH = GAME_H;
+        Log.w(TAG, "fill: unavailable: " + reason);
+        runOnUiThread(this::refreshDisplayCard);
+    }
+
+    /**
+     * Client thread: sizes the client's canvas to the pending frame request. Returns
+     * true when the frame buffer changed, in which case the frame in flight was drawn
+     * into the previous buffer and must not be published (its {@code Graphics} targets
+     * the old array); the client's next frame fetches a Graphics over the new one and
+     * is presented normally.
+     */
+    private boolean applyPendingFrameSize() {
+        int w = pendingFrameW, h = pendingFrameH;
+        if (w == frameW && h == frameH) {
+            return false;
+        }
+        if (clientObject == null || clientClass == null) {
+            return false;
+        }
+        ClassLoader cl = clientClass.getClassLoader();
+        // Read the canvas back first, and again after a mode re-assert: the display-mode
+        // applier resizes the canvas through the client's own path, and re-running the
+        // resize on a canvas that already has the requested size is *not* harmless -- the
+        // client's scrambled canvas arithmetic threw NegativeArraySizeException out of the
+        // frame-buffer constructor and the client thread died in its own error path.
+        if (!requestedCanvas(clientObject, cl, w, h)
+            && fillEnabled && !ClientDisplay.isResized(clientObject, cl)) {
+            // The client is back in its fixed display mode: it applies its own *stored*
+            // display setting whenever player settings arrive (login, a settings packet)
+            // or the settings interface opens, and that setting is the account's --
+            // fixed for most accounts. Re-assert the mode (which also re-requests the
+            // shell's maximum, repairing the canvas bounds) and fall through. Throttled:
+            // a client resetting it continuously is given up on instead of fought, since
+            // every attempt costs a frame-buffer allocation.
+            long now = System.currentTimeMillis();
+            if (now - lastFillReassert < FILL_REASSERT_MIN_MS) {
+                failFill("display mode reset by the client");
+                return false;
+            }
+            lastFillReassert = now;
+            Log.i(TAG, "fill: client reset the display mode, re-asserting");
+            setupClientDisplay();
+            if (!fillEnabled) {
+                return false;   // setupClientDisplay reported why and set the fallback
+            }
+        }
+        if (requestedCanvas(clientObject, cl, w, h)) {
+            // The applier (or the client itself) already produced the requested size: just
+            // publish it for the presentation.
+            if (w == frameW && h == frameH) {
+                return false;
+            }
+            Log.i(TAG, "client canvas already " + w + "x" + h);
+            publishFrameSize(w, h);
+            return true;
+        }
+        int[] canvas = ClientDisplay.resizeCanvas(clientObject, cl, w, h);
+        if (canvas == null) {
+            failFill("canvas resize threw");
+            return false;
+        }
+        Log.i(TAG, "resize client canvas " + canvas[0] + "x" + canvas[1]
+            + " (requested " + w + "x" + h + ")");
+        if (canvas[0] == frameW && canvas[1] == frameH) {
+            // No effect at all: the client clamped the request back to the size it
+            // already had, i.e. it is not honouring the request.
+            failFill("canvas did not resize");
+            return false;
+        }
+        // Publish *before* the client's next frame: it fetches its destination Graphics
+        // (a snapshot of AWTBridge.activePixels) at the start of that frame.
+        publishFrameSize(canvas[0], canvas[1]);
+        return true;
+    }
+
+    /** Whether the client's canvas already has the size the frame request asks for. */
+    private boolean requestedCanvas(Object client, ClassLoader cl, int w, int h) {
+        int[] canvas = ClientDisplay.canvasSize(client, cl);
+        return canvas != null && canvas[0] == w && canvas[1] == h;
+    }
+
+    /**
+     * Diagnostic: whether the client has armed its own shutdown deadline
+     * ({@code ClientDisplay.shutdownDeadline}). A frozen world is a client whose game
+     * loop exited on that deadline, so this belongs next to every frame line.
+     */
+    private String shutdownState() {
+        if (clientClass == null) {
+            return "-";
+        }
+        long deadline = ClientDisplay.shutdownDeadline(clientClass.getClassLoader());
+        return deadline == 0L ? "clear" : deadline == -1L ? "ERR" : "arm";
     }
 
     /**
@@ -3640,7 +4173,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * applet bridge (what the render thread scales to the surface), to locate
      * where the composited scene gets lost.
      */
-    private static String dumpBridgeContent() {
+    private String dumpBridgeContent() {
         StringBuilder sb = new StringBuilder();
         Object bp = bufferProviderStatic;
         if (bp != null) {
@@ -3662,11 +4195,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             }
         }
         int[] ap = AWTBridge.activePixels;
-        if (ap != null && ap.length >= GAME_W * GAME_H) {
-            int[] s = new int[]{0, 100 * GAME_W + 100, 250 * GAME_W + 380, 300 * GAME_W + 200, 400 * GAME_W + 200};
+        int fw = frameW, fh = frameH;
+        if (ap != null && fw > 0 && fh > 0 && ap.length >= fw * fh) {
+            int[] s = new int[]{0, 100 * fw + 100, Math.min(fh - 1, 250) * fw + Math.min(fw - 1, 380),
+                Math.min(fh - 1, 300) * fw + Math.min(fw - 1, 200), Math.min(fh - 1, 400) * fw + Math.min(fw - 1, 200)};
             sb.append(" appletSamp=");
             for (int i = 0; i < s.length; i++) {
-                sb.append(String.format("%08X,", ap[s[i]]));
+                if (s[i] < ap.length) {
+                    sb.append(String.format("%08X,", ap[s[i]]));
+                }
             }
         }
         return sb.toString();
@@ -3864,24 +4401,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
         surfaceW = width;
         surfaceH = height;
-        // The frame buffer is the client's own fixed 765x503 size; Skia scales
-        // it to the letterbox fit in drawBitmap (nearest-neighbour, see scalePaint).
-        renderBitmap = Bitmap.createBitmap(GAME_W, GAME_H, Bitmap.Config.ARGB_8888);
-        // The rasterizer writes 3D pixels with alpha 0. An alpha bitmap would
-        // have its alpha-0 pixels dropped by Skia's SRC_OVER blend, leaving the
-        // previous surface content visible (the "stale login-screen remnants"
-        // symptom); setHasAlpha(false) replaces the old `| 0xFF000000` pass.
-        renderBitmap.setHasAlpha(false);
-        srcRect.set(0, 0, GAME_W, GAME_H);
-        // Uniform scale, centred: the game keeps its native aspect (a stretch to
-        // fill would distort it) and the leftover strips are painted with barPaint.
-        float scale = Math.min(width / (float) GAME_W, height / (float) GAME_H);
-        fitW = Math.max(1, Math.round(GAME_W * scale));
-        fitH = Math.max(1, Math.round(GAME_H * scale));
-        fitLeft = (width - fitW) / 2;
-        fitTop = (height - fitH) / 2;
-        Log.i(TAG, "surface " + width + "x" + height + " fit " + fitW + "x" + fitH
-            + " at " + fitLeft + "," + fitTop);
+        // The frame bitmap and the letterbox fit rect are built on the render thread
+        // (rebuildRenderGeometry) from the live frame size, which the client owns and
+        // fill mode changes; this thread only publishes the new surface size and the
+        // frame size the surface asks for.
+        requestGeometry();
+    }
+
+    /**
+     * Render thread: (re)builds the frame bitmap and the fit rect from the live frame
+     * and surface sizes. A no-op unless one of them changed.
+     *
+     * <p>Called under {@code renderLock}, so a resize published by the client thread
+     * (publishFrameSize) can never be observed halfway. The frame bitmap is created
+     * here rather than in {@code surfaceChanged} because the client frame size is
+     * live: the surface may arrive before the client and every frame resize lands
+     * here.
+     */
+    private void rebuildRenderGeometry() {
+        int w = frameW, h = frameH;
+        int sw = surfaceW, sh = surfaceH;
+        if (sw <= 0 || sh <= 0) {
+            return;
+        }
+        if (w == geoW && h == geoH && sw == geoSurfaceW && sh == geoSurfaceH) {
+            return;
+        }
+        geoW = w;
+        geoH = h;
+        geoSurfaceW = sw;
+        geoSurfaceH = sh;
+        if (renderBitmap == null || renderBitmap.getWidth() != w || renderBitmap.getHeight() != h) {
+            renderBitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
+            // The rasterizer writes 3D pixels with alpha 0. An alpha bitmap would
+            // have its alpha-0 pixels dropped by Skia's SRC_OVER blend, leaving the
+            // previous surface content visible (the "stale login-screen remnants"
+            // symptom); setHasAlpha(false) replaces the old `| 0xFF000000` pass.
+            renderBitmap.setHasAlpha(false);
+            srcRect.set(0, 0, w, h);
+        }
+        // Uniform scale, centred: the game keeps its native aspect (a stretch to fill
+        // would distort it) and the leftover strips are painted with barPaint.
+        float scale = Math.min(sw / (float) w, sh / (float) h);
+        fitW = Math.max(1, Math.round(w * scale));
+        fitH = Math.max(1, Math.round(h * scale));
+        fitLeft = (sw - fitW) / 2;
+        fitTop = (sh - fitH) / 2;
+        Log.i(TAG, "surface " + sw + "x" + sh + " fit " + fitW + "x" + fitH
+            + " at " + fitLeft + "," + fitTop + " (frame " + w + "x" + h + ")");
     }
 
     @Override
@@ -3900,25 +4467,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void runRenderLoop() {
         // The frame is presented with native calls only: one row copy of the
-        // client's 765x503 int[] into the bitmap and one scaled drawBitmap.
+        // client's frame int[] into the bitmap and one scaled drawBitmap.
         // DISPLAY priority keeps this thread scheduled while the client thread
         // saturates the CPU with its software renderer.
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_DISPLAY);
         while (isRunning) {
-            if (renderBitmap == null) {
-                // No surface yet - idle so background work (updates, dexing)
-                // isn't starved.
-                try {
-                    Thread.sleep(50);
-                } catch (InterruptedException ignored) {}
-                continue;
-            }
-            // Wait for the client's next completed frame (delivered by the
-            // callbacks.draw proxy). We must NOT present on a timer, nor call
-            // client.paint(): that blits the game's LIVE frame buffer while the
-            // client thread is rendering the next frame into it (torn frames).
             long scaleStart;
             synchronized (renderLock) {
+                // The client frame size is live (fill mode resizes the client's canvas),
+                // so the bitmap and the fit rect are rebuilt here, from the sizes the
+                // client thread publishes.
+                rebuildRenderGeometry();
+                if (renderBitmap == null) {
+                    // No surface yet - idle so background work (updates, dexing)
+                    // isn't starved.
+                    try {
+                        renderLock.wait(50);
+                    } catch (InterruptedException ignored) {}
+                    continue;
+                }
+                // Wait for the client's next completed frame (delivered by the
+                // callbacks.draw proxy). We must NOT present on a timer, nor call
+                // client.paint(): that blits the game's LIVE frame buffer while the
+                // client thread is rendering the next frame into it (torn frames).
                 while (isRunning && frameSeq == lastDrawnSeq) {
                     try {
                         renderLock.wait(100);
@@ -3926,8 +4497,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 }
                 if (!isRunning) break;
                 lastDrawnSeq = frameSeq;
+                // A resize can land while we wait; rebuilding keeps the copy below
+                // from ever pairing a stride with the wrong frame buffer.
+                rebuildRenderGeometry();
                 scaleStart = System.nanoTime();
-                renderBitmap.setPixels(appletPixels, 0, GAME_W, 0, 0, GAME_W, GAME_H);
+                renderBitmap.setPixels(appletPixels, 0, frameW, 0, 0, frameW, frameH);
             }
             Canvas canvas = null;
             try {
@@ -3967,6 +4541,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                             Log.i(TAG, "conformance requested via " + conformanceRequest.getAbsolutePath());
                             runOnUiThread(() -> PluginConformance.run(this));
                         }
+                        consumeStackDumpRequest();
                         try {
                             Class<?> clientInterface = clientClass.getClassLoader().loadClass("net.runelite.api.Client");
                             Object state = clientInterface.getMethod("getGameState").invoke(clientObject);

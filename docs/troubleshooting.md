@@ -53,6 +53,28 @@ this page only routes you. Diagnostic surfaces and exact log-field meanings are 
   [telemetry-assessment.md](telemetry-assessment.md) §6. In the throttled `callbacks.draw` line, a
   frozen `world=` with a changing `bridge=` is the same failure from the other side.
 
+## Everything stops: `callbacks.draw` and `GameState` lines end
+
+- **What you see.** The screen freezes completely (no overlay movement either), `LoginTick` keeps
+  printing once a second, and the log's last frame line is preceded by `fill:`/`resize client
+  canvas` (i.e. it happened at a client canvas resize) or by nothing at all.
+- **Why.** The client's own game loop thread (named `Client` by `to.run`) exited. There are only two
+  ways out: the shutdown deadline `to.re` (armed by the `stop()`/`destroy()` Applet lifecycle,
+  `Client.stopNow()`, or the crash handler) or an exception, which the client logs itself as a
+  `System.err` line tagged `[Client] ERROR injected-client - Client error` with its stack.
+- **How to read it.** The frame log's `stop=` field is `clear`/`arm`/`ERR`
+  (`ClientDisplay.shutdownDeadline`); `arm` on the final lines means a shutdown, `clear` means an
+  exception. Grep the raw log (not `-s RuneLiteMobile`) for `[Client] ERROR`, and note the client's
+  own frames — the port's stack is irrelevant here, so the frame names are the client's obfuscated
+  ones.
+- **Known causes, both about resizing the client's canvas** (see
+  [rendering.md](rendering.md) §1.1/§3.1): binding the rasterizer to a *pre-resize* buffer
+  (`ArrayIndexOutOfBoundsException` out of `yw.fb`, `length=384796; index=384796` was the
+  resize-frame signature) and calling `GameEngine.resizeCanvas()` for a size the canvas already has
+  (`NegativeArraySizeException` out of `tx.<init>`, reachable through the mode applier's own resize).
+  For a hang instead of an exit — `LoginTick` printing but no exception, `stop=clear` — use the
+  thread dump in [device-runbook.md](device-runbook.md) §5.
+
 ## Grey walls, black ground / trees / actors
 
 - **What you see.** Geometry draws, but all shaded surfaces are grey and the ground, trees and

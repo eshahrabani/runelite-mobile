@@ -22,8 +22,9 @@ Old School RuneScape client. The port does not reimplement the game or the clien
 it names (`client`, `injected-client`, `runelite-api`) plus the runtime libraries they need, and
 `downloadAndDexJar` ASM-transforms and d8-dexes them all into
 `android/src/main/assets/runelite-dex.jar`. At runtime the app installs a `DexClassLoader` over that
-asset, loads the obfuscated `client` class, and asks it to paint into a 765x503 software buffer that
-lives in `core/`'s hand-written `java.awt` stubs.
+asset, loads the obfuscated `client` class, and asks it to paint into a software buffer that
+lives in `core/`'s hand-written `java.awt` stubs — 765x503 in the client's fixed display mode, or a
+device-aspect frame when the port's *game fill* mode puts the client into its own resizable mode.
 
 The entire difficulty is that Android has no `java.desktop`: the port supplies a working subset of
 AWT/Swing, replaces `sun.misc.Unsafe` and `java.lang.ProcessHandle`, and drives the client's own
@@ -40,12 +41,14 @@ anything past a build — the Android SDK platform-tools. The target device is e
 `dalvik.vm.usejit=false`, which is why AOT compilation is a required install step rather than an
 optimisation.
 
-**Key runtime constants.** The client's own frame size is 765x503 (`GAME_W`/`GAME_H`), the frame-pacing
+**Key runtime constants.** The client's frame size is live: `GAME_W`/`GAME_H` (765x503) is its floor
+and its fill-off/fallback size, and *game fill* (on by default) drives the client's own resizable
+mode to a device-aspect frame capped at `FILL_PIXEL_BUDGET` (700k px). The frame-pacing
 target is 60 fps (`FPS_TARGET`), a still finger held for `LONG_PRESS_MS` (400 ms) is a right click, and
 movement past `ROTATE_LOCK_DP` (10 dp) is the one-finger camera drag. The left press is *deferred*
 (nothing is pressed at touch-down; the press is sent on lift for a tap), which is what makes the long
-press possible — the client acts on mouse **down**. All of these live in `MainActivity`; change the
-frame size only together with `appletPixels` and `AWTBridge.activePixels/activeWidth/activeHeight`.
+press possible — the client acts on mouse **down**. All of these live in `MainActivity`; the frame
+array and the bridge dimensions are only ever swapped together by `publishFrameSize`.
 
 ---
 
@@ -55,7 +58,9 @@ State as of this writing. Numbers that move with upstream releases are described
 
 | Feature | State | Where documented |
 |---|---|---|
-| Software 3D rendering into a 765x503 frame | works | [rendering.md](docs/rendering.md) |
+| Software 3D rendering into a live-size frame | works | [rendering.md](docs/rendering.md) |
+| Game fill (device-aspect client frame) | works | [rendering.md](docs/rendering.md) §1.1 |
+| Sidebar overlap / resize modes | works | [side-panel.md](docs/side-panel.md) |
 | Touch → mouse (press/drag/release/click) | works | [input.md](docs/input.md) |
 | One-finger drag → camera rotate | works | [input.md](docs/input.md) |
 | Two-finger camera drag (middle-button emulation) | works | [input.md](docs/input.md) |

@@ -77,7 +77,17 @@ callbacks.draw: <W>x<H> fps=<n*1000.0/elapsed> (<n> in <elapsed>ms)
 | `red=<n>` | count of `0xFFFF0000` pixels in the same strip | Same overlay when it is enforcing a frame limit. |
 | `pal=<ok\|BAD>(<nz>/65536)` | whether the three rasteriser palette slots still alias `fq.aq`, and how much of the table is built (`pal=ERR` when the reflection fails) | `pal=BAD` or a near-zero `nz` means the palette invariant broke — see [rendering.md](rendering.md) invariant (a). |
 | `host=<Np\|->` | `RuneLiteHost.activePluginCount()+"p"`, or `-` when the host is not running | Confirms the plugin runtime is up and how many plugins are active. |
+| `stop=<clear\|arm\|ERR>` | `ClientDisplay.shutdownDeadline()` — the client's own shutdown deadline (`to.re`, the static long the game loop `to.run` exits on) | `arm` on the last lines before the numbers stop means the client took its own stop/error path (an Applet-lifecycle `stop()`, `Client.stopNow()`, or the `Callbacks.error` crash handler). A frozen world with `stop=clear` is a client thread blocked elsewhere — dump its stack ([device-runbook.md](device-runbook.md) §5). |
 | `blitMs=<n.n>` | `lastBlitNanos / 1e6` — time spent inside the `callbacks.draw` frame-blit branch | Watch for growth after a client update; compare with the cost model in [rendering.md](rendering.md). |
+
+The `<W>x<H>` in the prefix is the **live client frame size** (`frameW`/`frameH`), not a
+constant: 765x503 with game fill off, the device-aspect frame with it on. The render-thread
+line `surface <w>x<h> fit <w>x<h> at <l>,<t> (frame <w>x<h>)` gives the same size plus the
+fit rect it is presented into; the launcher's **Display** card (and the Host card's `frame`
+row) print it too. `resize client canvas <w>x<h> (requested <w>x<h>)` is the client-thread
+resize that follows, and `fill:` lines carry the fill state (`resizable mode applied`,
+`off (... display mode untouched)`, `client reset the display mode, re-asserting`,
+`unavailable: <reason>`).
 
 **If rendering "stops", check the `callbacks.draw` proxy first.** The render thread
 only presents when `frameSeq` changes, and `frameSeq` is incremented only inside the
@@ -114,7 +124,7 @@ GameState: <state> loginIndex: <idx> scaleMs=<lastScaleNanos/1e6> <probe>=<value
 | `getLocalPlayer` | local player object (or `null`) |
 | `getMapRegions` | rendered as `N regions` (the array length is substituted, not the array) |
 | `getFPS` | the client's own FPS counter |
-| `getCanvasWidth`, `getCanvasHeight` | the client canvas size — should stay `765`/`503` |
+| `getCanvasWidth`, `getCanvasHeight` | the client canvas size: `765`/`503` when game fill is off, the filled frame size when it is on (they must equal the `frame` row of the launcher's Display and Host cards) |
 | `isStretchedEnabled` | stretch mode |
 | `getWorldList` | appended last as `worldList=<n>`, or `ERR` |
 

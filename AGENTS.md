@@ -95,7 +95,14 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
      `yw.ef(int[], int, int, float[])` (the call its `yi.ab(int)` resize path
      makes). The client only runs that on a desktop resize, so without this the
      3D scene is rasterised into the client's original target: a frozen frame
-     with a live minimap. `fa.ak` is **not** a pixel target — it is each
+     with a live minimap. **Never bind a frame whose buffer just changed**: on a
+     resize frame the provider in flight is the previous buffer, and `yw.ef` also
+     sets the *clip*, so binding it leaves the new array with the old clip and the
+     next scene paint dies with `ArrayIndexOutOfBoundsException` out of `yw.fb`
+     (`length=384796; index=384796`), taking the client thread with it. The
+     callbacks proxy skips the bind whenever the provider's size differs from the
+     published frame size (`MainActivity`, see `docs/rendering.md` §3.1); the
+     client's own resize path leaves the rasterizer consistent. `fa.ak` is **not** a pixel target — it is each
      rasterizer's reference to the `fq.aq` HSL→RGB palette (65536 entries) that
      every shaded fill reads; re-pointing it at the frame turns those lookups
      into screen-pixel reads (grey walls, black ground/trees/actors). The
@@ -161,27 +168,74 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   there is nothing to do. Downtime target: a whole run is ~190 s measured, so
   RuneLite publishing -> users able to pull is ~5 min (cron) + ~3 min (build and
   publish) + the app's own 2-minute poll.
-- **Render loop is fixed 765×503** (the client's own frame size — `GAME_W` in
-  MainActivity must match it): `appletPixels` (MainActivity) ↔
-  `AWTBridge.activePixels/activeWidth/activeHeight`. Change all three
-  together. The render thread (`runRenderLoop`) blocks on `renderLock` until
+- **Render loop presents the client's own frame at a live size** (765×503 in the
+  client's fixed display mode, a device-aspect frame in the port's **game fill**
+  mode): `appletPixels` (MainActivity) ↔
+  `AWTBridge.activePixels/activeWidth/activeHeight` ↔ `frameW/frameH`. The first
+  two are swapped together by `publishFrameSize(w, h)` under `renderLock` — never
+  assign `AWTBridge.activePixels` directly: core's `Component.getGraphics()`
+  snapshots it at call time and the client caches that `Graphics` per frame-buffer
+  instance. `requestGeometry()` (UI thread) picks the frame size; `ClientDisplay`
+  drives the client's display mode and canvas (`GameEngine.resizeCanvas()`), and
+  `applyPendingFrameSize()` runs on the client thread at the top of the
+  `callbacks.draw` handler, where the client is between two frames. A frame drawn
+  through a just-replaced frame buffer is **not** presented (`publish == false`);
+  the next one is. The render thread (`runRenderLoop`) blocks on `renderLock` until
   `callbacks.draw` has bumped `frameSeq` — it never presents on a timer, and
   each presented frame is exactly one client frame. Presentation is two native
   calls: `renderBitmap.setPixels(appletPixels, …)` and one
   `canvas.drawBitmap(renderBitmap, srcRect, renderDst, scalePaint)` that lets
-  Skia scale 765×503 into the **letterbox fit rect** (nearest-neighbour:
+  Skia scale the frame into the **centred fit rect** (nearest-neighbour:
   `scalePaint.setFilterBitmap(false)`); four `drawRect`s paint the bars around
   it first, because the surface buffer is not cleared by the system. Do **not**
   reintroduce per-pixel Java loops here — the old scale loop + `| 0xFF000000`
   pass cost 172-229 ms/frame on a Pixel 8 Pro; this path costs ~12-15 ms of one
-  core at 2244×1008. The thread runs at `THREAD_PRIORITY_DISPLAY` and idles (no
+  core at 2244×1008 (measured 8-18 ms for the 605k-px fill frame). The thread runs
+  at `THREAD_PRIORITY_DISPLAY` and idles (no
   canvas lock) while `renderBitmap == null`. Nothing is drawn on the canvas: the
   loader's progress lives in a themed boot overlay (`bootOverlay`/`tvBootStatus`,
   hidden by the first presented frame), and the 5 s GameState log (`scaleMs=`)
-  is logcat-only. `surfaceChanged` recomputes `fitLeft/Top/W/H` and logs
-  `surface <w>x<h> fit <w>x<h> at <l>,<t>` — the same surface is inset by the
-  right-edge chrome, so opening the drawer fires a resize and the game
-  reletterboxes instead of being overlapped (`applyGameInsets`).
+  is logcat-only. `rebuildRenderGeometry()` (render thread, under `renderLock`)
+  rebuilds the bitmap, `srcRect` and `fitLeft/Top/W/H` from the live frame and
+  surface sizes and logs `surface <w>x<h> fit <w>x<h> at <l>,<t> (frame <w>x<h>)`;
+  `surfaceChanged` only records `surfaceW/H` and calls `requestGeometry()`. The
+  same surface is inset by the right-edge chrome in the sidebar's **resize** mode;
+  in the default **overlap** mode it stays full width and the drawer floats over
+  the game (`applyGameInsets`).
+- **Game fill drives the client's display mode** (`ClientDisplay.java` + the
+  launcher's **Display** card): `ClientDisplay.requestResizable(client, cl)` calls the
+  game's own applier — `ms.bo(int, byte)`, with `client.ne/nw/nv(int)` as fallbacks —
+  which sets the static boolean `Client.isResized()` returns and requests 7680×2160 from
+  the shell, then verifies `isResized()` actually flipped. Those obfuscated names are the
+  port's only version-specific display internals; re-derive them per the procedure added
+  to `docs/telemetry-assessment.md` §6. The switch is **one-way**: the fixed direction
+  (`ms.bo(1, 0)`) corrupts the client's canvas fields in this environment (see the resize
+  traps below), so fill *off* never calls an applier — at boot the client keeps its own
+  fixed mode (what the port always ran) and after a fill session it stays resizable until
+  the app restarts, with only the frame returning to 765×503.
+  A setup that fails turns fill off for the session (the pref survives), leaving the
+  frame at 765×503 — i.e. today's behaviour — and reporting
+  `game fill: unavailable: <reason>` on the launcher. Fill mode also forces
+  RuneLite's stretch off (`setStretchedEnabled(false)`), because an active stretch
+  shrinks the client's real dimensions and the client derives its own size requests
+  from those.
+- **Two client-resize traps, both fatal to the client thread** (the world freezes while
+  every other thread keeps running; the frame log's `stop=` field marks the client
+  taking its own shutdown: `to.re` armed, `ClientDisplay.shutdownDeadline`):
+  1. **Never bind the rasterizer to a pre-resize buffer** — see the render-loop bullet
+     above: `yw.ef` sets the array *and* the clip, so a stale bind leaves the new array
+     with the old clip and the next scene paint dies with
+     `ArrayIndexOutOfBoundsException` out of `yw.fb`, then `Callbacks.error`.
+  2. **Never call `GameEngine.resizeCanvas()` for a size the canvas already has.** The
+     mode applier (`ms.bo`, via `agh`) resizes the canvas itself when it switches
+     modes, so `applyPendingFrameSize` reads `Client.getCanvasWidth/Height` back first
+     and just publishes when it matches. A redundant pass threw
+     `NegativeArraySizeException` out of the frame-buffer constructor (`tx.<init>`) —
+     the client's canvas fields are stored scrambled, so a redundant re-derivation does
+     not round-trip — and the client's own resize path then hit the same corruption and
+     the thread died. Both rules are what make an in-game drawer toggle in resize mode
+     survivable at all; verify with `fill:`/`resize client canvas`/`callbacks.draw`
+     lines continuing after the resize and no `Callbacks.error`.
 - **Frame pacing is client-side** (`FPS_TARGET = 60` in MainActivity):
   `initialize()` is followed by `Client.setUnlockedFps(true)` +
   `setUnlockedFpsTarget(FPS_TARGET)` (that order — turning unlocked fps off
@@ -462,8 +516,14 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   `PluginErrorPanel` for that tab only (logged as `panel activation failed: <tooltip>`);
   the rest of the sidebar keeps working.
   `MainActivity`'s launcher screen carries the **Host** section (client version, runtime
-  status, plugin index/active counts, load failures, client AOT state, on-device dexer,
-  the last conformance summary, and the *Run plugin conformance* / *Refresh* pills).
+  status, the live `frame` size, plugin index/active counts, load failures, client AOT
+  state, on-device dexer,
+  the last conformance summary, and the *Run plugin conformance* / *Refresh* pills), and
+  the **Display** card (*Game fill: on/off* + *Sidebar: overlap/resize*, with the frame
+  size, the fill status and the fallback reason on their rows). The two settings live in
+  the launcher's `SharedPreferences` (`gameFill`, `sidebarOverlap`; both default on); a
+  fill failure is session-only so a pref set under an older client is retried after a
+  client bump.
 - **Swing runtime** (`core/src/main/java/{java,javax}/**` + `core/.../bridge/`). The port
   ships a hand-written `java.awt`/`javax.swing` because Android has no `java.desktop`;
   it is what makes the unmodified panels run. Four things to know before touching it:
