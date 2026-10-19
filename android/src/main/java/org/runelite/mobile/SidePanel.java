@@ -27,11 +27,12 @@ import org.runelite.mobile.host.RuneLiteHost;
  *
  * <p>The right-edge column (the drawer handle and the keyboard toggle) is always present
  * and consumes {@code handleWidthPx} of screen width; an open drawer adds
- * {@code drawerWidthPx}. The game surface is <em>inset</em> by that sum -- the host reads
- * {@link #occupiedWidthPx()} and resizes the surface (see {@link Listener}) -- instead of
- * the drawer floating over a full-size game. The column and the drawer swallow touches
- * inside their own bounds, and the game's own input mapping accounts for the inset, so no
- * tap is lost.
+ * {@code drawerWidthPx}. The game surface is <em>inset</em> by the column in both sidebar
+ * modes (so no game pixel is ever hidden behind the chrome), plus the open drawer in
+ * <b>resize</b> mode -- in <b>overlap</b> mode the drawer floats over the game instead.
+ * The host reads {@link #columnWidthPx()} / {@link #occupiedWidthPx()} and resizes the
+ * surface (see {@link Listener}). The column and the drawer swallow touches inside their
+ * own bounds, and the game's own input mapping accounts for the inset, so no tap is lost.
  */
 public final class SidePanel {
 
@@ -95,8 +96,8 @@ public final class SidePanel {
 
         // Right-edge column: the port's only always-present chrome. It holds the drawer
         // handle (top, fills the remaining height) and the keyboard toggle (foot); the
-        // host insets the game surface by the column + drawer width, so it takes screen
-        // space instead of covering the game.
+        // host always insets the game surface by the column (and, in resize mode, by the
+        // drawer too), so the column takes screen space instead of covering the game.
         column = new LinearLayout(activity);
         column.setOrientation(LinearLayout.VERTICAL);
         column.setBackground(UiTheme.corners(UiTheme.SURFACE_ALT, UiTheme.GOLD_DIM, 1.5f,
@@ -260,6 +261,15 @@ public final class SidePanel {
     /** Screen pixels the chrome hides from the game: the column, plus the drawer when open. */
     public int occupiedWidthPx() {
         return handleWidthPx + (open ? drawerWidthPx : 0);
+    }
+
+    /**
+     * Screen pixels the always-present right-edge column hides from the game. Always
+     * reserved (the column cannot be closed); the open drawer's {@code drawerWidthPx} is
+     * only reserved as well in the host's resize mode.
+     */
+    public int columnWidthPx() {
+        return handleWidthPx;
     }
 
     public void toggle() {

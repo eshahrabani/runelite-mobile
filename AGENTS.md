@@ -207,9 +207,10 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   rebuilds the bitmap, `srcRect` and `fitLeft/Top/W/H` from the live frame and
   surface sizes and logs `surface <w>x<h> fit <w>x<h> at <l>,<t> (frame <w>x<h>)`;
   `surfaceChanged` only records `surfaceW/H` and calls `requestGeometry()`. The
-  same surface is inset by the right-edge chrome in the sidebar's **resize** mode;
-  in the default **overlap** mode it stays full width and the drawer floats over
-  the game (`applyGameInsets`).
+  same surface is **always** inset by the always-present right-edge column (44 dp,
+  `SidePanel.columnWidthPx()`), so no game pixel renders under the chrome; the
+  sidebar's **resize** mode insets it by the open drawer as well, while in the
+  default **overlap** mode the drawer floats over the game (`applyGameInsets`).
 - **Game fill drives the client's display mode** (`ClientDisplay.java` + the
   launcher's **Display** card): `ClientDisplay.requestResizable(client, cl)` calls the
   game's own applier — `ms.bo(int, byte)`, with `client.ne/nw/nv(int)` as fallbacks —
@@ -506,11 +507,15 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   (shapes, alpha blending, the opaque frame blit, text).
 - **The drawer hosts RuneLite's real Swing sidebar** (`org.runelite.mobile.SidePanel` + the
   always-present right-edge column with the `‹`/`›` chevron and the `⌨` keyboard toggle).
-  The column is 44 dp wide; an open drawer adds `min(42% of the screen width, 380 dp)`. It
-  **takes space** rather than floating: `MainActivity.applyGameInsets` insets the game
-  `SurfaceView` and the keyboard bar by `sidePanel.occupiedWidthPx()`, so a toggle resizes
-  the surface and the game reletterboxes (the column is hidden on the launcher screen by
-  `setAvailable(false)`). The drawer header carries the `⌂` launcher shortcut.
+  The column is 44 dp wide; an open drawer adds `min(42% of the screen width, 380 dp)`. The
+  column **always takes space**: `MainActivity.applyGameInsets` insets the game
+  `SurfaceView` by `sidePanel.columnWidthPx()` in both sidebar modes (so no game pixel is
+  covered by the chrome), and by the open drawer as well only in **resize** mode — in the
+  default mode the drawer floats over the game, so a toggle there resizes nothing. The
+  keyboard bar takes the full `sidePanel.occupiedWidthPx()` in both modes, because it is
+  chrome and not game. The column is hidden on the launcher screen by `setAvailable(false)`
+  (the inset itself is left unchanged, so hiding the chrome never resizes the client). The
+  drawer header carries the `⌂` launcher shortcut.
   The drawer **body** is `SwingSidebarView`: RuneLite's `ClientToolbarPanel` +
   `JTabbedPane` (RIGHT placement, `JTabbedPane.trailingComponent` = the toolbar strip) +
   the real plugin panels, built in the asset dex by the `ClientUI` shim

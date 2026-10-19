@@ -32,9 +32,10 @@ container before `initialize()`.
 The mapping is **not** a stretch: the surface is letterboxed to the frame's aspect (uniform scale,
 centred, bars painted), and `fitLeft`/`fitTop`/`fitW`/`fitH` are the fit rect the render thread
 rebuilds whenever the frame or surface size changes (`rebuildRenderGeometry`). The surface itself is
-narrower than the screen whenever the right-edge chrome is showing in the sidebar's **resize** mode
-(`applyGameInsets`), so the same rect follows the drawer (see [side-panel.md](side-panel.md)); in
-**overlap** mode (the default) the surface stays full-width and the drawer simply covers it. A point
+narrower than the screen by the always-present right-edge column (`applyGameInsets`), so the same
+rect follows the chrome and no game pixel is hidden under it (see [side-panel.md](side-panel.md));
+in the sidebar's **resize** mode the open drawer is subtracted too, while in **overlap** mode (the
+default) the drawer floats over the game. A point
 that lands in a bar **clamps** to the nearest game pixel rather than being dropped: a finger that
 strays into a bar mid-gesture keeps its event stream, which the two-finger camera gesture needs. The
 blit geometry that scales the frame into the fit rect is described in [rendering.md](rendering.md).
@@ -186,7 +187,7 @@ The game has **no in-game text input**. There is no IME hook inside the client; 
 | `kbEdit` | `EditText`, single-line, hint `Type here...`, `IME_ACTION_GO`; the editor action dispatches `VK_ENTER` |
 | `Enter` / `Hide` | `dispatchKeyCode(VK_ENTER, '\n')` / `toggleKeyboardBar()` |
 
-`toggleKeyboardBar` flips `kbBar` visibility and shows/hides the soft keyboard via `InputMethodManager` (`MainActivity.toggleKeyboardBar`). The bar is inset by the right-edge chrome width like the game surface (`applyGameInsets`), so it centres over the game area rather than under the drawer column.
+`toggleKeyboardBar` flips `kbBar` visibility and shows/hides the soft keyboard via `InputMethodManager` (`MainActivity.toggleKeyboardBar`). The bar is inset by the full chrome width (`sidePanel.occupiedWidthPx()`, column plus open drawer) in both sidebar modes, so it centres clear of the column and of the drawer rather than under the chrome — unlike the game surface, which reserves the open drawer only in **resize** mode.
 
 The core can also raise the bar itself: when a Swing text component takes or loses the focus from a pointer press, `UiBridge.focusOwnerChanged` fires `Host.textInputRequested` → the `SwingSidebarView` callback → `MainActivity.showKeyboardBar(boolean)` (thread-hopped to the Android main thread). So a tap on a sidebar text field opens the same bar, and its keystrokes land in the Swing field rather than the game. `showKeyboardBar` is idempotent; `toggleKeyboardBar` is the `⌨`-tile/manual path.
 
@@ -215,7 +216,7 @@ The `Throwable` catch in `dispatchMouseEvent` happens **after** the `Dispatch mo
 
 ## 8. Touch ownership and view layering
 
-The drawer, its column and the keyboard bar consume only events inside their own bounds; the game surface is *inset* rather than covered (`applyGameInsets`), so no tap is lost. The order in which children are added to `rootLayout` decides what draws over what:
+The drawer, its column and the keyboard bar consume only events inside their own bounds; the game surface is *inset* by the column in both sidebar modes and by the open drawer in **resize** mode rather than being covered by the chrome (`applyGameInsets`), so no tap is lost — in **overlap** mode the open drawer sits over the game area by design. The order in which children are added to `rootLayout` decides what draws over what:
 
 1. `surfaceView` — the game surface, added first (bottom).
 2. `launcherScroll` — the launcher panel (scrim + centred card).

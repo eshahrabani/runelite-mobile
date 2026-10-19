@@ -161,12 +161,14 @@ that each presented frame is exactly one completed client frame.
 | `surfaceChanged` | records `surfaceW/H` and calls `requestGeometry()`; the bitmap, `srcRect` and the fit rect are built by the render thread's `rebuildRenderGeometry()` |
 | `surfaceDestroyed` | sets `isRunning = false`, interrupts and joins the render thread |
 
-The surface is inset by the right-edge chrome in the sidebar's **resize** mode
-(`applyGameInsets`, see [side-panel.md](side-panel.md)), so a drawer toggle fires `surfaceChanged`
-with a smaller width and the game re-renders and reletterboxes to the reduced area instead of being
-overlapped. In **overlap** mode (the default) the inset stays 0, the drawer floats over the game and
-a drawer toggle changes neither the surface nor the frame — that is the mode's point: the resizable
-layout's minimap and tab panel live under the drawer.
+The surface is inset by the right-edge chrome (`applyGameInsets`, see
+[side-panel.md](side-panel.md)). The always-present column (44 dp) is reserved in **both**
+sidebar modes, so the game never renders under the chrome; a drawer toggle fires
+`surfaceChanged` only in **resize** mode, where the open drawer is reserved as well and the
+game re-renders and reletterboxes to the reduced area instead of being overlapped. In
+**overlap** mode (the default) a drawer toggle changes neither the surface nor the frame —
+the drawer floats over the game, which is the mode's point: the resizable layout's minimap
+and tab panel live under the drawer.
 
 The render thread runs at `THREAD_PRIORITY_DISPLAY` so it stays scheduled while the client thread
 saturates a core with the software renderer (`MainActivity.runRenderLoop`). While `renderBitmap == null`

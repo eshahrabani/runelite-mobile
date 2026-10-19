@@ -124,7 +124,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * so a later client build -- with different obfuscated internals -- can succeed).
      */
     private volatile boolean fillEnabled = true;
-    /** Sidebar mode: true = the drawer floats over a full-width game, false = it insets it. */
+    /** Sidebar mode: true = the open drawer floats over the game, false = it insets it too. */
     private volatile boolean sidebarOverlap = true;
     /** False until {@link #setupClientDisplay()} ran for the current client instance. */
     private volatile boolean displaySetupDone;
@@ -1902,16 +1902,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     /**
      * Insets the game surface and the keyboard bar by the right-edge chrome width.
      *
-     * <p>Two modes (the launcher's Display card): <b>overlap</b>, the drawer floats over
-     * a full-width game (that is the mode's point -- the resizable layout's minimap and
-     * tab panel live under the drawer), and <b>resize</b>, today's behaviour, where the
-     * surface is inset and the client re-renders at the smaller size. The keyboard bar
-     * sits under the drawer in both modes, so its action pills stay clear of the chrome
-     * either way -- it is chrome, not game.
+     * <p>Two modes (the launcher's Display card): <b>overlap</b>, where the surface is
+     * inset by the always-present column only and the open drawer floats over the game
+     * (that is the mode's point -- the resizable layout's minimap and tab panel live under
+     * the drawer), and <b>resize</b>, where the surface takes the column plus the open
+     * drawer and the client re-renders at the smaller size. The column is reserved in both
+     * modes: it is permanent chrome, so no game pixel belongs under it. The keyboard bar
+     * always sits clear of the full chrome width, drawers included -- it is chrome, not
+     * game.
      */
     private void applyGameInsets() {
         int chrome = sidePanel != null ? sidePanel.occupiedWidthPx() : 0;
-        insetRight(surfaceView, sidebarOverlap ? 0 : chrome);
+        int column = sidePanel != null ? sidePanel.columnWidthPx() : 0;
+        insetRight(surfaceView, sidebarOverlap ? column : chrome);
         insetRight(kbBar, chrome);
     }
 

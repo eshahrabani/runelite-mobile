@@ -38,17 +38,22 @@ what draws over what — the login overlay is last, so it covers the drawer).
 - The chevron's `OnTouchListener` toggles on `ACTION_UP` and always returns `true` — a `TextView`
   click listener would consume the down event itself and the column's swallowing listener (below)
   would never see it.
-- **The drawer takes screen space or floats over the game** (the launcher's Display card,
-  `Sidebar: overlap` / `Sidebar: resize`). `occupiedWidthPx()` is
-  `handleWidthPx + (open ? drawerWidthPx : 0)`; `MainActivity.applyGameInsets` sets the right margin
-  of `surfaceView` and `kbBar` from it (driven by `Listener.onOpenChanged`). In the default
-  **overlap** mode only `kbBar` gets the margin — the keyboard bar is chrome, its pills must stay
-  clear of the drawer — and the *game* stays full width, with the drawer floating over it (the point
-  of the mode: the resizable layout's minimap and tab panel live under the drawer). In **resize**
-  mode the surface is inset too, so a toggle
-  fires `surfaceChanged` with a narrower surface and the game re-renders at the smaller size and
-  reletterboxes into the reduced area —
-  nothing is overlapped, and the surface's own touch mapping follows ([rendering.md](rendering.md)).
+- **The column always takes screen space; the drawer floats or takes space** (the launcher's
+  Display card, `Sidebar: overlap` / `Sidebar: resize`). `columnWidthPx()` is
+  `handleWidthPx` (the always-present column), `occupiedWidthPx()` is
+  `handleWidthPx + (open ? drawerWidthPx : 0)`; `MainActivity.applyGameInsets` sets the right
+  margin of `surfaceView` and `kbBar` from them (driven by `Listener.onOpenChanged`). The
+  game surface is inset by the column in **both** modes, so no game pixel renders under the
+  chrome. In the default **overlap** mode the drawer adds nothing to the game's inset — it
+  floats over the game (the point of the mode: the resizable layout's minimap and tab panel
+  live under the drawer) — so a toggle changes neither the surface nor the frame. In
+  **resize** mode the surface is inset by the drawer too, so a toggle fires `surfaceChanged`
+  with a narrower surface and the game re-renders at the smaller size and reletterboxes into
+  the reduced area — nothing is overlapped, and the surface's own touch mapping follows
+  ([rendering.md](rendering.md)). `kbBar` always takes `occupiedWidthPx()`, because the
+  keyboard bar is chrome: its pills must stay clear of the drawer in both modes. The inset
+  does not depend on `setAvailable` — hiding the chrome on the launcher must not resize a
+  running client.
 - `toggle()` flips `open`, runs `applyState()` and persists `sidePanelOpen`. `applyState` sets the
   drawer `VISIBLE`/`GONE`, calls `UiBridge.setSidebarVisible(open)` (§2), calls
   `swingSidebarView.setSuspended(!open)` (§2), updates the chevron glyph, and notifies
