@@ -130,7 +130,15 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   `response_type=id_token code` — the id_token arrives in the URL **fragment**,
   which a browser never sends to a server; `LocalCallbackServer` serves a page
   whose JS POSTs the fragment back to `127.0.0.1:80`/`[::1]:80`, and
-  `handleConsentFragment` reads it there — there is no WebView). Game session:
+  `handleConsentFragment` reads it there — there is no WebView). Loopback :80 is
+  bindable only where the image sets `net.ipv4.ip_unprivileged_port_start=0`
+  (phones); a `1024` floor (Google Play emulator images) fails both binds with
+  `EACCES`, and `startJagexLogin` then selects **manual capture** instead of
+  aborting: the same leg-2 page runs in the browser, the login overlay grows a
+  "Paste login link" pill (`submitConsentLink` accepts the
+  `http://localhost/#…` address, prefilled from the clipboard) and
+  `handleConsentFragment` — unchanged — consumes it. The redirect URI cannot be
+  relaxed to escape this (Jagex refuses every other one, probed). Game session:
   `auth.jagex.com/game-session/v1/sessions` → `sessionId`,
   `…/v1/accounts` (Bearer sessionId) → character picker. Legacy
   (`login_provider=runescape`) accounts are rejected with a message.

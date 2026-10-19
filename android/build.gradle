@@ -331,6 +331,9 @@ task syncRuneLiteJars {
     description = "Downloads the RuneLite client + runtime jars pinned by bootstrap.json"
     def outDir = project.ext.rlJarsDir
     outputs.dir(outDir)
+    // The task's real input is the remote bootstrap.json; an output-only up-to-date
+    // check would pin the client forever until the build script changes.
+    outputs.upToDateWhen { false }
     doLast {
         outDir.mkdirs()
         println "Fetching RuneLite bootstrap.json..."
@@ -345,10 +348,12 @@ task syncRuneLiteJars {
         def sha256 = { File f ->
             java.security.MessageDigest.getInstance("SHA-256").digest(f.bytes).encodeHex().toString()
         }
+        def kept = [] as Set
         def fetch = { String name, String url, String expected ->
             def target = new File(outDir, name)
             if (target.exists() && expected != null && sha256(target) == expected) {
                 println "  [cached]     " + name
+                kept << name
                 return target
             }
             def part = new File(outDir, name + ".part")
@@ -365,6 +370,7 @@ task syncRuneLiteJars {
                 throw new GradleException("Could not move " + part + " to " + target)
             }
             println "  downloaded   " + name + " (" + target.length() + " bytes)"
+            kept << name
             return target
         }
 
@@ -421,6 +427,14 @@ task syncRuneLiteJars {
             " (" + runtimeEntries.size() + " classes byte-identical)"
 
         new File(outDir, "version.txt").text = clientVersion
+        outDir.listFiles()?.each { File f ->
+            if (f.isFile() && f.name != 'version.txt' && !kept.contains(f.name)) {
+                if (!f.delete()) {
+                    throw new GradleException("Could not delete stale RuneLite artifact " + f.absolutePath)
+                }
+                println "  removed stale " + f.name
+            }
+        }
         println "RuneLite jars ready in " + outDir.absolutePath + " (v" + clientVersion + ")"
     }
 }

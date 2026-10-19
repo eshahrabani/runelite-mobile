@@ -3,6 +3,8 @@ package org.runelite.mobile;
 import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ClipData;
+import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Bitmap;
@@ -260,6 +262,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private String leg2State;
     private String leg2Nonce;
     private boolean loginActive = false;
+    /** True when loopback :80 could not be bound and leg 2's fragment must be pasted back. */
+    private boolean manualConsentCapture;
+    /** "Paste login link" pill in the login overlay; visible only in manual capture mode. */
+    private TextView btnPasteLoginLink;
     /** Version whose update dialog the user already declined, so a *new* version still asks. */
     private String declinedVersion;
 
@@ -872,6 +878,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         closeParams.gravity = Gravity.BOTTOM;
         loginOverlay.addView(tvCloseLogin, closeParams);
 
+        // Only meaningful when loopback :80 could not be bound (emulator images that
+        // reserve low ports): the consent redirect then cannot reach the app, so the
+        // browser's http://localhost/#... address has to be pasted back by hand.
+        btnPasteLoginLink = pillAction("Paste login link");
+        btnPasteLoginLink.setVisibility(View.GONE);
+        btnPasteLoginLink.setOnClickListener(v -> promptForConsentLink());
+        FrameLayout.LayoutParams pasteParams = new FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT);
+        pasteParams.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+        pasteParams.bottomMargin = (int) (84 * density);
+        loginOverlay.addView(btnPasteLoginLink, pasteParams);
+
         rootLayout.addView(loginOverlay);
 
         // The app starts on the launcher screen: the right-edge chrome (and a drawer
@@ -1343,9 +1361,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (loginActive) return;
         loginActive = true;
         loginStage = LoginStage.LEG1;
-        if (!startCallbackServer()) {
-            failLogin("Login failed: could not start the local login callback.");
-            return;
+        leg2State = null;      // a stale nonce from an earlier attempt must never validate a pasted link
+        leg2Nonce = null;
+        manualConsentCapture = !startCallbackServer();
+        btnPasteLoginLink.setVisibility(manualConsentCapture ? View.VISIBLE : View.GONE);
+        if (manualConsentCapture) {
+            Log.w(TAG, "Consent callback server unavailable; leg 2's link must be pasted back");
         }
         leg1Verifier = JagexOAuthClient.generateVerifier();
         String challenge = JagexOAuthClient.createChallenge(leg1Verifier);
@@ -1449,7 +1470,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         callbackServer = new LocalCallbackServer(fragment ->
             runOnUiThread(() -> handleConsentFragment(fragment)));
         if (!callbackServer.start()) {
-            Log.e(TAG, "Could not bind the localhost consent callback port 80");
+            Log.e(TAG, "Could not bind the localhost consent callback port 80; falling back to pasted consent links");
             callbackServer = null;
             return false;
         }
@@ -1460,6 +1481,71 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         if (callbackServer != null) {
             callbackServer.stop();
             callbackServer = null;
+        }
+    }
+
+    /** Dialog that accepts the consent redirect URL the browser could not deliver. */
+    private void promptForConsentLink() {
+        if (!loginActive) return;
+        final EditText input = createStyledEditText("http://localhost/#id_token=…", readClipboardText());
+        AlertDialog dialog = new AlertDialog.Builder(this)
+            .setTitle("Paste the login link")
+            .setView(input)
+            .setPositiveButton("Continue", null)
+            .setNegativeButton("Cancel", null)
+            .create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(v -> {
+            String reason = submitConsentLink(input.getText().toString());
+            if (reason == null) {
+                dialog.dismiss();
+            } else {
+                input.setError(reason);
+            }
+        });
+    }
+
+    /**
+     * Feeds a pasted consent redirect URL (or bare fragment) to the leg-2 handler.
+     * Returns null when the link was accepted (or the login ended), else the reason to show inline.
+     */
+    private String submitConsentLink(String pasted) {
+        if (pasted == null || pasted.trim().isEmpty()) return "Paste the address of the page that did not load.";
+        String text = pasted.trim();
+        String pairs;
+        int hash = text.indexOf('#');
+        if (hash >= 0) {
+            pairs = text.substring(hash + 1);              // full http://localhost/#… URL or bare fragment
+        } else if (text.contains("id_token=") || text.contains("error=")) {
+            pairs = text;                                  // only the fragment was copied
+        } else if (text.contains("?error=")) {
+            pairs = text.substring(text.indexOf('?') + 1); // error response returned in the query
+        } else {
+            return "That is not the Jagex login link. Copy the browser's address bar.";
+        }
+        if (parsePairs(pairs, "error", true) == null) {
+            if (leg2State == null) return "Finish signing in to Jagex in your browser first.";
+            if (!leg2State.equals(parsePairs(pairs, "state", true))) {
+                return "That link is from an earlier sign-in attempt. Copy the newest link.";
+            }
+        }
+        Log.i(TAG, "Providing consent fragment from the pasted link");
+        handleConsentFragment(pairs);
+        return null;
+    }
+
+    /** First text item on the clipboard, or null when unavailable (app not focused / empty). */
+    private String readClipboardText() {
+        try {
+            ClipboardManager cm = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+            if (cm == null || !cm.hasPrimaryClip()) return null;
+            ClipData clip = cm.getPrimaryClip();
+            if (clip == null || clip.getItemCount() == 0) return null;
+            CharSequence text = clip.getItemAt(0).coerceToText(this);
+            return text == null ? null : text.toString().trim();
+        } catch (Exception e) {
+            Log.w(TAG, "Clipboard read failed: " + e.getMessage());
+            return null;
         }
     }
 
@@ -1479,7 +1565,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         leg2Nonce = JagexOAuthClient.randomToken(16);
         String url = JagexOAuthClient.buildConsentAuthorizeUrl(leg2State, leg2Nonce);
         Log.i(TAG, "[4] Opening browser for consent authorize (leg 2)");
-        tvLoginStatus.setText("Confirming account — check your browser");
+        if (manualConsentCapture) {
+            tvLoginStatus.setText("Consent page opened. When the browser shows a page that cannot load, "
+                + "copy its address and tap \u201cPaste login link\u201d.");
+        } else {
+            tvLoginStatus.setText("Confirming account — check your browser");
+        }
         openInBrowser(url);
     }
 
@@ -1487,6 +1578,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private void handleConsentFragment(String fragment) {
         if (!loginActive || loginStage != LoginStage.LEG2) {
             Log.w(TAG, "Ignoring consent callback outside leg 2: stage=" + loginStage);
+            return;
+        }
+        String error = parsePairs(fragment, "error", true);
+        if (error != null && !error.isEmpty()) {
+            String description = parsePairs(fragment, "error_description", true);
+            String message = description != null && !description.isEmpty() ? description : error;
+            if (message.length() > 160) message = message.substring(0, 160) + "…";
+            Log.e(TAG, "Consent authorize returned error=" + error + " description=" + description);
+            failLogin("Login failed: " + message);
             return;
         }
         String state = parsePairs(fragment, "state", true);
