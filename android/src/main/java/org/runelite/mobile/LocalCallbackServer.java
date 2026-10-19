@@ -22,7 +22,11 @@ import java.util.List;
  * This server serves a page whose JS POSTs location.hash back to it, delivering
  * the fragment to the app.
  *
- * Android apps can bind port 80 on loopback without root (verified on-device).
+ * Apps may bind :80 on loopback only where the OS image allows unprivileged low
+ * ports: images with net.ipv4.ip_unprivileged_port_start = 0 (the usual phone
+ * setting) can, while a 1024 value (Google Play emulator images) yields EACCES on
+ * both 127.0.0.1 and ::1. When start() reports the bind failure, MainActivity
+ * falls back to a pasted consent link instead of aborting the login.
  * Connections from non-loopback peers are rejected. Only one consent POST is
  * accepted per server instance.
  */

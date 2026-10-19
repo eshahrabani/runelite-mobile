@@ -2,7 +2,7 @@
 
 **Audience:** developer
 **Read this when:** you touch Jagex account login, session tokens, the local OAuth callback, or the client's `JX_*` launch contract
-**Verified against:** `MainActivity.startJagexLogin`, `MainActivity.onNewIntent`, `MainActivity.handleLeg1Code`, `MainActivity.startConsentLeg`, `MainActivity.handleConsentFragment`, `MainActivity.onLoginSucceeded`, `MainActivity.selectCharacter`, `MainActivity.bootstrapGameClient`, `MainActivity.writeCredentialsFile`, `MainActivity.importCredentialsFile`, `MainActivity.saveManualCredentials`, `MainActivity.signOut`, `JagexOAuthClient.java`, `LocalCallbackServer.java`, `AndroidManifest.xml`, `xml/network_security_config.xml`
+**Verified against:** `MainActivity.startJagexLogin`, `MainActivity.onNewIntent`, `MainActivity.handleLeg1Code`, `MainActivity.startConsentLeg`, `MainActivity.startCallbackServer`, `MainActivity.handleConsentFragment`, `MainActivity.promptForConsentLink`, `MainActivity.submitConsentLink`, `MainActivity.readClipboardText`, `MainActivity.onLoginSucceeded`, `MainActivity.selectCharacter`, `MainActivity.bootstrapGameClient`, `MainActivity.writeCredentialsFile`, `MainActivity.importCredentialsFile`, `MainActivity.saveManualCredentials`, `MainActivity.signOut`, `JagexOAuthClient.java`, `LocalCallbackServer.java`, `AndroidManifest.xml`, `xml/network_security_config.xml`
 
 The port does not implement authentication. It runs the two-leg OAuth flow that the official
 Jagex Launcher performs, then hands the resulting **game session** to the unmodified client as
@@ -110,7 +110,9 @@ consent authorize URL:
 `buildConsentAuthorizeUrl` passes `codeChallenge = null` and `prompt = null`, so this leg carries
 **no PKCE** and no `prompt`. The redirect is exactly `http://localhost` (port 80, no path).
 
-On return, `handleConsentFragment` validates `state` against `leg2State` (mismatch →
+On return, `handleConsentFragment` first reports an OAuth failure — a fragment carrying
+`error=` becomes `failLogin("Login failed: <error_description or error>")`, truncated to 160
+chars — and only then validates `state` against `leg2State` (mismatch →
 `failLogin("Login failed: consent state mismatch. Try again.")`), extracts `id_token`, sets
 `DONE`, and creates the game session on a `JagexSession` thread. `nonce` is not validated, and
 the `code` half of `response_type=id_token code` is never consumed — only `id_token` is used.
@@ -133,7 +135,10 @@ with "Login complete. Return to RuneLite Mobile.".
 Server behaviour (`LocalCallbackServer`):
 
 - `start()` binds `127.0.0.1:80` and `[::1]:80` with backlog 4, and returns true if **any**
-  address bound. Binding port 80 on loopback needs no root.
+  address bound. Port 80 on loopback is bindable only where
+  `net.ipv4.ip_unprivileged_port_start` is `0` (the usual phone setting); a `1024` value — every
+  Google Play emulator image — fails both binds with `EACCES`, which is what selects the pasted
+  fallback in §4b.
 - One daemon accept thread per bound address, named `LoginCallback-<addr>`.
 - Accepted connections from non-loopback peers are rejected via `isLoopbackAddress()`.
 - Socket read timeout is 8000 ms. `readRequest` parses HTTP/1.x headers byte-wise up to a blank
@@ -147,11 +152,38 @@ Server behaviour (`LocalCallbackServer`):
 parsed on the UI thread. The server is started **before leg 1** (`startJagexLogin` starts it, then
 opens the leg-1 browser), so it is running during both legs, but it only ever receives the leg-2
 consent callback. It is stopped on `cancelLogin`, on `onDestroy`, and by itself after the single
-POST. If binding fails, `startJagexLogin` calls `failLogin("Login failed: could not start the
-local login callback.")` and leg 1 never opens.
+POST. If binding fails, `startJagexLogin` logs `falling back to pasted consent links` and selects
+§4b — the login continues in manual capture mode instead of aborting.
 
 The token is delivered by **this server**, not by any intercepted WebView navigation. There is no
 `shouldOverrideUrlLoading` in the tree.
+
+## 4b. Fallback: pasted consent link (manual capture)
+
+On an image that cannot bind :80 (a `1024` unprivileged-port floor: Play emulator images; also a
+real device whose :80 is held by another app) the consent redirect can never reach the app, and
+`CONSENT_REDIRECT_URI` cannot be changed — Jagex rejected every other redirect URI
+(`error=invalid_request`, probed with `http://localhost:42080`). The browser still lands on
+`http://localhost/#id_token=…` and keeps that fragment in its address bar, so the app asks for it:
+
+```text
+startCallbackServer() fails → manualConsentCapture = true
+    → "Paste login link" pill in the login overlay (GONE on every normal phone)
+    → dialog, field prefilled from the clipboard (readClipboardText)
+    → submitConsentLink(...) → handleConsentFragment(fragment)   # identical to the server path
+```
+
+`submitConsentLink` accepts a full `http://localhost/#…` URL, a bare `…&state=…` fragment, or a
+`?error=…` query, and returns an inline reason instead of calling the handler when the text is not
+a login link, when leg 2 has not started (`leg2State == null`), or when `state` is stale. Links
+carrying `error=` skip the state check on purpose — they exist to surface Jagex's message, which
+`handleConsentFragment` then reports. `cancelLogin`/`failLogin`/`selectCharacter` need no change:
+the next `startJagexLogin` recomputes the mode and resets `leg2State`/`leg2Nonce`.
+
+Verified on `emulator-5554` (API 36, Play image): bind fails with `EACCES`, the pill appears, and a
+pasted `#error=access_denied&error_description=…` link produces
+`Login failed: <description>` while `#state=<leg2State>&id_token=…` reaches
+`[5/6] Captured consent id_token`. A real phone keeps the automatic path, with no pill.
 
 ## 5. Game session exchange
 
