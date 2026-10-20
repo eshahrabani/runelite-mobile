@@ -228,6 +228,32 @@ it downloads RuneLite's official injected client (pre-dexed by CI) and loads it 
   RuneLite's stretch off (`setStretchedEnabled(false)`), because an active stretch
   shrinks the client's real dimensions and the client derives its own size requests
   from those.
+- **Portrait mode: a 70/30 game/HUD split with a tabbed band.** The Display card's `Portrait` pill
+  (`portraitMode`, persisted as `portrait`) switches the activity to portrait at runtime — the manifest
+  keeps `screenOrientation="landscape"` and lists `orientation|screenSize|smallestScreenSize|
+  screenLayout|keyboardHidden` in `configChanges`, so the rotation re-lays out the running activity and
+  the booted client survives (same pid) — and asks for a **765-wide frame at the surface's aspect**
+  (`requestGeometry`, bypassing `FILL_PIXEL_BUDGET`: 765 is the game's own UI width floor, and only the
+  top 70 % is 3D). Portrait forces the resizable display mode on, like fill; a failure sets
+  `portraitFailed` and falls back to the 765×503 letterbox.
+  The split is presentation, not widget surgery, and runs on the client thread right after the frame
+  blit in `callbacks.draw`: `ClientDisplay.applyPortraitLayout` **measures** the band (`round(0.70 *
+  frameH)`, floored so ≥360 rows remain), the content top below the app's 56-frame-row tab strip, and
+  the chatbox (interface **162** root child 0, 519×165) and side-panel (`161:38`, 200×281) rects;
+  `clipPortraitScene` re-points the 3D rasterizer at the same array with a band-tall clip
+  (`yw.ef(pixels, w, bandTop, depth)` — its height argument is the viewport the client projects
+  through, so the scene is centred and scaled in the band, not cropped, verified on the device);
+  `clearPortraitBottomBand` zeroes the band in the client's buffer; and `maskInactivePanel` blacks out
+  everything in the *presented* copy except the selected panel. The band is **tabbed**: `Chat` or
+  `Side panel` (the host pill strip at the band's top edge, `portraitTab` in prefs) — one panel at a
+  time, the other masked, which is what replaced the original side-by-side plan.
+  `getTopLevelInterfaceId() == 161` is the gate: the welcome/ad screen reports 165 and fullscreen
+  interfaces differ, and then the band is `inactive` — nothing is clipped, cleared or masked.
+  **The panels keep the client's own sizes.** Their rows are *siblings* of the interface root (the chat
+  root reports no children), and the client's layout pass rewrites position and size between frames: a
+  `setSize` reverted, a `setForcedPosition` offset moved the root without its rows, and re-running the
+  panels' scripts left the side panel empty (all measured). A genuinely wider chat/panel needs the
+  client's stretch mode or a host-side scaled copy **plus** an inverse transform in the touch path.
 - **Two client-resize traps, both fatal to the client thread** (the world freezes while
   every other thread keeps running; the frame log's `stop=` field marks the client
   taking its own shutdown: `to.re` armed, `ClientDisplay.shutdownDeadline`):
@@ -532,11 +558,14 @@ objectindicators, cluescrolls, party — every plugin that injects a shim) faile
   status, the live `frame` size, plugin index/active counts, load failures, client AOT
   state, on-device dexer,
   the last conformance summary, and the *Run plugin conformance* / *Refresh* pills), and
-  the **Display** card (*Game fill: on/off* + *Sidebar: overlap/resize*, with the frame
-  size, the fill status and the fallback reason on their rows). The two settings live in
-  the launcher's `SharedPreferences` (`gameFill`, `sidebarOverlap`; both default on); a
-  fill failure is session-only so a pref set under an older client is retried after a
-  client bump.
+  the **Display** card (*Portrait: on/off*, *Game fill: on/off* — disabled and shown as
+  *forced (portrait)* while portrait is on — and *Sidebar: overlap/resize*, with the frame
+  size, the portrait band/tab state, the fill status and the fallback reason on their
+  rows). The settings live in the launcher's `SharedPreferences` (`gameFill`,
+  `sidebarOverlap`, `portrait`, `portraitTab`; fill and overlap default on, portrait off);
+  a fill/portrait failure is session-only so a pref set under an older client is retried
+  after a client bump. The launcher card's width is `min(420 dp, widthPixels - 2*24 dp)`
+  and is recomputed on a rotation (`updateLauncherCardWidth`).
 - **Swing runtime** (`core/src/main/java/{java,javax}/**` + `core/.../bridge/`). The port
   ships a hand-written `java.awt`/`javax.swing` because Android has no `java.desktop`;
   it is what makes the unmodified panels run. Four things to know before touching it:

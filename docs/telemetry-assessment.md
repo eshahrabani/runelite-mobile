@@ -143,7 +143,18 @@ On a client version bump (watch `bootstrap.json` / `client-version.txt`):
    `java.applet.AppletContext.showDocument` (a real URL open).
 5. Re-check `grep -rl "firebase\|crashlytics\|analytics\|sentry" .` returns nothing in
    this repo (no added telemetry SDK).
-6. Re-derive the **client-internal names the port drives** (all obfuscated per version; they
+6. Re-derive the **resizable layout's interface ids** the portrait band measures: the toplevel
+   (`getTopLevelInterfaceId()` must read **161** while the play layout is up — 165 is the fullscreen
+   container the welcome/ad screen reports, 164 is unused by this build), the chatbox
+   (`InterfaceID.CHATBOX` = **162**, root child 0 = the 519x165 chat parent at (0,1586)), and the side
+   panel's slot, a *toplevel child* found by geometry (right-hand column, ≥120 px square; it was
+   **161:38**, 200x281 at 544,1443, with the paging arrows at 161:39/40 and the tab-icon row at
+   161:41-48). `ClientDisplay.applyPortraitLayout` logs `portrait layout: … chat <rect> side <rect>`
+   on its first application, and logs one `portrait layout children 161: …` line listing every child
+   as `id:type/contentType@x,yxWxH`; those two lines are what the numbers above are re-derived from
+   (they are interface-definition data, so a client bump can move them). A wrong id degrades to
+   `inactive`/`pending` on the launcher's Display card, never to a broken game.
+7. Re-derive the **client-internal names the port drives** (all obfuscated per version; they
    live in exactly two files — `ClientDisplay` for the display-mode applier, `MainActivity`
    for the rasterizer/palette probes):
    - the **display-mode applier** the fill mode uses, `ms.bo(int, byte)`, and its duplicates

@@ -56,11 +56,14 @@ public final class SidePanel {
     private final FrameLayout root;
     /**
      * The drawer width is the single knob for the Swing UI scale: the drawer is
-     * {@code min(42% of screen, 380 dp)} wide and {@link SwingSidebarView} maps that onto
-     * RuneLite's 272-logical-px sidebar (and thumbnails its bitmaps to a scale that does
-     * not exceed the drawer), so widening or narrowing this rule retunes {@code uiScale}.
+     * {@code min(42% of screen, 380 dp)} wide, widened when that would clip the sidebar
+     * ({@link #drawerWidthFor}), and {@link SwingSidebarView} maps that onto RuneLite's
+     * 272-logical-px sidebar (and thumbnails its bitmaps to a scale that does not exceed
+     * the drawer). Recomputed on a rotation by {@link #onScreenWidthChanged}.
      */
-    private final int drawerWidthPx;
+    private int drawerWidthPx;
+    /** The drawer's horizontal padding, in dp (both sides). */
+    private static final int DRAWER_PADDING_DP = 12;
     private final int handleWidthPx;
     private final float density;
     private final SharedPreferences prefs;
@@ -85,7 +88,7 @@ public final class SidePanel {
         DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
         this.density = metrics.density;
         this.prefs = activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
-        this.drawerWidthPx = Math.min((int) (0.42f * metrics.widthPixels), (int) (380 * density));
+        this.drawerWidthPx = drawerWidthFor(metrics.widthPixels);
         this.handleWidthPx = (int) (44 * density);
 
         container = new FrameLayout(activity);
@@ -151,7 +154,8 @@ public final class SidePanel {
             drawerWidthPx, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
         drawerParams.rightMargin = handleWidthPx;
         drawer.setLayoutParams(drawerParams);
-        drawer.setPadding((int) (12 * density), (int) (12 * density), (int) (12 * density), (int) (12 * density));
+        drawer.setPadding((int) (DRAWER_PADDING_DP * density), (int) (12 * density),
+            (int) (DRAWER_PADDING_DP * density), (int) (12 * density));
 
         // Header: the brand and the launcher shortcut (the floating gear button the
         // host used to draw over the game is gone).
@@ -215,6 +219,42 @@ public final class SidePanel {
         open = prefs.getBoolean(PREFS_OPEN, false);
         updateStatus();
         applyState();
+    }
+
+    /**
+     * The drawer's width for a screen width: {@code min(42% of the screen, 380 dp)}, but
+     * never so narrow that the Swing sidebar has to clip -- the sidebar renders at an
+     * integer scale of its 272-logical-px width, so the drawer has to fit
+     * {@code scale * 272 + padding}. Portrait narrows the screen a lot (42% of 1280 px is
+     * 537 px, i.e. a scale-1 sidebar with its right-hand tab strip cut off), which is what
+     * this floor is for.
+     */
+    private int drawerWidthFor(int screenWidthPx) {
+        int base = Math.min((int) (0.42f * screenWidthPx), (int) (380 * density));
+        int pad = 2 * (int) (DRAWER_PADDING_DP * density);
+        int scale = Math.max(SwingSidebarView.MIN_SCALE, Math.min(SwingSidebarView.MAX_SCALE,
+            Math.round(base / (float) SwingSidebarView.SIDEBAR_LOGICAL_WIDTH)));
+        int needed = scale * SwingSidebarView.SIDEBAR_LOGICAL_WIDTH + pad;
+        return Math.min((int) (380 * density), Math.max(base, needed));
+    }
+
+    /**
+     * Recomputes the drawer width for a new screen width and applies it (a rotation).
+     * The Swing sidebar re-derives its own integer scale from the new content width.
+     */
+    public void onScreenWidthChanged(int screenWidthPx) {
+        int width = drawerWidthFor(screenWidthPx);
+        if (width == drawerWidthPx) {
+            return;
+        }
+        drawerWidthPx = width;
+        FrameLayout.LayoutParams lp = (FrameLayout.LayoutParams) drawer.getLayoutParams();
+        lp.width = width;
+        drawer.setLayoutParams(lp);
+        if (listener != null) {
+            // The host re-insets the game surface by the new width.
+            listener.onOpenChanged(open);
+        }
     }
 
     public void setListener(Listener listener) {

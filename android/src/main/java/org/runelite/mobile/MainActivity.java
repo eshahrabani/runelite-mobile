@@ -7,6 +7,8 @@ import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
@@ -124,6 +126,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      * so a later client build -- with different obfuscated internals -- can succeed).
      */
     private volatile boolean fillEnabled = true;
+    /**
+     * Portrait mode (the Display card): the activity runs in the portrait orientation
+     * and the client frame is a 765-wide frame at the surface's aspect whose top 70% is
+     * the 3D scene and whose bottom 30% band is a tabbed HUD -- the chatbox on one tab,
+     * the side panel (inventory/equipment/skills/...) on the other, full width
+     * ({@link ClientDisplay#applyPortraitLayout}). Persisted; like fill mode a setup that
+     * fails is session-only, so a later client build can succeed.
+     */
+    private volatile boolean portraitMode;
+    /** The resizable setup failed in portrait mode: the frame falls back to 765x503. */
+    private volatile boolean portraitFailed;
+    /** Portrait layout state: "off", "pending", "ok", "inactive" or "unavailable: ...". */
+    private volatile String portraitLayoutStatus = "off";
+    /** The band's active tab: {@link #PORTRAIT_TAB_CHAT} or {@link #PORTRAIT_TAB_SIDE}. */
+    private volatile int portraitTab = PORTRAIT_TAB_CHAT;
+    /** First frame row of the portrait HUD band, or 0 when the layout is not active. */
+    private volatile int portraitTopRow;
+    /** The client's resizable maximum height (its display applier requests 7680x2160). */
+    private static final int PORTRAIT_MAX_H = 2160;
+    /** The portrait band's tabs: the chatbox, or the side panel (inventory/skills/...). */
+    private static final int PORTRAIT_TAB_CHAT = 0, PORTRAIT_TAB_SIDE = 1;
     /** Sidebar mode: true = the open drawer floats over the game, false = it insets it too. */
     private volatile boolean sidebarOverlap = true;
     /** False until {@link #setupClientDisplay()} ran for the current client instance. */
@@ -222,8 +245,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private LinearLayout hostRows;
     private TextView btnHostConformance;
     private TextView btnHostRefresh;
-    /** The launcher's Display section: game fill + sidebar mode. */
+    /** The portrait band's tab strip (host chrome drawn over the game's HUD band). */
+    private LinearLayout portraitTabs;
+    private TextView portraitTabChat;
+    private TextView portraitTabSide;
+    /** The launcher's Display section: portrait mode, game fill, sidebar mode. */
     private LinearLayout displayRows;
+    private TextView btnPortraitMode;
     private TextView btnFillMode;
     private TextView btnSidebarMode;
     private TextView btnManual;
@@ -367,9 +395,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // 2. Load saved session state
         loadSessionState();
         loadDisplayPrefs();
+        // The manifest declares landscape (the port's native orientation); portrait mode
+        // overrides it at runtime. The manifest's configChanges lists orientation/screen
+        // size, so the switch re-lays out the activity instead of recreating it -- and
+        // the loaded client survives it.
+        setRequestedOrientation(portraitMode
+            ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
 
         // 3. Build UI: SurfaceView + launcher screen + login WebView overlay
         buildLauncherUi();
+        buildPortraitTabs();
         setContentView(rootLayout);
 
         // 4. Touch input dispatch into the game client
@@ -479,10 +515,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         launcherPanel.setOrientation(LinearLayout.VERTICAL);
         launcherPanel.setBackground(UiTheme.rounded(0xF71E1A16, UiTheme.GOLD_DIM, 2f, 20f, density));
 
-        int cardWidth = Math.min((int) (420 * density), (int) (0.92f * metrics.widthPixels));
+        int cardMargin = (int) (24 * density);
+        int cardWidth = launcherCardWidth(metrics.widthPixels, density);
         FrameLayout.LayoutParams panelLp = new FrameLayout.LayoutParams(
             cardWidth, LinearLayout.LayoutParams.WRAP_CONTENT, Gravity.CENTER);
-        int cardMargin = (int) (24 * density);
         panelLp.setMargins(cardMargin, cardMargin, cardMargin, cardMargin);
         launcherPanel.setLayoutParams(panelLp);
         launcherPanel.setPadding((int) (28 * density), (int) (24 * density), (int) (28 * density), (int) (24 * density));
@@ -634,6 +670,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         displayRows = new LinearLayout(this);
         displayRows.setOrientation(LinearLayout.VERTICAL);
         displayCard.addView(displayRows);
+
+        btnPortraitMode = pillAction("Portrait: off");
+        btnPortraitMode.setLayoutParams(fullWidthParams((int) (6 * density)));
+        btnPortraitMode.setOnClickListener(v -> togglePortraitMode());
+        displayCard.addView(btnPortraitMode);
 
         btnFillMode = pillAction("Game fill: on");
         btnFillMode.setLayoutParams(fullWidthParams((int) (6 * density)));
@@ -1022,7 +1063,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         hostRows.removeAllViews();
         hostRows.addView(hostRow("client version", RuneLiteHost.clientVersion()));
         hostRows.addView(hostRow("runtime", RuneLiteHost.isRunning() ? "running" : "not running"));
-        hostRows.addView(hostRow("frame", frameW + "x" + frameH + (fillEnabled ? " (fill)" : " (fixed)")));
+        hostRows.addView(hostRow("frame", frameW + "x" + frameH
+            + (portraitMode ? " (portrait)" : fillEnabled ? " (fill)" : " (fixed)")));
         hostRows.addView(hostRow("plugin index", RuneLiteHost.indexSize() + " classes"));
         hostRows.addView(hostRow("active plugins", String.valueOf(RuneLiteHost.activePluginCount())));
         hostRows.addView(hostRow("status", RuneLiteHost.status()));
@@ -1074,7 +1116,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         displayRows.removeAllViews();
-        if (!fillEnabled) {
+        if (portraitMode) {
+            String reason = portraitLayoutStatus;
+            if (portraitFailed && !reason.startsWith("unavailable")) {
+                reason = fillStatus;   // the resizable setup never applied the layout
+            }
+            if (portraitFailed || reason.startsWith("unavailable")) {
+                displayRows.addView(hostText("portrait layout: " + reason, 11f, UiTheme.RED));
+                displayRows.addView(hostRow("fallback", "letterbox " + frameW + "x" + frameH));
+            } else if ("ok".equals(reason)) {
+                displayRows.addView(hostRow("game", "portrait — resizable " + frameW + "x" + frameH
+                    + " (" + ((frameW * frameH) / 1000) + "k px), band from row " + portraitTopRow
+                    + " (" + (portraitTab == PORTRAIT_TAB_CHAT ? "chat" : "side panel") + ")"));
+            } else {
+                // "off"/"pending"/"inactive": no resizable layout is up yet (the launcher
+                // screen, the welcome screen or a fullscreen interface). Not an error.
+                displayRows.addView(hostRow("game", "portrait — waiting for the game layout"));
+            }
+        } else if (!fillEnabled) {
             displayRows.addView(hostRow("game", "off — letterbox " + GAME_W + "x" + GAME_H));
         } else if (fillStatus.startsWith("unavailable")) {
             displayRows.addView(hostText("game: " + fillStatus, 11f, UiTheme.RED));
@@ -1088,8 +1147,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         displayRows.addView(hostRow("sidebar", sidebarOverlap
             ? "overlap — the drawer floats over the game" : "resize — the game is inset"));
+        if (btnPortraitMode != null) {
+            btnPortraitMode.setText(portraitMode ? "Portrait: on" : "Portrait: off");
+        }
         if (btnFillMode != null) {
-            btnFillMode.setText(fillEnabled ? "Game fill: off" : "Game fill: on");
+            // Portrait owns the frame's aspect and size (the 70/30 layout needs the
+            // resizable mode), so the fill pref is out of play until portrait is off.
+            btnFillMode.setEnabled(!portraitMode);
+            btnFillMode.setAlpha(portraitMode ? 0.5f : 1f);
+            btnFillMode.setText(portraitMode ? "Game fill: forced (portrait)"
+                : fillEnabled ? "Game fill: off" : "Game fill: on");
         }
         if (btnSidebarMode != null) {
             btnSidebarMode.setText(sidebarOverlap ? "Sidebar: resize" : "Sidebar: overlap");
@@ -1165,6 +1232,129 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         return params;
     }
 
+    /**
+     * The launcher card's width: at most 420 dp, and always inside the 24-dp gutters on
+     * both sides. The old {@code 0.92 * width} rule plus the margins overflowed a
+     * portrait screen, where the card's own margins are a large fraction of the width.
+     */
+    private static int launcherCardWidth(int widthPixels, float density) {
+        int margin = (int) (24 * density);
+        return Math.min((int) (420 * density), Math.max(1, widthPixels - 2 * margin));
+    }
+
+    /** Re-applies the launcher card's width (a rotation changes the screen width). */
+    private void updateLauncherCardWidth() {
+        if (launcherPanel == null) {
+            return;
+        }
+        android.view.ViewGroup.LayoutParams lp = launcherPanel.getLayoutParams();
+        if (!(lp instanceof FrameLayout.LayoutParams)) {
+            return;
+        }
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        ((FrameLayout.LayoutParams) lp).width = launcherCardWidth(metrics.widthPixels, metrics.density);
+        launcherPanel.setLayoutParams(lp);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Portrait band tabs
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /**
+     * Builds the portrait band's tab strip: host chrome over the game surface, at the top
+     * of the client's HUD band. It selects which panel the band shows -- the chatbox or the
+     * side panel (inventory, equipment, skills, ...) -- and both get the band's full width,
+     * because only one is shown at a time ({@link ClientDisplay#applyPortraitLayout}). The
+     * strip is added right above the surface, so the launcher, the login overlay and the
+     * drawer all cover it.
+     */
+    private void buildPortraitTabs() {
+        final float density = getResources().getDisplayMetrics().density;
+        portraitTabs = new LinearLayout(this);
+        portraitTabs.setOrientation(LinearLayout.HORIZONTAL);
+        portraitTabs.setBackground(UiTheme.rounded(0xF20D0B09, UiTheme.GOLD_DIM, 1f, 10f, density));
+        int gap = (int) (4 * density);
+        portraitTabs.setPadding(gap, gap, gap, gap);
+        portraitTabChat = portraitTabPill("Chat");
+        portraitTabSide = portraitTabPill("Side panel");
+        LinearLayout.LayoutParams half = new LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        LinearLayout.LayoutParams half2 = new LinearLayout.LayoutParams(0,
+            LinearLayout.LayoutParams.MATCH_PARENT, 1f);
+        half2.leftMargin = gap;
+        portraitTabs.addView(portraitTabChat, half);
+        portraitTabs.addView(portraitTabSide, half2);
+        portraitTabChat.setOnClickListener(v -> setPortraitTab(PORTRAIT_TAB_CHAT));
+        portraitTabSide.setOnClickListener(v -> setPortraitTab(PORTRAIT_TAB_SIDE));
+        portraitTabs.setVisibility(View.GONE);
+        rootLayout.addView(portraitTabs, 1);
+        updatePortraitTabPills();
+    }
+
+    private TextView portraitTabPill(String text) {
+        final float density = getResources().getDisplayMetrics().density;
+        TextView view = new TextView(this);
+        view.setText(text);
+        view.setTextSize(12f);
+        view.setGravity(Gravity.CENTER);
+        view.setPadding(0, 0, 0, 0);
+        UiTheme.ripple(view);
+        view.setTextColor(UiTheme.GOLD);
+        view.setBackground(UiTheme.rounded(0x33FFFFFF, 0, 0, 8f, density));
+        return view;
+    }
+
+    /** UI thread: shows/hides the strip and places it on the band's top edge. */
+    private void layoutPortraitTabs() {
+        if (portraitTabs == null) {
+            return;
+        }
+        boolean show = portraitMode && "ok".equals(portraitLayoutStatus)
+            && launcherScroll != null && launcherScroll.getVisibility() != View.VISIBLE;
+        if (!show) {
+            portraitTabs.setVisibility(View.GONE);
+            return;
+        }
+        int fw = frameW, fh = frameH;
+        int fitL = fitLeft, fitT = fitTop, fitWpx = fitW, fitHpx = fitH;
+        if (fw <= 0 || fh <= 0 || fitWpx <= 0 || fitHpx <= 0) {
+            portraitTabs.setVisibility(View.GONE);
+            return;
+        }
+        float scale = fitHpx / (float) fh;
+        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
+            fitWpx, Math.max(1, Math.round(ClientDisplay.TAB_ROWS * scale)));
+        lp.leftMargin = fitL;
+        lp.topMargin = fitT + Math.round(portraitTopRow * scale);
+        portraitTabs.setLayoutParams(lp);
+        portraitTabs.setVisibility(View.VISIBLE);
+        updatePortraitTabPills();
+    }
+
+    /** UI thread: selects the band's tab. The client thread applies it on its next frame. */
+    private void setPortraitTab(int tab) {
+        if (portraitTab == tab) {
+            return;
+        }
+        portraitTab = tab;
+        prefs().edit().putString("portraitTab",
+            tab == PORTRAIT_TAB_SIDE ? "side" : "chat").apply();
+        updatePortraitTabPills();
+        refreshDisplayCard();
+    }
+
+    private void updatePortraitTabPills() {
+        if (portraitTabChat == null || portraitTabSide == null) {
+            return;
+        }
+        final float density = getResources().getDisplayMetrics().density;
+        boolean chat = portraitTab == PORTRAIT_TAB_CHAT;
+        portraitTabChat.setTextColor(chat ? UiTheme.GOLD : UiTheme.TEXT_MUTED);
+        portraitTabSide.setTextColor(chat ? UiTheme.TEXT_MUTED : UiTheme.GOLD);
+        portraitTabChat.setBackground(UiTheme.rounded(chat ? 0x5EF0C040 : 0x00000000, 0, 0, 8f, density));
+        portraitTabSide.setBackground(UiTheme.rounded(chat ? 0x00000000 : 0x5EF0C040, 0, 0, 8f, density));
+    }
+
     // ═══════════════════════════════════════════════════════════════════════
     // Session persistence
     // ═══════════════════════════════════════════════════════════════════════
@@ -1188,13 +1378,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
     /**
-     * The Display card's two settings: game fill (device-aspect client frame) and the
-     * sidebar mode. Both are read here -- before {@code buildLauncherUi()} -- so the
-     * launcher renders the stored state and {@code bootstrapGameClient} applies it.
+     * The Display card's settings: game fill (device-aspect client frame), portrait
+     * mode (the 70/30 split) and the sidebar mode. All are read here -- before
+     * {@code buildLauncherUi()} -- so the launcher renders the stored state and
+     * {@code bootstrapGameClient} applies it.
      */
     private void loadDisplayPrefs() {
         SharedPreferences prefs = prefs();
         fillEnabled = prefs.getBoolean("gameFill", true);
+        portraitMode = prefs.getBoolean("portrait", false);
+        portraitTab = "side".equals(prefs.getString("portraitTab", "chat"))
+            ? PORTRAIT_TAB_SIDE : PORTRAIT_TAB_CHAT;
         sidebarOverlap = prefs.getBoolean("sidebarOverlap", true);
     }
 
@@ -1876,6 +2070,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     private void launchGame() {
         launcherScroll.setVisibility(View.GONE);
+        layoutPortraitTabs();
         // The right-edge column (and with it the keyboard toggle) comes back here.
         sidePanel.setAvailable(true);
         firstFramePresented = false;   // a restarted/resumed client hides the overlay again
@@ -1892,6 +2087,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void showLauncher() {
         launcherScroll.setVisibility(View.VISIBLE);
+        layoutPortraitTabs();
         kbBar.setVisibility(View.GONE);
         bootOverlay.setVisibility(View.GONE);
         sidePanel.setAvailable(false);
@@ -2263,6 +2459,39 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                                                 // A frame reached the surface: the boot overlay's job is done.
                                                 firstFramePresented = true;
                                                 runOnUiThread(MainActivity.this::hideBootOverlay);
+                                            }
+                                            // Portrait: force the client's widgets into the 70/30 split
+                                            // and blank the band below it. Both run *after* the blit:
+                                            // the frame just presented keeps the layout it was drawn
+                                            // with, and the next client frame uses what is applied here.
+                                            // Applying before the blit would make RuneLite overlays
+                                            // (which read the moved widget bounds) jump one frame ahead
+                                            // of the game UI they are composited with.
+                                            boolean portrait = portraitMode && clientObject != null && clientClass != null;
+                                            if (portrait) {
+                                                String status = ClientDisplay.applyPortraitLayout(
+                                                    clientObject, clientClass.getClassLoader(), frameW, frameH,
+                                                    portraitTab);
+                                                if (!status.equals(portraitLayoutStatus)) {
+                                                    portraitLayoutStatus = status;
+                                                    runOnUiThread(() -> {
+                                                        refreshDisplayCard();
+                                                        layoutPortraitTabs();
+                                                    });
+                                                }
+                                                portraitTopRow = "ok".equals(status)
+                                                    ? ClientDisplay.appliedTopRow() : 0;
+                                                if (portraitTopRow > 0) {
+                                                    // The scene is clipped to the band's top and the band
+                                                    // itself is blanked, so the HUD tabs own every pixel
+                                                    // below it (the client redraws the panels over black).
+                                                    clipPortraitScene(provider, portraitTopRow);
+                                                    clearPortraitBottomBand(provider);
+                                                    maskInactivePanel();
+                                                }
+                                            } else {
+                                                portraitLayoutStatus = "off";
+                                                portraitTopRow = 0;
                                             }
                                             lastBlitNanos = System.nanoTime() - blitStart;
                                         }
@@ -3843,6 +4072,115 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private Class<?> bufferProviderIface;
     private Method bufferProviderWidthMethod;
     private Method bufferProviderHeightMethod;
+    private Method bufferProviderPixelsMethod;
+    /** One diagnostic per process: a clear that cannot run is not retried loudly. */
+    private boolean portraitClearFailureLogged;
+
+    /**
+     * Clips the 3D rasterizer to the band's top ({@code yw.ef}'s height argument is the
+     * rasterizer's clip *and* the viewport the client projects through -- with the frame at
+     * 765x1751 the scene came out centred and correctly scaled in the 70% band, not
+     * cropped). Applied every frame because the client's own scene pass re-derives the
+     * clip; the buffer bind and this call always name the same array, so the clip can only
+     * ever be *smaller* than the buffer, never mismatched.
+     */
+    private void clipPortraitScene(Object provider, int top) {
+        int[] size = bufferProviderSize(provider);
+        if (top <= 0 || size == null || top >= size[1]) return;
+        try {
+            ClassLoader cl = clientClass.getClassLoader();
+            if (bufferProviderPixelsMethod == null) {
+                bufferProviderPixelsMethod = bufferProviderIface.getMethod("getPixels");
+            }
+            int[] px = (int[]) bufferProviderPixelsMethod.invoke(provider);
+            Class<?> rasterizer = cl.loadClass("yw");
+            float[] depth = (float[]) rasterizer.getField("aw").get(null);
+            Method ef = rasterizer.getDeclaredMethod("ef", int[].class, int.class, int.class, float[].class);
+            ef.setAccessible(true);
+            ef.invoke(null, px, size[0], top, depth);
+            rasterizerBoundPixels = null;   // the clip is not the bind's full-frame one
+        } catch (Throwable t) {
+            Log.w(TAG, "portrait clip failed: " + t);
+        }
+    }
+
+    /**
+     * Blacks out everything in the band except the panel on show, in the <b>presented</b>
+     * copy: the band is tabbed, so exactly one panel belongs there. The client keeps drawing
+     * both (it owns their geometry and the layout that places them) -- masking is what makes
+     * the band a one-panel HUD. The panel's rect comes from the live widget bounds
+     * ({@link ClientDisplay#appliedChatRect()} / {@link ClientDisplay#appliedSideRect()}), so
+     * the game's own decorations around it (the side panel's paging arrows, its tab-icon row)
+     * disappear with it.
+     *
+     * <p>Filling the presented copy rather than the client's buffer is deliberate: the client
+     * redraws both panels every frame, so a clear of its buffer would be repainted before the
+     * blit. The band above the panel's rect is already black (the rasterizer is clipped and
+     * the client's buffer below the split is blanked), so only the strips around the panel
+     * need painting here.
+     */
+    private void maskInactivePanel() {
+        int[] px = appletPixels;
+        int[] panel = portraitTab == PORTRAIT_TAB_CHAT
+            ? ClientDisplay.appliedChatRect() : ClientDisplay.appliedSideRect();
+        int bandTop = portraitTopRow;
+        if (px == null || frameW <= 0 || panel == null || bandTop <= 0) {
+            return;
+        }
+        int left = Math.max(0, Math.min(frameW, panel[0]));
+        int right = Math.max(left, Math.min(frameW, panel[0] + panel[2]));
+        int top = Math.max(bandTop, Math.min(frameH, panel[1]));
+        int bottom = Math.max(top, Math.min(frameH, panel[1] + panel[3]));
+        fillRows(px, bandTop, top, 0, frameW);                  // above the panel
+        fillRows(px, bottom, frameH, 0, frameW);                // below it
+        fillRows(px, top, bottom, 0, left);                     // and the strips either side
+        fillRows(px, top, bottom, right, frameW);
+    }
+
+    /** Zeros {@code px[rows y0..y1) x columns x0..x1)}. */
+    private void fillRows(int[] px, int y0, int y1, int x0, int x1) {
+        int from = Math.max(0, y0), to = Math.min(frameH, y1);
+        int c0 = Math.max(0, x0), c1 = Math.min(frameW, x1);
+        if (from >= to || c0 >= c1) {
+            return;
+        }
+        for (int row = from; row < to; row++) {
+            java.util.Arrays.fill(px, row * frameW + c0, row * frameW + c1, 0);
+        }
+    }
+
+    /**
+     * Blanks the rows below the portrait HUD band in the <b>client's</b> frame buffer
+     * ({@code MainBufferProvider.getPixels()}), not in the presented copy: the client
+     * redraws the chat and the side menu over them every frame, and the gaps between the
+     * widgets stay black instead of showing the previous frame's scene. Called on the
+     * client thread right after the frame blit, so the presented frame is untouched.
+     *
+     * <p>~436k ints per frame at 765x1900, which {@code Arrays.fill} covers in tens of
+     * microseconds -- negligible next to the scene. A fresh frame buffer is zero-filled
+     * already; this is what covers interface transitions and re-layouts that reuse it.
+     */
+    private void clearPortraitBottomBand(Object provider) {
+        int top = portraitTopRow;
+        int[] size = bufferProviderSize(provider);
+        if (top <= 0 || size == null || top >= size[1]) {
+            return;
+        }
+        try {
+            if (bufferProviderPixelsMethod == null) {
+                bufferProviderPixelsMethod = bufferProviderIface.getMethod("getPixels");
+            }
+            int[] px = (int[]) bufferProviderPixelsMethod.invoke(provider);
+            if (px != null && px.length >= size[0] * size[1]) {
+                java.util.Arrays.fill(px, top * size[0], size[1] * size[0], 0);
+            }
+        } catch (Throwable t) {
+            if (!portraitClearFailureLogged) {
+                portraitClearFailureLogged = true;
+                Log.w(TAG, "portrait band clear unavailable: " + t);
+            }
+        }
+    }
 
     /**
      * Swaps the display buffer and the live frame size. Must be called on the client
@@ -3916,6 +4254,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
      */
     private void requestGeometry() {
         int w = GAME_W, h = GAME_H;
+        if (portraitMode && !portraitFailed && surfaceW > 0 && surfaceH > surfaceW) {
+            // Portrait: a 765-wide frame at the surface's aspect, so the fit fills the
+            // screen and the client's widget layout has the width it needs. 765 is a
+            // layout floor, not taste: the HUD band below is the chat (519 px) beside the
+            // side menu (241 px), and the top area needs the 512-px mainmodal plus the
+            // 211-px minimap column -- a narrower frame overlaps them. Fill mode's pixel
+            // budget is deliberately bypassed: the frame is ~1.2-1.6M px but only its top
+            // 70% is rasterised 3D, and the width floor binds before the budget does.
+            int height = Math.round(GAME_W * (surfaceH / (float) surfaceW));
+            pendingFrameW = GAME_W;
+            pendingFrameH = Math.max(GAME_H, Math.min(height, PORTRAIT_MAX_H));
+            return;
+        }
         if (fillEnabled && surfaceW > 0 && surfaceH > 0) {
             int s = Math.max(1, Math.min(3, Math.round(surfaceH / (float) GAME_H)));
             for (;;) {
@@ -3952,6 +4303,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         refreshDisplayCard();
     }
 
+    /**
+     * UI thread: flips portrait mode, persisted, applied by the client thread's next
+     * frame. The orientation request is what starts the switch: the manifest lists
+     * orientation/screen size in {@code configChanges}, so the activity re-lays out
+     * instead of restarting and the running client survives.
+     */
+    private void togglePortraitMode() {
+        portraitMode = !portraitMode;
+        prefs().edit().putBoolean("portrait", portraitMode).apply();
+        // A portrait setup that failed is retried after the toggle: the failure may have
+        // been the frame geometry the previous orientation produced.
+        portraitFailed = false;
+        displaySetupDone = false;
+        fillStatus = "pending";
+        setRequestedOrientation(portraitMode
+            ? ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
+        requestGeometry();
+        refreshDisplayCard();
+        refreshHostCard();
+    }
+
     /** UI thread: flips the sidebar mode (overlap vs resize), persisted. */
     private void toggleSidebarMode() {
         sidebarOverlap = !sidebarOverlap;
@@ -3963,13 +4336,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
     /**
      * Client thread (from the draw handler, i.e. between two frames): applies the display
-     * setup the current fill setting needs. Fill on puts the client into its own resizable
-     * display mode -- the client hard-sets its canvas to 765x503 and clamps to it in fixed
-     * mode -- so a failure here leaves the frame at 765x503, i.e. the pre-fill behaviour.
-     * Fill off touches the client's display state **only** through the frame size: the
-     * fixed direction of the mode applier corrupts the client's canvas bookkeeping
-     * ({@link ClientDisplay#requestResizable} documents the crash), so the client keeps
-     * whatever mode it booted with.
+     * setup the current fill/portrait setting needs. Both put the client into its own
+     * resizable display mode -- the client hard-sets its canvas to 765x503 and clamps to
+     * it in fixed mode, and portrait additionally needs the resizable widget layout to
+     * move -- so a failure here leaves the frame at 765x503, i.e. the pre-fill behaviour.
+     * Turning both off touches the client's display state **only** through the frame
+     * size: the fixed direction of the mode applier corrupts the client's canvas
+     * bookkeeping ({@link ClientDisplay#requestResizable} documents the crash), so the
+     * client keeps whatever mode it booted with.
      */
     private void setupClientDisplay() {
         if (clientObject == null || clientClass == null) {
@@ -3977,7 +4351,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             return;
         }
         ClassLoader cl = clientClass.getClassLoader();
-        if (!fillEnabled) {
+        if (!fillEnabled && !portraitMode) {
             fillStatus = "off";
             pendingFrameW = GAME_W;
             pendingFrameH = GAME_H;
@@ -3986,23 +4360,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         }
         try {
             // An active RuneLite stretch owns the canvas (it reports the *real* size
-            // instead of the requested one); fill mode needs the canvas itself.
+            // instead of the requested one); both modes need the canvas itself.
             ClientDisplay.disableStretch(clientObject, cl);
             if (!ClientDisplay.requestResizable(clientObject, cl)) {
                 failFill("display mode unchanged");
                 return;
             }
+            portraitFailed = false;
             fillStatus = "ok";
-            Log.i(TAG, "fill: resizable mode applied (isResized=true)");
+            Log.i(TAG, (portraitMode ? "portrait" : "fill") + ": resizable mode applied (isResized=true)");
         } catch (Throwable t) {
             failFill(String.valueOf(t));
         }
     }
 
-    /** Turns fill mode off for this session (the pref stays; the frame falls back). */
+    /** Turns fill/portrait mode off for this session (the pref stays; the frame falls back). */
     private void failFill(String reason) {
         fillStatus = "unavailable: " + reason;
         fillEnabled = false;
+        if (portraitMode) {
+            portraitFailed = true;
+        }
         pendingFrameW = GAME_W;
         pendingFrameH = GAME_H;
         Log.w(TAG, "fill: unavailable: " + reason);
@@ -4031,7 +4409,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         // client's scrambled canvas arithmetic threw NegativeArraySizeException out of the
         // frame-buffer constructor and the client thread died in its own error path.
         if (!requestedCanvas(clientObject, cl, w, h)
-            && fillEnabled && !ClientDisplay.isResized(clientObject, cl)) {
+            && (fillEnabled || portraitMode) && !ClientDisplay.isResized(clientObject, cl)) {
             // The client is back in its fixed display mode: it applies its own *stored*
             // display setting whenever player settings arrive (login, a settings packet)
             // or the settings interface opens, and that setting is the account's --
@@ -4047,8 +4425,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
             lastFillReassert = now;
             Log.i(TAG, "fill: client reset the display mode, re-asserting");
             setupClientDisplay();
-            if (!fillEnabled) {
+            if ((!fillEnabled && !portraitMode) || portraitFailed) {
                 return false;   // setupClientDisplay reported why and set the fallback
+            }
+            if (portraitMode) {
+                // A failed portrait setup just disabled the mode (and the geometry with
+                // it), so the request is recomputed rather than trusted.
+                requestGeometry();
+                w = pendingFrameW;
+                h = pendingFrameH;
             }
         }
         if (requestedCanvas(clientObject, cl, w, h)) {
@@ -4552,6 +4937,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         fitTop = (sh - fitH) / 2;
         Log.i(TAG, "surface " + sw + "x" + sh + " fit " + fitW + "x" + fitH
             + " at " + fitLeft + "," + fitTop + " (frame " + w + "x" + h + ")");
+        // The band's tab strip is sized and placed from the fit rect, which just changed.
+        runOnUiThread(this::layoutPortraitTabs);
     }
 
     @Override
@@ -4692,6 +5079,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
     }
 
 
+
+    @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // The manifest lists orientation/screen size in configChanges, so a rotation
+        // re-lays out this activity instead of recreating it: the booted client, the
+        // drawer and the render loop all survive and only the geometry changes. The
+        // stage (the core's virtual windows and the sidebar) is told the new size, the
+        // drawer re-derives its width from it, and the frame request follows the surface.
+        DisplayMetrics dm = getResources().getDisplayMetrics();
+        UiBridge.setScreenSize(dm.widthPixels, dm.heightPixels, dm.density);
+        updateLauncherCardWidth();
+        if (sidePanel != null) {
+            sidePanel.onScreenWidthChanged(dm.widthPixels);
+        }
+        applyGameInsets();
+        requestGeometry();
+        refreshDisplayCard();
+        refreshHostCard();
+    }
 
     @Override
     protected void onResume() {

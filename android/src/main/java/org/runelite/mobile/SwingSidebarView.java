@@ -61,13 +61,15 @@ public class SwingSidebarView extends View implements UiBridge.Host {
     /**
      * {@code net.runelite.client.ui.ClientUI.SIDEBAR_LOGICAL_WIDTH}, hard-coded because
      * {@code ClientUI} lives in the asset dex, which this dex cannot see. The drawer is
-     * sized so that this many logical pixels fit; everything else follows from it.
+     * sized so that this many logical pixels fit; everything else follows from it
+     * ({@link SidePanel#onScreenWidthChanged} widens the drawer to keep the scale from
+     * clipping the sidebar).
      */
-    private static final int SIDEBAR_LOGICAL_WIDTH = 272;
+    static final int SIDEBAR_LOGICAL_WIDTH = 272;
 
     /** The integer scale the core renders the sidebar at (1 px borders stay 1 px). */
-    private static final int MIN_SCALE = 1;
-    private static final int MAX_SCALE = 3;
+    static final int MIN_SCALE = 1;
+    static final int MAX_SCALE = 3;
 
     /** At most one render per frame; further dirty marks coalesce into the next one. */
     private static final long FRAME_INTERVAL_MS = 16L;
@@ -158,11 +160,11 @@ public class SwingSidebarView extends View implements UiBridge.Host {
         contentWidthPx = w;
         contentHeightPx = h;
         // The integer scale keeps the core's 1 px borders exactly 1 px: fractional
-        // scaling would smear them, and core's rasteriser is hard-edged. Rounding (rather
-        // than flooring) to the nearest integer is what makes the drawer use the largest
-        // scale it can afford: the sidebar's 12 px UI font at 2x is noticeably smaller than
-        // the desktop's, and at 3x it reads like a phone UI.
-        int fitted = Math.round(w / (float) SIDEBAR_LOGICAL_WIDTH);
+        // scaling would smear them, and core's rasteriser is hard-edged. Flooring (rather
+        // than rounding) picks the largest scale the content width actually fits: rounding
+        // can pick a scale whose 272-px logical width is wider than the drawer, which cuts
+        // the right-hand tab strip off -- the narrow portrait drawer is exactly that case.
+        int fitted = w / SIDEBAR_LOGICAL_WIDTH;
         float scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, fitted));
         uiScale = scale;
         final int logicalW = Math.round(w / scale);

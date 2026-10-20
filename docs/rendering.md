@@ -113,6 +113,56 @@ live frame size and the fallback reason.
 </svg>
 ```
 
+### 1.2 Portrait mode: the 70/30 band
+
+The launcher's **Display** card has a `Portrait` pill (`portraitMode`, persisted as `portrait`). It
+switches the activity to `SCREEN_ORIENTATION_PORTRAIT` at runtime — the manifest keeps
+`screenOrientation="landscape"` but lists `orientation|screenSize|smallestScreenSize|screenLayout|
+keyboardHidden` in `configChanges`, so the rotation re-lays out the running activity instead of
+recreating it (the booted client survives; `pidof` is unchanged across a toggle) — and asks for a
+**765-wide frame at the surface's aspect** (`requestGeometry`): portrait mode deliberately bypasses
+`FILL_PIXEL_BUDGET`, because 765 is a *layout* floor (the chat is 519 px and the side panel 200-241 px
+of the client's own UI) and only the top 70 % is 3D. Portrait also forces the client's resizable mode
+on (`setupClientDisplay` accepts `fillEnabled || portraitMode`); a failure sets `portraitFailed` and
+falls back to the 765×503 letterbox, exactly like a fill failure.
+
+The split is *presentation plus a widget measurement*, in this order, on the client thread right after
+the frame blit (`callbacks.draw`):
+
+1. `ClientDisplay.applyPortraitLayout(client, cl, frameW, frameH, tab)` **measures** — it never writes
+   a widget. It reports the band's top row (`round(0.70 * frameH)`, floored so at least 360 rows
+   remain), the content top below the app's tab strip (`TAB_ROWS` = 56 frame rows), and the two panel
+   rects, and returns `ok` / `pending` / `inactive` / `unavailable: …`. `inactive` is the welcome
+   screen, a loading state or a fullscreen interface (`getTopLevelInterfaceId() != 161`): the band is
+   then *not* cleared and the whole canvas belongs to the client.
+2. `clipPortraitScene(provider, bandTop)` re-points the 3D rasterizer at the same display array with a
+   `bandTop`-tall clip (`yw.ef(pixels, w, bandTop, depth)`, §3.1's bind call). The height argument is
+   the viewport the client projects through, so the scene comes out **centred and correctly scaled in
+   the 70 % band**, not cropped — verified on the device. It is applied every frame because the
+   client's own scene pass re-derives the clip.
+3. `clearPortraitBottomBand(provider)` zeroes the band rows in the client's own frame buffer, so the
+   band starts black each frame instead of keeping the previous scene.
+4. `maskInactivePanel()` blanks the band in the *presented* copy (`appletPixels`) except the active
+   panel's rect. The band is tabbed — **Chat** (the chatbox, `InterfaceID.CHATBOX` = interface 162,
+   root child 0, 519×165 at the band's bottom-left) or **Side panel** (the toplevel's side slot,
+   `161:38` on 1.13.2, 200×281 plus its paging arrows) — and the client keeps drawing both, so the
+   mask is what makes the band one-panel-at-a-time. Masking the *presented* copy is deliberate: the
+   client's buffer is repainted before every blit.
+
+The tab strip itself is host chrome (`MainActivity.buildPortraitTabs`): two pills at the band's top
+edge, positioned from the live fit rect (`layoutPortraitTabs`), hidden while the launcher is up or
+the layout is inactive, and persisted as `portraitTab` (`chat`/`side`).
+
+**The panels keep the client's own sizes.** The chatbox and the side panel are fixed-size interfaces
+whose rows are *siblings* of the root widget (the chat root reports no children at all), and the
+client's layout pass rewrites their position and size between frames: a `setSize` was reverted, a
+`setForcedPosition` offset moved the root without its rows, and re-running the panels' scripts left
+the side panel empty. So "the active panel fills the band's width" is not reachable from the widget
+API without breaking the panels' contents and their touch mapping; the band shows one panel at its
+native size and everything else is black. Making them genuinely wider needs either the client's own
+stretch mode or a host-side scaled copy *plus* a matching inverse transform in the touch path.
+
+
 ## 2. The frame handshake
 
 The client calls the `Callbacks.draw(MainBufferProvider, Graphics, int, int)` overload once per

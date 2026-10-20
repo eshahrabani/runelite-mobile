@@ -236,6 +236,269 @@ final class ClientDisplay {
         }
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // Portrait band: 70% game view, 30% tabbed HUD
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /*
+     * Measured on client 1.13.2 (resizable display mode, canvas 765x1751). The ids are
+     * interface-definition data, not jar symbols, so a client bump can move them; the child
+     * dump this class logs on its first application is what they are re-derived from
+     * (docs/telemetry-assessment.md §6).
+     *
+     *   tli 161  the resizable toplevel -- what getTopLevelInterfaceId() reports while the
+     *            play layout is up (the welcome/ad screen reports 165, the fullscreen
+     *            container; 164 is unused by this build).
+     *   161      children 0-18 are the scene's layout layers, 16/17 the mainmodal/maincrm
+     *            (512x334, centred in the 515x1586 modal area), 19-48 the minimap pieces,
+     *            the side panel's slot (child 38, 200x281 at 544,1443, with the two paging
+     *            arrows either side) and the side-tab icon row (children 41-48 at y=1714).
+     *   162      the chatbox: root child 0 is the 519x165 chat parent at (0,1586) -- the
+     *            band's bottom-left; its rows (child 1 onwards) are its *siblings*, not its
+     *            children (the root reports no children at all).
+     *
+     * The client's layout owns all of that geometry: it rewrites the panels' positions and
+     * sizes on its own layout runs, and neither a {@code setPos}/{@code setSize} nor a
+     * forced offset survives (measured: a size set on the chat root reset between frames,
+     * an offset moved the root out from under its rows, and re-running the panels' scripts
+     * left the side panel empty). So nothing here writes a widget. What the portrait band
+     * needs from the client are the two panel rects, and the host does the rest: it clips
+     * the 3D scene at the band's top and masks everything in the band except the selected
+     * panel, which is what makes the band a one-panel-at-a-time HUD.
+     */
+
+    /** The chatbox interface ({@code InterfaceID.CHATBOX}) and its parent child. */
+    private static final int GROUP_CHAT = 162, CHILD_CHAT = 0;
+    /** Frame rows the app's tab strip reserves at the top of the band (56 -> 28 dp @ 1.5x). */
+    static final int TAB_ROWS = 56;
+    /** The band is at least this tall, so the side panel's 281 rows still fit. */
+    private static final int MIN_BAND = 360;
+    /** Side-slot discovery: the panel root sits in the right-hand column, in the band. */
+    private static final int SIDE_SLOT_X_NUM = 2, SIDE_SLOT_X_DEN = 3;   // x > 2/3 frameW
+    private static final int SIDE_SLOT_Y_NUM = 1, SIDE_SLOT_Y_DEN = 3;   // y > 1/3 frameH
+
+    /** First frame row of the band as last measured, or 0 when the layout is not active. */
+    private static volatile int appliedTopRow;
+    /** First frame row below the tab strip: where the band's panel content starts. */
+    private static volatile int appliedContentTop;
+    /** The panels' rects in frame coordinates ({@code x, y, width, height}), or null. */
+    private static volatile int[] chatRect, sideRect;
+
+    private static int lastFrameW, lastFrameH, lastTli, lastTab, layoutTicks, dumpedTli;
+    private static Object lastChat;
+
+    // Resolved once per class loader: a client restart builds a new DexClassLoader, and
+    // the cached Method objects of the old one cannot be invoked on the new widgets.
+    private static ClassLoader widgetLoader;
+    private static Method clientGetWidget, clientTopLevelInterfaceId;
+    private static Method widgetGetWidth, widgetGetHeight, widgetGetOriginalX,
+        widgetGetOriginalY, widgetGetOriginalWidth, widgetGetOriginalHeight, widgetGetType,
+        widgetGetContentType;
+
+    /** The band's top frame row, or 0 when the portrait layout is not applied. */
+    static int appliedTopRow() {
+        return appliedTopRow;
+    }
+
+    /** The band's content top (below the app's tab strip), or 0 when not applied. */
+    static int appliedContentTop() {
+        return appliedContentTop;
+    }
+
+    /** The chatbox' rect in frame coordinates, or null. The host masks with it. */
+    static int[] appliedChatRect() {
+        return chatRect;
+    }
+
+    /** The side panel's rect in frame coordinates, or null. The host masks with it. */
+    static int[] appliedSideRect() {
+        return sideRect;
+    }
+
+    /**
+     * Measures the portrait band: the split row ({@link #appliedTopRow()}), the content top
+     * below the tab strip, and the two panels' rects. Returns {@code "ok"}, {@code
+     * "pending"} (the chatbox is not loaded yet), {@code "inactive"} (no resizable layout is
+     * drawn -- the welcome screen, a loading state or a fullscreen interface: nothing is
+     * touched and the band must not be cleared) or {@code "unavailable: <reason>"}.
+     *
+     * <p>Client thread only. It reads widgets; the caller must not expect any of them to
+     * have been changed.
+     */
+    static String applyPortraitLayout(Object client, ClassLoader cl, int frameW, int frameH, int tab) {
+        if (client == null || cl == null || frameW <= 0 || frameH <= 0) {
+            return "pending";
+        }
+        try {
+            resolveWidgetApi(cl);
+            int tli = intOf(clientTopLevelInterfaceId, client);
+            if (tli != 161) {
+                appliedTopRow = 0;
+                appliedContentTop = 0;
+                chatRect = null;
+                sideRect = null;
+                return "inactive";
+            }
+            Object chat = widget(client, GROUP_CHAT, CHILD_CHAT);
+            if (chat == null) {
+                appliedTopRow = 0;
+                appliedContentTop = 0;
+                return "pending";    // the chatbox is not loaded yet
+            }
+            int bandTop = Math.round(frameH * 0.70f);
+            if (frameH - bandTop < MIN_BAND) {
+                bandTop = Math.max(1, frameH - MIN_BAND);
+            }
+            int contentTop = bandTop + TAB_ROWS;
+            int contentH = Math.max(1, frameH - contentTop);
+
+            boolean sizeChanged = frameW != lastFrameW || frameH != lastFrameH;
+            boolean reload = chat != lastChat || tli != lastTli || tab != lastTab;
+            boolean periodic = layoutTicks++ % 60 == 0;
+
+            // The side panel is a toplevel child (161:38 on 1.13.2) found by its geometry
+            // (right-hand column, panel-sized) rather than a pinned child id, and re-found
+            // now and then because the client rebuilds it as tabs are switched.
+            if (reload || periodic || sideRect == null) {
+                sideRect = rectOf(findSideSlot(client, tli, frameW, frameH));
+            }
+            chatRect = rectOf(chat);
+            appliedTopRow = bandTop;
+            appliedContentTop = contentTop;
+            lastChat = chat;
+            if (sizeChanged || reload) {
+                Log.i(TAG, "portrait layout: tli " + tli + " frame " + frameW + "x" + frameH
+                    + " band " + bandTop + "+" + TAB_ROWS + " content " + contentTop + "+" + contentH
+                    + " tab " + (tab == 0 ? "chat" : "side")
+                    + " chat " + boundsOf(chat) + " side " + boundsOf(sideRect));
+            }
+            if (dumpedTli != tli) {
+                dumpedTli = tli;
+                dumpLayoutChildren(client, tli);
+            }
+            lastFrameW = frameW;
+            lastFrameH = frameH;
+            lastTli = tli;
+            lastTab = tab;
+            return "ok";
+        } catch (Throwable t) {
+            appliedTopRow = 0;
+            appliedContentTop = 0;
+            chatRect = null;
+            sideRect = null;
+            Log.w(TAG, "portrait layout unavailable: " + t);
+            return "unavailable: " + t;
+        }
+    }
+
+    /**
+     * The side panel's slot: the toplevel child in the right-hand column, in the band, and
+     * panel-sized (on 1.13.2 that is {@code 161:38}, 200x281 at 544,1443). Scanned over the
+     * toplevel's children only, and only on a layout change / periodically.
+     */
+    private static Object findSideSlot(Object client, int tli, int frameW, int frameH) throws Throwable {
+        int minX = frameW * SIDE_SLOT_X_NUM / SIDE_SLOT_X_DEN;
+        int minY = frameH * SIDE_SLOT_Y_NUM / SIDE_SLOT_Y_DEN;
+        for (int child = 0; child < 128; child++) {
+            Object w;
+            try {
+                w = clientGetWidget.invoke(client, tli, child);
+            } catch (Throwable t) {
+                continue;
+            }
+            int[] r = rectOf(w);
+            if (r != null && r[0] >= minX && r[1] >= minY && r[2] >= 120 && r[3] >= 120) {
+                return w;
+            }
+        }
+        return null;
+    }
+
+    private static int[] rectOf(Object w) {
+        if (w == null) {
+            return null;
+        }
+        try {
+            java.awt.Rectangle r = (java.awt.Rectangle) w.getClass().getMethod("getBounds").invoke(w);
+            return new int[]{r.x, r.y, r.width, r.height};
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    private static String boundsOf(Object w) {
+        int[] r = rectOf(w);
+        return r == null ? "null" : r[0] + "," + r[1] + "x" + r[2] + "x" + r[3];
+    }
+
+    private static String boundsOf(int[] r) {
+        return r == null ? "null" : r[0] + "," + r[1] + "x" + r[2] + "x" + r[3];
+    }
+
+    private static Object widget(Object client, int group, int child) throws Throwable {
+        return clientGetWidget.invoke(client, group, child);
+    }
+
+    private static int intOf(Method method, Object target) throws Throwable {
+        return ((Integer) method.invoke(target)).intValue();
+    }
+
+    /**
+     * One-shot dump of the toplevel's children, {@code id:type/contentType:x,y,w,h}. The
+     * child ids above are interface data, not jar symbols, so this line is what they are
+     * re-derived from after a client bump (docs/telemetry-assessment.md §6).
+     */
+    private static void dumpLayoutChildren(Object client, int group) {
+        try {
+            StringBuilder sb = new StringBuilder("portrait layout children ").append(group).append(':');
+            for (int child = 0; child < 128; child++) {
+                Object w = widget(client, group, child);
+                if (w == null) {
+                    continue;
+                }
+                sb.append(' ').append(child)
+                    .append(':').append(intOf(widgetGetType, w))
+                    .append('/').append(intOf(widgetGetContentType, w))
+                    .append('@').append(intOf(widgetGetOriginalX, w))
+                    .append(',').append(intOf(widgetGetOriginalY, w))
+                    .append('x').append(intOf(widgetGetOriginalWidth, w))
+                    .append('x').append(intOf(widgetGetOriginalHeight, w));
+            }
+            Log.i(TAG, sb.toString());
+        } catch (Throwable t) {
+            Log.w(TAG, "portrait layout child dump failed: " + t);
+        }
+    }
+
+    /** Resolves the public widget API once per class loader (a restart replaces it). */
+    private static void resolveWidgetApi(ClassLoader cl) throws Throwable {
+        if (widgetLoader == cl && clientGetWidget != null) {
+            return;
+        }
+        Class<?> clientIface = cl.loadClass("net.runelite.api.Client");
+        clientGetWidget = clientIface.getMethod("getWidget", int.class, int.class);
+        clientTopLevelInterfaceId = clientIface.getMethod("getTopLevelInterfaceId");
+        Class<?> w = cl.loadClass("net.runelite.api.widgets.Widget");
+        widgetGetWidth = w.getMethod("getWidth");
+        widgetGetHeight = w.getMethod("getHeight");
+        widgetGetOriginalX = w.getMethod("getOriginalX");
+        widgetGetOriginalY = w.getMethod("getOriginalY");
+        widgetGetOriginalWidth = w.getMethod("getOriginalWidth");
+        widgetGetOriginalHeight = w.getMethod("getOriginalHeight");
+        widgetGetType = w.getMethod("getType");
+        widgetGetContentType = w.getMethod("getContentType");
+        widgetLoader = cl;
+        // A previous loader's widgets are gone: force a fresh measure and dump.
+        lastChat = null;
+        lastTli = 0;
+        lastTab = -1;
+        lastFrameW = 0;
+        lastFrameH = 0;
+        chatRect = null;
+        sideRect = null;
+        dumpedTli = 0;
+    }
+
     /**
      * The client's own shutdown deadline, as {@code to.re} reports it: the static long
      * that the game loop ({@code to.run}) checks each iteration and exits on, set by the

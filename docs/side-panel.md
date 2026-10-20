@@ -30,11 +30,21 @@ what draws over what — the login overlay is last, so it covers the drawer).
   its foot is the `⌨` keyboard toggle (44 dp × 48 dp, 8 dp bottom margin) →
   `Listener.onKeyboardToggleRequested()` → `MainActivity.toggleKeyboardBar`.
 - **Drawer** (`drawer`, `Gravity.END`, full height, 12 dp padding): width
-  `min(0.42 * widthPixels, 380 * density)` (`drawerWidthPx`) and `rightMargin = handleWidthPx`, so it
-  sits immediately left of the column. Its header is the brand `RuneLite` plus the `⌂` launcher
+  `drawerWidthFor(widthPixels)` (`drawerWidthPx`) and `rightMargin = handleWidthPx`, so it sits
+  immediately left of the column. The rule is `min(0.42 * widthPixels, 380 * density)` widened when
+  that would clip the sidebar: the Swing sidebar renders at an integer scale of its 272 logical px, so
+  the drawer must fit `scale * 272 + 2 * 12 dp` padding (`scale` = the clamp of `round(base / 272)`),
+  capped at 380 dp. On the 2856-px landscape test display that is the 1140-px cap; on a 1280-px
+  portrait screen it is 616 px (content 544 px → scale 2, no clipped tab strip). Its header is the brand `RuneLite` plus the `⌂` launcher
   shortcut (34 dp) → `Listener.onShowLauncherRequested()` → `MainActivity.showLauncher`; it replaces
   the floating gear button the host used to draw over the game. Its body is
   `content` (weight 1): the Swing sidebar added later, with a `statusText` placeholder behind it.
+- **Rotation.** The activity handles `orientation|screenSize|…` itself, so a portrait/landscape
+  switch does not recreate it. `MainActivity.onConfigurationChanged` re-publishes the stage size
+  (`UiBridge.setScreenSize`), re-applies the launcher card's width, calls
+  `SidePanel.onScreenWidthChanged(widthPixels)` (which recomputes `drawerWidthPx`, updates the
+  drawer's layout params and notifies the host so the game surface re-insets), then
+  `applyGameInsets()` + `requestGeometry()`. The drawer keeps its open/closed state.
 - The chevron's `OnTouchListener` toggles on `ACTION_UP` and always returns `true` — a `TextView`
   click listener would consume the down event itself and the column's swallowing listener (below)
   would never see it.
@@ -187,14 +197,16 @@ plugin dialogs and modal option panes; RuneLite's config colour picker is a `JDi
 ## 5. UI scale
 
 `SwingSidebarView.onSizeChanged` derives the integer UI scale from the drawer's device width:
-`uiScale = clamp(round(contentWidthPx / 272), 1, 3)` (`SIDEBAR_LOGICAL_WIDTH` = 272 =
+`uiScale = clamp(contentWidthPx / 272, 1, 3)` (an integer division, i.e. floored) (`SIDEBAR_LOGICAL_WIDTH` = 272 =
 RuneLite's `ClientUI.SIDEBAR_LOGICAL_WIDTH`, hard-coded because the asset dex is invisible to this
 dex; `MIN_SCALE`/`MAX_SCALE` = 1/3). It then calls
 `UiBridge.setSidebarBounds(round(w / scale), round(h / scale), scale)`: the core lays the root out at
-that logical size and paints through a `Graphics` scaled by it. Rounding (rather than flooring) is
-deliberate — the drawer should use the largest scale it can afford, because the 12 px logical UI font
-at 2× reads too small on a phone — so **the drawer-width rule in `SidePanel` is the one knob that
-retunes the whole sidebar.**
+that logical size and paints through a `Graphics` scaled by it. Flooring (rather than rounding) picks the
+largest scale the content width actually *fits*: rounding can choose a scale whose 272-px logical
+width is wider than the drawer, which cuts the right-hand tab strip off — the narrow portrait drawer
+is exactly that case. **The drawer-width rule in `SidePanel` is the one knob that retunes the whole
+sidebar**, and `onScreenWidthChanged` re-derives it after a rotation (`MainActivity
+.onConfigurationChanged`).
 
 Glyphs are rasterised at device resolution: fonts and every `FontMetrics` answer stay *logical*,
 `Graphics.drawString` passes the effective scale to `TextBridge.drawString`, and
